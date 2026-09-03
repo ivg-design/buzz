@@ -11,10 +11,8 @@ import type {
   Profile,
   RelayAgent,
 } from "@/shared/api/types";
-import {
-  mergeAgentNamesIntoProfiles,
-  mergeMemberAgentFlagsIntoProfiles,
-} from "./useChannelActivityTyping";
+import { mergeAgentNamesIntoProfiles } from "@/features/agents/lib/agentProfileFallback";
+import { mergeMemberAgentFlagsIntoProfiles } from "./useChannelActivityTyping";
 
 /**
  * The channel screen's message-row profile lookup: the `users-batch` query

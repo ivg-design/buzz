@@ -124,7 +124,10 @@ export function resolveUserLabel(input: {
   }
 
   const safeFallback = fallbackName?.trim();
-  if (safeFallback) {
+  if (
+    safeFallback &&
+    normalizePubkey(safeFallback) !== normalizePubkey(pubkey)
+  ) {
     return safeFallback;
   }
 

@@ -5,14 +5,20 @@ import {
 import { formatDmParticipantDisplayName } from "@/features/channels/lib/dmParticipantDisplay";
 import type { Channel } from "@/shared/api/types";
 
-function isGenericDmChannelName(name: string) {
+function isGenericDmChannelName(
+  name: string,
+  participantPubkeys: readonly string[],
+) {
   const normalized = name.trim().toLowerCase();
   return (
     normalized.length === 0 ||
     normalized === "dm" ||
     normalized === "direct message" ||
     normalized === "direct messages" ||
-    /^group dm\s*(\(\d+\))?$/.test(normalized)
+    /^group dm\s*(\(\d+\))?$/.test(normalized) ||
+    participantPubkeys.some(
+      (pubkey) => pubkey.trim().toLowerCase() === normalized,
+    )
   );
 }
 
@@ -21,7 +27,10 @@ export function resolveChannelDisplayLabel(
   currentPubkey: string | undefined,
   profiles: UserProfileLookup | undefined,
 ) {
-  if (channel.channelType !== "dm" || !isGenericDmChannelName(channel.name)) {
+  if (
+    channel.channelType !== "dm" ||
+    !isGenericDmChannelName(channel.name, channel.participantPubkeys)
+  ) {
     return channel.name;
   }
 

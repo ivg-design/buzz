@@ -82,6 +82,29 @@ test("buildProjectBootstrapTemplates binds a default repository to the home chan
   ]);
 });
 
+test("buildProjectBootstrapTemplates attaches an existing repository without changing its coordinate", () => {
+  const templates = buildProjectBootstrapTemplates({
+    cloneUrl: "  https://github.com/mysteropodes/nemo.git  ",
+    name: "Nemo",
+    ownerPubkey: OWNER,
+    projectChannelId: CHANNEL,
+    webUrl: "  https://github.com/mysteropodes/nemo  ",
+  });
+
+  assert.equal(templates.repositoryAddress, `30617:${OWNER}:nemo`);
+  assert.deepEqual(templates.repository.tags, [
+    ["d", "nemo"],
+    ["name", "Nemo"],
+    ["buzz-channel", CHANNEL],
+    ["clone", "https://github.com/mysteropodes/nemo.git"],
+    ["web", "https://github.com/mysteropodes/nemo"],
+  ]);
+  assert.deepEqual(
+    templates.project.tags.filter((tag) => tag[0] === "a"),
+    [["a", `30617:${OWNER}:nemo`]],
+  );
+});
+
 test("buildDefaultProjectRepositoryTemplate uses the project slug as the repo id", () => {
   const template = buildDefaultProjectRepositoryTemplate({
     name: "Space Invaders 3D",

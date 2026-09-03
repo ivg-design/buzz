@@ -187,15 +187,19 @@ export function buildProjectAnnouncementTemplate({
 
 /** Default 30617 bound to the project home channel, using the project slug. */
 export function buildDefaultProjectRepositoryTemplate({
+  cloneUrl,
   description,
   name,
   ownerPubkey,
   projectChannelId,
+  webUrl,
 }: {
+  cloneUrl?: string;
   description?: string;
   name: string;
   ownerPubkey: string;
   projectChannelId: string;
+  webUrl?: string;
 }): {
   dtag: string;
   repository: ProjectEventTemplate;
@@ -222,6 +226,14 @@ export function buildDefaultProjectRepositoryTemplate({
   if (normalizedDescription) {
     repositoryTags.push(["description", normalizedDescription]);
   }
+  const normalizedCloneUrl = cloneUrl?.trim();
+  if (normalizedCloneUrl) {
+    repositoryTags.push(["clone", normalizedCloneUrl]);
+  }
+  const normalizedWebUrl = webUrl?.trim();
+  if (normalizedWebUrl) {
+    repositoryTags.push(["web", normalizedWebUrl]);
+  }
   return {
     dtag,
     repositoryAddress,
@@ -235,23 +247,29 @@ export function buildDefaultProjectRepositoryTemplate({
 
 /** Home channel + default repository already listed on the project. */
 export function buildProjectBootstrapTemplates({
+  cloneUrl,
   description,
   name,
   ownerPubkey,
   projectChannelId,
   projectVisibility = "listed",
+  webUrl,
 }: {
+  cloneUrl?: string;
   description?: string;
   name: string;
   ownerPubkey: string;
   projectChannelId: string;
   projectVisibility?: ProjectListingVisibility;
+  webUrl?: string;
 }): ProjectBootstrapTemplates {
   const repository = buildDefaultProjectRepositoryTemplate({
+    cloneUrl,
     description,
     name,
     ownerPubkey,
     projectChannelId,
+    webUrl,
   });
   const announcement = buildProjectAnnouncementTemplate({
     description,

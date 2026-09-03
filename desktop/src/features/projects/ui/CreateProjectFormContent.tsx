@@ -34,6 +34,8 @@ export function CreateProjectFormContent({
 }) {
   const [name, setName] = React.useState("");
   const [description, setDescription] = React.useState("");
+  const [repositoryCloneUrl, setRepositoryCloneUrl] = React.useState("");
+  const [repositoryWebUrl, setRepositoryWebUrl] = React.useState("");
   const [errorMessage, setErrorMessage] = React.useState<string | null>(null);
   const nameInputRef = React.useRef<HTMLInputElement>(null);
   const settings = useCreateProjectFormSettings(active, setDescription);
@@ -42,6 +44,8 @@ export function CreateProjectFormContent({
     if (!active) return;
     setName(initialName);
     setDescription("");
+    setRepositoryCloneUrl("");
+    setRepositoryWebUrl("");
     setErrorMessage(null);
 
     const timerId = globalThis.setTimeout(() => {
@@ -60,6 +64,8 @@ export function CreateProjectFormContent({
       await onCreate({
         name: trimmedName,
         description: description.trim() || undefined,
+        repositoryCloneUrl: repositoryCloneUrl.trim() || undefined,
+        repositoryWebUrl: repositoryWebUrl.trim() || undefined,
         channelVisibility: settings.channelVisibility,
         projectVisibility: settings.projectVisibility,
         agents: settings.buildAgents(),
@@ -175,6 +181,78 @@ export function CreateProjectFormContent({
               placeholder="What this project should become"
               rows={2}
               value={description}
+            />
+          </div>
+        </div>
+
+        <div className="space-y-1.5">
+          <label
+            className="text-sm font-medium text-foreground"
+            htmlFor="create-project-repository-clone-url"
+          >
+            Repository clone URL
+            <span className={CREATE_LABEL_OPTIONAL_CLASS}>Optional</span>
+          </label>
+          <div
+            className={cn(
+              "flex min-h-11 items-center px-3",
+              CREATE_FIELD_SHELL_CLASS,
+            )}
+          >
+            <Input
+              autoCapitalize="none"
+              autoComplete="off"
+              autoCorrect="off"
+              className={cn(
+                "h-8 px-0 py-0 leading-6",
+                CREATE_FIELD_CONTROL_CLASS,
+              )}
+              data-testid="create-project-repository-clone-url"
+              disabled={isCreating}
+              id="create-project-repository-clone-url"
+              onChange={(event) => {
+                setRepositoryCloneUrl(event.target.value);
+                setErrorMessage(null);
+              }}
+              placeholder="https://github.com/owner/repository.git"
+              spellCheck={false}
+              value={repositoryCloneUrl}
+            />
+          </div>
+        </div>
+
+        <div className="space-y-1.5">
+          <label
+            className="text-sm font-medium text-foreground"
+            htmlFor="create-project-repository-web-url"
+          >
+            Repository web URL
+            <span className={CREATE_LABEL_OPTIONAL_CLASS}>Optional</span>
+          </label>
+          <div
+            className={cn(
+              "flex min-h-11 items-center px-3",
+              CREATE_FIELD_SHELL_CLASS,
+            )}
+          >
+            <Input
+              autoCapitalize="none"
+              autoComplete="off"
+              autoCorrect="off"
+              className={cn(
+                "h-8 px-0 py-0 leading-6",
+                CREATE_FIELD_CONTROL_CLASS,
+              )}
+              data-testid="create-project-repository-web-url"
+              disabled={isCreating}
+              id="create-project-repository-web-url"
+              onChange={(event) => {
+                setRepositoryWebUrl(event.target.value);
+                setErrorMessage(null);
+              }}
+              placeholder="https://github.com/owner/repository"
+              spellCheck={false}
+              value={repositoryWebUrl}
             />
           </div>
         </div>

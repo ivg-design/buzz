@@ -30,6 +30,8 @@ import { getCachedRelayOrigin } from "@/shared/lib/mediaUrl";
 export type CreateProjectInput = {
   name: string;
   description?: string;
+  repositoryCloneUrl?: string;
+  repositoryWebUrl?: string;
   channelVisibility?: ChannelVisibility;
   projectVisibility?: ProjectListingVisibility;
   agents?: readonly CreateChannelManagedAgentInput[];
@@ -137,10 +139,12 @@ async function ensureDefaultRepository({
   project: Project;
 }): Promise<Project> {
   const repositoryTemplate = buildDefaultProjectRepositoryTemplate({
+    cloneUrl: input.repositoryCloneUrl,
     description: input.description,
     name: input.name,
     ownerPubkey,
     projectChannelId: channelId,
+    webUrl: input.repositoryWebUrl,
   });
   const existingRepository =
     project.repositories.find(
@@ -275,11 +279,13 @@ export async function createProject(
   }
 
   const templates = buildProjectBootstrapTemplates({
+    cloneUrl: input.repositoryCloneUrl,
     description: input.description,
     name: input.name,
     ownerPubkey: identity.pubkey,
     projectChannelId: channel.id,
     projectVisibility: input.projectVisibility ?? "listed",
+    webUrl: input.repositoryWebUrl,
   });
   const existingRepositoryEvent = await fetchOwnHead(
     KIND_REPO_ANNOUNCEMENT,

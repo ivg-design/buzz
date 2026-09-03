@@ -27,7 +27,8 @@
 //! 1. Apply `ignore_self` gate.
 //! 2. Apply `author_allowed` gate (same as normal mode) so the nudge goes
 //!    only to authors the real agent would answer.
-//! 3. Require an explicit @mention via `event_mentions_agent`.
+//! 3. Require an explicit @mention in ordinary channels; DM membership makes
+//!    every DM message implicitly addressed to the agent.
 //! 4. Apply `filter::match_event` so channel/kind rules still constrain.
 //! 5. Build and publish a nudge reply (surface-correct copy).
 //! 6. Deduplicate by event-id (reconnect replay must not double-nudge).
@@ -75,6 +76,7 @@ use crate::{
     event_mentions_agent, filter,
     inbound_author_gate::AuthorizedListenerEvent,
     relay::{self, HarnessRelay, RelayEventPublisher},
+    reply_placement::ReplyPlacement,
     InboundAuthorGate, OwnerCache,
 };
 
@@ -364,12 +366,17 @@ pub(crate) async fn run_setup_listener(config: Config, payload: SetupPayload) ->
     );
 
     let channel_ids: Vec<Uuid> = channel_info_map.keys().copied().collect();
+    let dm_channel_ids: HashSet<Uuid> = channel_info_map
+        .iter()
+        .filter_map(|(channel_id, info)| (info.channel_type == "dm").then_some(*channel_id))
+        .collect();
 
     // Build subscription rules: mentions only (setup mode must not react to
     // every message in a channel).
     let rules = build_setup_subscription_rules(&config);
 
-    let channel_filters = crate::config::resolve_channel_filters(&config, &channel_ids, &rules);
+    let channel_filters =
+        crate::config::resolve_channel_filters(&config, &channel_ids, &dm_channel_ids, &rules);
 
     if channel_filters.is_empty() {
         tracing::warn!(
@@ -386,6 +393,12 @@ pub(crate) async fn run_setup_listener(config: Config, payload: SetupPayload) ->
     }
 
     let publisher = relay.event_publisher();
+    let nudge_emitter = SetupNudgeEmitter {
+        publisher: &publisher,
+        keys: &config.keys,
+        payload: &payload,
+        reply_placement: config.reply_placement,
+    };
 
     let channel_info = crate::pool::ChannelInfoResolver::new(channel_info_map, rest_client.clone());
 
@@ -409,7 +422,7 @@ pub(crate) async fn run_setup_listener(config: Config, payload: SetupPayload) ->
         if kind_u32 == KIND_MEMBER_ADDED_NOTIFICATION
             || kind_u32 == KIND_MEMBER_REMOVED_NOTIFICATION
         {
-            handle_setup_membership(&mut relay, &buzz_event, &config, &rules, &channel_ids).await;
+            handle_setup_membership(&mut relay, &buzz_event, &config, &rules, &channel_info).await;
             continue;
         }
 
@@ -420,12 +433,6 @@ pub(crate) async fn run_setup_listener(config: Config, payload: SetupPayload) ->
 
         // ignore_self: don't react to our own messages.
         if buzz_event.event.pubkey.to_hex() == pubkey_hex {
-            continue;
-        }
-
-        // Require an explicit @mention of this agent — setup mode must not
-        // nudge on every channel event even if subscribe_mode is "all".
-        if !event_mentions_agent(&buzz_event.event, &pubkey_hex) {
             continue;
         }
 
@@ -446,14 +453,23 @@ pub(crate) async fn run_setup_listener(config: Config, payload: SetupPayload) ->
             continue;
         };
 
+        // Setup mode must not nudge on every ordinary channel event even when
+        // subscribe_mode is "all". In a DM, membership already addresses the
+        // message to every participant, so no redundant p-tag is required.
+        if !setup_event_is_addressed(
+            authorized_event.event(),
+            &pubkey_hex,
+            authorized_event.is_dm(),
+        ) {
+            continue;
+        }
+
         if !nudge_authorized_event(
             authorized_event,
             &rules,
             &pubkey_hex,
             &mut nudged_event_ids,
-            &publisher,
-            &config.keys,
-            &payload,
+            &nudge_emitter,
         )
         .await
         {
@@ -469,32 +485,29 @@ async fn nudge_authorized_event(
     rules: &[filter::SubscriptionRule],
     pubkey_hex: &str,
     nudged_event_ids: &mut HashSet<EventId>,
-    publisher: &RelayEventPublisher,
-    keys: &nostr::Keys,
-    payload: &SetupPayload,
+    nudge_emitter: &SetupNudgeEmitter<'_>,
 ) -> bool {
-    let (buzz_event, effective_author) = authorized_event.into_parts();
+    let (buzz_event, effective_author, is_dm) = authorized_event.into_parts();
 
     // Apply channel/kind filter rules.
-    let filter_matched =
-        filter::match_event(&buzz_event.event, buzz_event.channel_id, rules, pubkey_hex)
-            .await
-            .is_some();
+    let filter_matched = filter::match_event(
+        &buzz_event.event,
+        buzz_event.channel_id,
+        rules,
+        pubkey_hex,
+        is_dm,
+    )
+    .await
+    .is_some();
 
     if !should_nudge_for_event(buzz_event.event.id, filter_matched, nudged_event_ids) {
         return false;
     }
 
     // Build and publish the setup nudge.
-    if let Err(e) = publish_setup_nudge(
-        publisher,
-        keys,
-        buzz_event.channel_id,
-        &buzz_event.event,
-        &effective_author,
-        payload,
-    )
-    .await
+    if let Err(e) = nudge_emitter
+        .publish(buzz_event.channel_id, &buzz_event.event, &effective_author)
+        .await
     {
         tracing::warn!("setup-mode: failed to publish nudge: {e}");
     } else {
@@ -553,10 +566,8 @@ pub(crate) fn should_nudge_for_event(
 
 /// Build the subscription rules used in setup mode.
 ///
-/// Always uses "mentions" mode: setup mode must not react to every event.
-/// Even if the agent's normal config is `subscribe_mode = all`, setup mode
-/// enforces explicit @mention filtering (see `event_mentions_agent` call in
-/// the loop above).
+/// Always uses "mentions" mode: setup mode must not react to every event in an
+/// ordinary channel. DM events are implicitly addressed by membership.
 fn build_setup_subscription_rules(config: &Config) -> Vec<filter::SubscriptionRule> {
     use crate::config::SubscribeMode;
 
@@ -566,8 +577,8 @@ fn build_setup_subscription_rules(config: &Config) -> Vec<filter::SubscriptionRu
         .unwrap_or_else(|| vec![KIND_STREAM_MESSAGE, KIND_WORKFLOW_APPROVAL_REQUESTED]);
 
     match &config.subscribe_mode {
-        // Config mode: load the actual rules, but they will be filtered by
-        // the explicit event_mentions_agent check in the main loop anyway.
+        // Config mode: load the actual rules, but the main loop still enforces
+        // ordinary-channel addressing independently of those rules.
         SubscribeMode::Config => match crate::config::load_rules(&config.config_path) {
             Ok(rules) => rules,
             Err(e) => {
@@ -595,6 +606,10 @@ fn mentions_rule(kinds: Vec<u32>) -> filter::SubscriptionRule {
     }
 }
 
+fn setup_event_is_addressed(event: &nostr::Event, agent_pubkey_hex: &str, is_dm: bool) -> bool {
+    is_dm || event_mentions_agent(event, agent_pubkey_hex)
+}
+
 /// Handle membership add/remove events in setup mode.
 ///
 /// Subscribe new channels; unsubscribe removed ones. No queue/session
@@ -604,21 +619,30 @@ async fn handle_setup_membership(
     buzz_event: &crate::relay::BuzzEvent,
     config: &Config,
     rules: &[filter::SubscriptionRule],
-    _initial_channel_ids: &[Uuid],
+    channel_info: &crate::pool::ChannelInfoResolver,
 ) {
     let kind_u32 = buzz_event.event.kind.as_u16() as u32;
     let channel_id = buzz_event.channel_id;
 
     if kind_u32 == KIND_MEMBER_ADDED_NOTIFICATION {
         // Subscribe to the newly-joined channel.
-        let ids = vec![channel_id];
-        let filters = crate::config::resolve_channel_filters(config, &ids, rules);
-        for (cid, filter) in filters {
-            if let Err(e) = relay.subscribe_channel(cid, filter).await {
-                tracing::warn!("setup-mode: failed to subscribe to new channel {cid}: {e}");
-            } else {
-                tracing::info!("setup-mode: subscribed to new channel {cid}");
-            }
+        let is_dm = channel_info
+            .resolve_channel_metadata(channel_id)
+            .await
+            .is_some_and(|info| info.channel_type == "dm");
+        let Some(filter) =
+            crate::config::resolve_dynamic_channel_filter(config, channel_id, is_dm, rules)
+        else {
+            tracing::debug!(
+                %channel_id,
+                "setup-mode: new channel matched no subscription rules"
+            );
+            return;
+        };
+        if let Err(e) = relay.subscribe_channel(channel_id, filter).await {
+            tracing::warn!("setup-mode: failed to subscribe to new channel {channel_id}: {e}");
+        } else {
+            tracing::info!(%channel_id, is_dm, "setup-mode: subscribed to new channel");
         }
     } else if kind_u32 == KIND_MEMBER_REMOVED_NOTIFICATION {
         if let Err(e) = relay.unsubscribe_channel(channel_id).await {
@@ -629,63 +653,79 @@ async fn handle_setup_membership(
 
 /// Build and publish a setup nudge reply to the triggering event.
 ///
-/// Threading: flat reply to the thread root if one exists; otherwise reply
-/// to the triggering event itself. P-tags the verified effective asker.
-async fn publish_setup_nudge(
-    publisher: &RelayEventPublisher,
-    keys: &nostr::Keys,
-    channel_id: Uuid,
-    triggering_event: &nostr::Event,
-    recipient_hex: &str,
-    payload: &SetupPayload,
-) -> Result<()> {
-    use buzz_sdk::ThreadRef;
+/// Existing threads stay flat at their canonical root. Every top-level nudge,
+/// including a DM nudge, follows the configured reply-placement policy. P-tags
+/// the verified effective asker.
+struct SetupNudgeEmitter<'a> {
+    publisher: &'a RelayEventPublisher,
+    keys: &'a nostr::Keys,
+    payload: &'a SetupPayload,
+    reply_placement: ReplyPlacement,
+}
 
-    // Parse NIP-10 thread tags to determine reply target.
-    let thread_tags = crate::queue::parse_thread_tags(triggering_event);
+impl SetupNudgeEmitter<'_> {
+    async fn publish(
+        &self,
+        channel_id: Uuid,
+        triggering_event: &nostr::Event,
+        recipient_hex: &str,
+    ) -> Result<()> {
+        use buzz_sdk::ThreadRef;
 
-    let thread_ref = if let Some(root_str) = &thread_tags.root_event_id {
-        // Threaded event: reply flat to the root.
-        let root_id = nostr::EventId::from_hex(root_str)
-            .map_err(|e| anyhow::anyhow!("invalid root event id: {e}"))?;
-        Some(ThreadRef {
-            root_event_id: root_id,
-            parent_event_id: root_id,
-        })
-    } else {
-        // Top-level event: reply to the triggering event.
-        Some(ThreadRef {
-            root_event_id: triggering_event.id,
-            parent_event_id: triggering_event.id,
-        })
-    };
+        // Parse NIP-10 thread tags to determine reply target.
+        let thread_tags = crate::queue::parse_thread_tags(triggering_event);
 
-    let body = payload.nudge_body();
+        let thread_ref = if let Some(root_str) = &thread_tags.root_event_id {
+            // Threaded event: reply flat to the root.
+            let root_id = nostr::EventId::from_hex(root_str)
+                .map_err(|e| anyhow::anyhow!("invalid root event id: {e}"))?;
+            Some(ThreadRef {
+                root_event_id: root_id,
+                parent_event_id: root_id,
+            })
+        } else if self.reply_placement == ReplyPlacement::Thread {
+            // Under thread placement the triggering top-level event becomes
+            // the new thread root, for streams and DMs alike.
+            Some(ThreadRef {
+                root_event_id: triggering_event.id,
+                parent_event_id: triggering_event.id,
+            })
+        } else {
+            // Timeline mode keeps a top-level channel nudge in the main timeline.
+            None
+        };
 
-    let event_builder = buzz_sdk::build_message(
-        channel_id,
-        &body,
-        thread_ref.as_ref(),
-        &[recipient_hex], // p-tag the verified effective asker
-        false,
-        &[],
-        &[],
-    )
-    .map_err(|e| anyhow::anyhow!("failed to build setup nudge: {e}"))?;
+        let body = self.payload.nudge_body();
 
-    let signed = event_builder
-        .sign_with_keys(keys)
-        .map_err(|e| anyhow::anyhow!("failed to sign setup nudge: {e}"))?;
+        let event_builder = buzz_sdk::build_message(
+            channel_id,
+            &body,
+            thread_ref.as_ref(),
+            &[recipient_hex], // p-tag the verified effective asker
+            false,
+            &[],
+            &[],
+        )
+        .map_err(|e| anyhow::anyhow!("failed to build setup nudge: {e}"))?;
 
-    publisher
-        .publish_event(signed)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to publish setup nudge: {e}"))?;
+        let signed = event_builder
+            .sign_with_keys(self.keys)
+            .map_err(|e| anyhow::anyhow!("failed to sign setup nudge: {e}"))?;
 
-    Ok(())
+        self.publisher
+            .publish_event(signed)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to publish setup nudge: {e}"))?;
+
+        Ok(())
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+#[path = "setup_mode/reply_placement_tests.rs"]
+mod reply_placement_tests;
 
 #[cfg(test)]
 mod tests {
@@ -737,6 +777,35 @@ mod tests {
             payload.requirements.as_slice(),
             [RequirementPayload::GitBash]
         ));
+    }
+
+    #[tokio::test]
+    async fn setup_addressing_accepts_untagged_dm_but_rejects_untagged_stream() {
+        let agent = nostr::Keys::generate().public_key().to_hex();
+        let event = nostr::EventBuilder::new(
+            nostr::Kind::Custom(KIND_STREAM_MESSAGE as u16),
+            "configure me",
+        )
+        .sign_with_keys(&nostr::Keys::generate())
+        .expect("signed setup trigger");
+        let rules = vec![mentions_rule(vec![KIND_STREAM_MESSAGE])];
+        let channel_id = Uuid::new_v4();
+
+        assert!(!setup_event_is_addressed(&event, &agent, false));
+        assert!(
+            filter::match_event(&event, channel_id, &rules, &agent, false)
+                .await
+                .is_none(),
+            "an untagged stream event must not reach setup mode"
+        );
+
+        assert!(setup_event_is_addressed(&event, &agent, true));
+        assert!(
+            filter::match_event(&event, channel_id, &rules, &agent, true)
+                .await
+                .is_some(),
+            "an untagged DM event must reach setup mode"
+        );
     }
 
     #[tokio::test]
@@ -793,6 +862,12 @@ mod tests {
             agent_pubkey: agent.clone(),
             requirements: vec![],
         };
+        let nudge_emitter = SetupNudgeEmitter {
+            publisher: &publisher,
+            keys: &agent_keys,
+            payload: &payload,
+            reply_placement: ReplyPlacement::Thread,
+        };
 
         assert!(
             nudge_authorized_event(
@@ -800,9 +875,7 @@ mod tests {
                 &rules,
                 &agent,
                 &mut HashSet::new(),
-                &publisher,
-                &agent_keys,
-                &payload,
+                &nudge_emitter,
             )
             .await
         );

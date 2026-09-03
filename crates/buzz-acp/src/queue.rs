@@ -21,6 +21,10 @@ use uuid::Uuid;
 use crate::prompt_project::PromptProjectInfo;
 
 use crate::config::DedupMode;
+use crate::reply_placement::{
+    append_new_thread_instruction, append_thread_instruction, append_timeline_instruction,
+    ReplyPlacement,
+};
 use crate::scope::SessionScope;
 
 /// Maximum events queued per session scope before oldest events are dropped.
@@ -1359,36 +1363,6 @@ pub(crate) fn format_event_block(
     block
 }
 
-/// Append a reply instruction when the agent is responding to a thread event.
-///
-/// Tells the agent to default to `--reply-to <event_id>` for ordinary replies
-/// while still allowing an explicit human request to post at the channel root or
-/// top level.
-fn append_reply_instruction(s: &mut String, event_id: &str) {
-    s.push_str(&format!(
-        "\nIMPORTANT: For ordinary replies in this turn, use `--reply-to {event_id}` \
-         on `buzz messages send` so the conversation stays threaded. \
-         If the human explicitly asks for a channel-root, top-level, \
-         or broadcast post, send that message without `--reply-to`. \
-         If the requested destination is ambiguous, ask before sending."
-    ));
-}
-
-/// Append a new-thread reply instruction for a human-facing top-level mention.
-///
-/// The triggering mention has no thread tags, so the agent's reply becomes the
-/// thread root. Anchoring to the triggering event (rather than leaving the
-/// choice open) prevents replying into a stale/unrelated prior thread.
-fn append_new_thread_reply_instruction(s: &mut String, event_id: &str) {
-    s.push_str(&format!(
-        "\nIMPORTANT: This is a new top-level message. For ordinary replies in \
-         this turn, use `--reply-to {event_id}` on `buzz messages send` — the \
-         triggering message is the thread root. Do NOT reply into any other \
-         (older) thread. If the human explicitly asks for a channel-root, \
-         top-level, or broadcast post, send that message without `--reply-to`."
-    ));
-}
-
 /// Decide whether a turn is human-facing for reply-anchor purposes.
 ///
 /// A turn is human-facing when the triggering sender is a human, OR a human
@@ -1583,10 +1557,9 @@ fn append_project_home(s: &mut String, channel_info: Option<&PromptChannelInfo>,
 /// Format a `<context>` section from the resolved session scope and turn routing.
 ///
 /// `reply_anchor` is the pre-resolved `--reply-to` target for this turn (see
-/// [`resolve_reply_anchor`]). In the thread/DM branches it threads ordinary
-/// replies; in the channel branch a `Some` anchor means a human-facing
-/// top-level mention whose reply should open a new thread rooted at the
-/// triggering event.
+/// [`resolve_reply_anchor`]). A `Some` anchor keeps an existing thread at its
+/// canonical root or opens a new thread under the thread-placement policy.
+/// A top-level message under timeline placement has no anchor, including DMs.
 fn format_context_hints(
     scope: &SessionScope,
     channel_info: Option<&PromptChannelInfo>,
@@ -1594,6 +1567,7 @@ fn format_context_hints(
     is_dm: bool,
     conversation_context_status: ConversationContextStatus,
     reply_anchor: Option<&str>,
+    reply_placement: ReplyPlacement,
 ) -> String {
     let channel_id = scope.channel_id();
     let channel_display = match channel_info {
@@ -1638,7 +1612,8 @@ fn format_context_hints(
              Channel: {channel_display}\n\
              {ctx_hint}"
         );
-        // If this is a DM reply, include thread structural info as supplementary.
+        // Existing DM threads stay at their canonical root. Top-level DMs obey
+        // the same configurable placement policy as other conversations.
         if let Some(ref root) = thread_tags.root_event_id {
             s.push_str(&format!("\nThread root: {root}"));
             if let Some(ref parent) = thread_tags.parent_event_id {
@@ -1647,8 +1622,12 @@ fn format_context_hints(
                 }
             }
             if let Some(event_id) = reply_anchor {
-                append_reply_instruction(&mut s, event_id);
+                append_thread_instruction(&mut s, event_id);
             }
+        } else if reply_placement == ReplyPlacement::Timeline {
+            append_timeline_instruction(&mut s);
+        } else if let Some(event_id) = reply_anchor {
+            append_new_thread_instruction(&mut s, event_id);
         }
         crate::prompt_framing::semantic_section("context", &s)
     } else if let Some(root) = scope
@@ -1683,11 +1662,13 @@ fn format_context_hints(
             }
         }
         s.push_str(&format!("\n{ctx_hint}"));
-        if let Some(event_id) = reply_anchor {
+        if thread_tags.root_event_id.is_none() && reply_placement == ReplyPlacement::Timeline {
+            append_timeline_instruction(&mut s);
+        } else if let Some(event_id) = reply_anchor {
             if thread_tags.root_event_id.is_some() {
-                append_reply_instruction(&mut s, event_id);
+                append_thread_instruction(&mut s, event_id);
             } else {
-                append_new_thread_reply_instruction(&mut s, event_id);
+                append_new_thread_instruction(&mut s, event_id);
             }
         }
         crate::prompt_framing::semantic_section("context", &s)
@@ -1702,8 +1683,10 @@ fn format_context_hints(
         s.push_str(
             "\nHint: Use `buzz messages get --channel <UUID>` for recent messages if needed.",
         );
-        if let Some(event_id) = reply_anchor {
-            append_new_thread_reply_instruction(&mut s, event_id);
+        if reply_placement == ReplyPlacement::Timeline {
+            append_timeline_instruction(&mut s);
+        } else if let Some(event_id) = reply_anchor {
+            append_new_thread_instruction(&mut s, event_id);
         }
         crate::prompt_framing::semantic_section("context", &s)
     }
@@ -1847,6 +1830,7 @@ pub struct FormatPromptArgs<'a> {
     /// live session had already received. Trigger-only context does not set it.
     pub conversation_context_had_delivered_events: bool,
     pub profile_lookup: Option<&'a PromptProfileLookup>,
+    pub reply_placement: ReplyPlacement,
     /// When true, base_prompt and system_prompt are delivered via the system
     /// role (session/new) and omitted from the user message. When false
     /// (legacy agents), they are injected as `<base>` and `<system>` sections.
@@ -2014,13 +1998,17 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
     //   - in a thread  → anchor to the thread ROOT (no depth-2 nesting)
     //   - top-level     → anchor to the triggering event (it becomes the root)
     // Agent↔agent turns get no forced anchor — deep nesting is intentional
-    // there. DMs are always 1:1 with a human, so they always anchor.
+    // there. DMs follow the configured top-level placement, while explicit DM
+    // threads stay anchored to their canonical root.
     let sender_pubkey = last_event.event.pubkey.to_hex();
     let reply_anchor = if is_dm {
-        thread_tags
-            .root_event_id
-            .is_some()
-            .then(|| last_event.event.id.to_hex())
+        thread_tags.root_event_id.clone().or_else(|| {
+            (args.reply_placement == ReplyPlacement::Thread).then(|| last_event.event.id.to_hex())
+        })
+    } else if args.reply_placement == ReplyPlacement::Timeline
+        && thread_tags.root_event_id.is_none()
+    {
+        None
     } else {
         resolve_reply_anchor(
             &sender_pubkey,
@@ -2040,6 +2028,7 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
             args.conversation_context_had_delivered_events,
         ),
         reply_anchor.as_deref(),
+        args.reply_placement,
     ));
 
     // 3. Conversation context (thread or DM).
@@ -2190,6 +2179,10 @@ pub(crate) fn native_steer_framing() -> (&'static str, &'static str) {
     let framing = MergeFraming::for_reason(Some(CancelReason::Steer));
     (framing.new_tag, framing.closing_note)
 }
+
+#[cfg(test)]
+#[path = "queue/reply_placement_tests.rs"]
+mod reply_placement_tests;
 
 #[cfg(test)]
 mod tests {
@@ -4028,21 +4021,14 @@ mod tests {
                         }
                         assert_eq!(
                             prompt.contains("This is a new top-level message"),
-                            !is_dm && !is_reply
+                            !is_reply
                         );
-                        if !is_dm || is_reply {
-                            let anchor = if is_dm {
-                                reply.id.to_hex()
-                            } else if is_reply {
-                                root.to_uppercase()
-                            } else {
-                                root.clone()
-                            };
-                            assert!(prompt.contains(&format!("--reply-to {anchor}")));
+                        let anchor = if is_reply {
+                            root.to_uppercase()
                         } else {
-                            assert!(!prompt.contains("--reply-to"));
-                            assert!(prompt.contains("buzz messages get"));
-                        }
+                            root.clone()
+                        };
+                        assert!(prompt.contains(&format!("--reply-to {anchor}")));
                     }
                 }
             }
@@ -5257,7 +5243,7 @@ mod tests {
         let root_id = "b".repeat(64);
         let event = make_event_with_tags(
             "thanks",
-            vec![vec!["e".into(), root_id, "".into(), "reply".into()]],
+            vec![vec!["e".into(), root_id.clone(), "".into(), "reply".into()]],
         );
         let event_id = event.id.to_hex();
         let batch = FlushBatch {
@@ -5287,9 +5273,10 @@ mod tests {
         )
         .join("\n\n");
         assert!(
-            prompt.contains(&format!("--reply-to {event_id}")),
-            "DM thread reply should include reply instruction"
+            prompt.contains(&format!("--reply-to {root_id}")),
+            "DM thread reply should anchor at the canonical root"
         );
+        assert!(!prompt.contains(&format!("--reply-to {event_id}")));
     }
 
     #[test]
@@ -5324,9 +5311,10 @@ mod tests {
     }
 
     #[test]
-    fn test_reply_instruction_absent_for_dm_non_reply() {
+    fn test_thread_placement_opens_thread_for_top_level_dm() {
         let ch = Uuid::new_v4();
         let event = make_event("hey there");
+        let event_id = event.id.to_hex();
         let batch = FlushBatch {
             channel_id: ch,
             scope: conv(ch),
@@ -5354,8 +5342,8 @@ mod tests {
         )
         .join("\n\n");
         assert!(
-            !prompt.contains("--reply-to"),
-            "DM non-reply should NOT include reply instruction"
+            prompt.contains(&format!("--reply-to {event_id}")),
+            "thread placement should open a thread for a top-level DM"
         );
     }
 

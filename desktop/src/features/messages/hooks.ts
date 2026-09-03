@@ -37,7 +37,7 @@ import {
 
 export { mergeMessages, mergeTimelineCacheMessages };
 import { splitOutgoingTags } from "@/features/messages/lib/imetaMediaMarkdown";
-import { messageMentionPubkeys } from "@/features/messages/lib/messageMentionPubkeys";
+import { resolveMessageRecipientPubkeys } from "@/features/messages/lib/messageMentionPubkeys";
 import { buildSentFromThreadTag } from "@/features/messages/lib/sentFromThread";
 import {
   clearTimeoutState,
@@ -46,12 +46,17 @@ import {
 import { relayClient, setVisibleChannel } from "@/shared/api/relayClient";
 import { customEmojiQueryKey } from "@/features/custom-emoji/hooks";
 import { channelsQueryKey } from "@/features/channels/hooks";
+import {
+  CHANNEL_MEMBERS_STALE_TIME_MS,
+  channelMembersQueryKey,
+} from "@/features/channels/rosterFreshness";
 import { reactionEmojiUrl } from "@/shared/api/customEmoji";
 import type { CustomEmoji } from "@/shared/lib/remarkCustomEmoji";
 import {
   addReaction,
   deleteMessage,
   editMessage,
+  getChannelMembers,
   removeReaction,
   sendChannelMessage,
 } from "@/shared/api/tauri";
@@ -544,10 +549,18 @@ export function useSendMessageMutation(
         mentionTags,
         linkPreviewTags,
       } = splitOutgoingTags(mediaTags);
-      const recipientPubkeys = messageMentionPubkeys(
+      const recipientPubkeys = await resolveMessageRecipientPubkeys(
         effectiveChannel,
         identity.pubkey,
         mentionPubkeys,
+        async (channelId) => {
+          const members = await queryClient.fetchQuery({
+            queryKey: channelMembersQueryKey(channelId),
+            queryFn: () => getChannelMembers(channelId),
+            staleTime: CHANNEL_MEMBERS_STALE_TIME_MS,
+          });
+          return members.map((member) => member.pubkey);
+        },
       );
       if (sentFromThreadRootId && parentEventId) {
         throw new Error(

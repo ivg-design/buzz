@@ -765,6 +765,7 @@ pub struct PromptContext {
     /// from `heartbeat_prompt` (agent self-prompting).
     pub turn_liveness_interval: Duration,
     pub dedup_mode: DedupMode,
+    pub reply_placement: crate::reply_placement::ReplyPlacement,
     pub system_prompt: Option<String>,
     /// Sanitized agent name used to compose `_meta.sessionTitle` on session/new.
     /// Channel sessions add the channel name; thread sessions also add the root
@@ -2695,6 +2696,7 @@ pub async fn run_prompt_task(
                 conversation_context: conversation_context.as_ref(),
                 conversation_context_had_delivered_events,
                 profile_lookup: profile_lookup.as_ref(),
+                reply_placement: ctx.reply_placement,
                 has_system_prompt_support: agent.has_system_prompt_support(),
                 base_prompt: standing.base_prompt,
                 system_prompt: standing.system_prompt,
@@ -8665,6 +8667,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             max_turn_duration: Duration::from_secs(120),
             turn_liveness_interval: Duration::ZERO,
             dedup_mode: DedupMode::Drop,
+            reply_placement: crate::reply_placement::ReplyPlacement::Thread,
             system_prompt: None,
             session_title: None,
             team_instructions: None,

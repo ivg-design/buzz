@@ -11,6 +11,7 @@ mod prompt_framing;
 mod prompt_project;
 mod queue;
 mod relay;
+mod reply_placement;
 mod scope;
 mod setup_mode;
 mod usage;
@@ -357,11 +358,20 @@ mod inbound_author_gate {
     pub(crate) struct AuthorizedListenerEvent {
         buzz_event: relay::BuzzEvent,
         effective_author: String,
+        is_dm: bool,
     }
 
     impl AuthorizedListenerEvent {
-        pub(crate) fn into_parts(self) -> (relay::BuzzEvent, String) {
-            (self.buzz_event, self.effective_author)
+        pub(crate) fn event(&self) -> &nostr::Event {
+            &self.buzz_event.event
+        }
+
+        pub(crate) fn is_dm(&self) -> bool {
+            self.is_dm
+        }
+
+        pub(crate) fn into_parts(self) -> (relay::BuzzEvent, String, bool) {
+            (self.buzz_event, self.effective_author, self.is_dm)
         }
     }
 
@@ -554,6 +564,7 @@ mod inbound_author_gate {
             Some(AuthorizedListenerEvent {
                 buzz_event,
                 effective_author: decision.effective_author,
+                is_dm: decision.is_dm,
             })
         }
 
@@ -596,12 +607,13 @@ impl AuthorizedNormalListenerEvent {
         rules: &[SubscriptionRule],
         agent_pubkey_hex: &str,
     ) -> Option<NormalListenerIngress> {
-        let (buzz_event, effective_author) = self.0.into_parts();
+        let (buzz_event, effective_author, is_dm) = self.0.into_parts();
         let matched = filter::match_event(
             &buzz_event.event,
             buzz_event.channel_id,
             rules,
             agent_pubkey_hex,
+            is_dm,
         )
         .await?;
         Some(NormalListenerIngress {
@@ -2667,6 +2679,10 @@ async fn tokio_main() -> Result<()> {
 
     tracing::info!("discovered {} channel(s)", channel_info_map.len());
     let channel_ids: Vec<Uuid> = channel_info_map.keys().copied().collect();
+    let dm_channel_ids: HashSet<Uuid> = channel_info_map
+        .iter()
+        .filter_map(|(channel_id, info)| (info.channel_type == "dm").then_some(*channel_id))
+        .collect();
 
     let rules: Vec<SubscriptionRule> = match config.subscribe_mode {
         SubscribeMode::Mentions => {
@@ -2705,7 +2721,8 @@ async fn tokio_main() -> Result<()> {
         }
     };
 
-    let channel_filters = config::resolve_channel_filters(&config, &channel_ids, &rules);
+    let channel_filters =
+        config::resolve_channel_filters(&config, &channel_ids, &dm_channel_ids, &rules);
     if channel_filters.is_empty() {
         tracing::warn!("no channel subscriptions resolved — agent will sit idle");
     }
@@ -2767,6 +2784,7 @@ async fn tokio_main() -> Result<()> {
         max_turn_duration: Duration::from_secs(config.max_turn_duration_secs),
         turn_liveness_interval: Duration::from_secs(config.turn_liveness_secs),
         dedup_mode: config.dedup_mode,
+        reply_placement: config.reply_placement,
         system_prompt: config.system_prompt.clone(),
         session_title: config.session_title.clone(),
         team_instructions: config.team_instructions.clone(),
@@ -3266,15 +3284,32 @@ async fn tokio_main() -> Result<()> {
 
                                     if subscribed_channel_ids.contains(&ch) {
                                         tracing::debug!(channel_id = %ch, "membership notification: channel already subscribed");
-                                    } else if let Some(filter) = config::resolve_dynamic_channel_filter(&config, ch, &rules) {
-                                        tracing::info!(channel_id = %ch, "membership notification: subscribing to new channel");
-                                        if let Err(e) = relay.subscribe_channel_from(ch, filter, Some(ts)).await {
-                                            tracing::warn!("failed to subscribe to new channel {ch}: {e}");
-                                        } else {
-                                            subscribed_channel_ids.insert(ch);
-                                        }
                                     } else {
-                                        tracing::debug!(channel_id = %ch, "membership notification: no matching rules — skipping");
+                                        // Resolve a newly joined channel's type before
+                                        // selecting its REQ filter. DMs are addressed by
+                                        // membership and therefore must not require a
+                                        // redundant p-tag. If metadata is unavailable,
+                                        // retain the narrower ordinary-channel filter.
+                                        let is_dm = ctx
+                                            .channel_info
+                                            .resolve_channel_metadata(ch)
+                                            .await
+                                            .is_some_and(|info| info.channel_type == "dm");
+                                        if let Some(filter) = config::resolve_dynamic_channel_filter(
+                                            &config,
+                                            ch,
+                                            is_dm,
+                                            &rules,
+                                        ) {
+                                            tracing::info!(channel_id = %ch, is_dm, "membership notification: subscribing to new channel");
+                                            if let Err(e) = relay.subscribe_channel_from(ch, filter, Some(ts)).await {
+                                                tracing::warn!("failed to subscribe to new channel {ch}: {e}");
+                                            } else {
+                                                subscribed_channel_ids.insert(ch);
+                                            }
+                                        } else {
+                                            tracing::debug!(channel_id = %ch, "membership notification: no matching rules — skipping");
+                                        }
                                     }
                                 } else {
                                     subscribed_channel_ids.remove(&ch);
@@ -8909,6 +8944,7 @@ mod build_mcp_servers_tests {
             subscribe_mode: config::SubscribeMode::All,
             dedup_mode: config::DedupMode::Queue,
             session_policy: scope::SessionPolicy::Channel,
+            reply_placement: reply_placement::ReplyPlacement::Thread,
             multiple_event_handling: config::MultipleEventHandling::Queue,
             ignore_self: true,
             kinds_override: None,
@@ -9135,6 +9171,7 @@ mod error_outcome_emission_tests {
             subscribe_mode: config::SubscribeMode::All,
             dedup_mode: config::DedupMode::Queue,
             session_policy: scope::SessionPolicy::Channel,
+            reply_placement: reply_placement::ReplyPlacement::Thread,
             multiple_event_handling: config::MultipleEventHandling::Queue,
             ignore_self: true,
             kinds_override: None,

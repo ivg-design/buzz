@@ -12,9 +12,8 @@
 //!
 //! [`windows_install_command!`] emits the two-step form instead — download the
 //! vendor script to a file, then execute the file — which does not match that
-//! signature. All three runtimes use it, not only the one observed failing:
-//! Goose and Claude escaped by scoring under the classifier threshold, which is
-//! luck rather than design, and the threshold is not ours to depend on.
+//! signature. Every runtime that installs an external CLI uses it. Codex is not
+//! in this set because codex-acp supplies the CLI used by managed sessions.
 //!
 //! # Why one macro instead of three literals
 //!
@@ -117,15 +116,14 @@ mod tests {
         }
     }
 
-    /// All three runtimes must be hardened, not just the one observed failing.
-    /// Goose and Claude escaped only by scoring under the classifier threshold.
+    /// Every external CLI installer must be hardened.
     #[test]
     fn test_every_windows_install_command_downloads_to_a_file_then_executes_it() {
         let commands = windows_install_commands();
         assert_eq!(
             commands.len(),
-            3,
-            "expected exactly one Windows install command for each of goose, claude, codex"
+            2,
+            "expected exactly one Windows install command for goose and claude"
         );
         for (id, command) in commands {
             assert!(
@@ -212,7 +210,6 @@ mod tests {
                 "https://raw.githubusercontent.com/aaif-goose/goose/main/download_cli.ps1",
             ),
             ("claude", "https://claude.ai/install.ps1"),
-            ("codex", "https://chatgpt.com/codex/install.ps1"),
         ] {
             let runtime = known_acp_runtime_exact(id).unwrap();
             let command = runtime.cli_install_commands_windows[0];

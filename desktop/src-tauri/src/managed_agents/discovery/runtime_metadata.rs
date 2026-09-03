@@ -217,5 +217,18 @@ mod tests {
         );
         assert!(codex.adapter_install_instructions_url.contains("codex-acp"));
         assert!(codex.cli_install_hint.contains("Codex CLI"));
+        assert_eq!(
+            codex.underlying_cli, None,
+            "codex-acp uses its bundled Codex CLI rather than a PATH-resolved copy"
+        );
+        assert!(
+            codex.cli_install_commands_for_os().is_empty(),
+            "installing codex-acp must not install a second Codex CLI"
+        );
+        assert_eq!(
+            codex.auth_probe_args,
+            Some(&["codex-acp", "cli", "login", "status"][..]),
+            "auth readiness must probe the same bundled CLI codex-acp runs"
+        );
     }
 }

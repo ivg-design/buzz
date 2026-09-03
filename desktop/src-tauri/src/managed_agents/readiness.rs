@@ -336,8 +336,8 @@ pub enum Requirement {
     /// This is an informational surface only — there is no in-app destination
     /// that can repair an external config file; the user must edit it manually.
     CliConfigInvalid {
-        /// Arguments used in the probe (e.g. `["codex", "login", "status"]`);
-        /// `probe_args[0]` is the CLI name (e.g. `"codex"`).
+        /// Arguments used in the probe (e.g. `["codex-acp", "cli", "login", "status"]`);
+        /// `probe_args[0]` is the executable name.
         probe_args: Vec<String>,
         /// Human-readable hint shown when no structured copy is available.
         setup_copy: String,
@@ -405,8 +405,8 @@ impl AgentReadiness {
 ///   - `databricks` / `databricks_v2` → `DATABRICKS_HOST` (token optional —
 ///     OAuth PKCE is the fallback)
 /// * **claude**: a successful `claude auth status` probe.
-/// * **codex**: a successful `codex login status` probe (checks the codex
-///   credential store — NOT `OPENAI_API_KEY`).
+/// * **codex**: a successful `codex-acp cli login status` probe. The adapter
+///   delegates to its bundled Codex CLI and checks the shared credential store.
 /// * **unknown / custom command**: always `Ready` (no requirements known).
 ///
 /// Databricks note: `DATABRICKS_TOKEN` is `.unwrap_or_default()` in
@@ -454,7 +454,7 @@ fn collect_missing_requirements(
             "complete Claude Code authentication by running the Claude CLI",
             rt,
         ),
-        "codex" => cli_login::requirements(&["codex", "login", "status"], "run `codex login`", rt),
+        "codex" => cli_login::declared_requirements(rt, "run `codex-acp login`"),
         _ => vec![],
     }
 }

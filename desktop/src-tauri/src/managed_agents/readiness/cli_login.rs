@@ -10,6 +10,20 @@ use crate::managed_agents::{
 
 use super::{cli_probe, Requirement};
 
+/// Evaluate the auth probe declared by a built-in runtime.
+pub(super) fn declared_requirements(
+    runtime: &KnownAcpRuntime,
+    setup_copy: &str,
+) -> Vec<Requirement> {
+    requirements(
+        runtime
+            .auth_probe_args
+            .expect("a CLI-login runtime must declare an auth probe"),
+        setup_copy,
+        runtime,
+    )
+}
+
 /// Requirements for CLI-login runtimes (claude, codex).
 pub(super) fn requirements(
     probe_args: &[&str],

@@ -612,6 +612,7 @@ fn update_time_override_preserves_pin_for_persona_less_agent() {
 mod effort_clear;
 mod forced_discovery;
 mod managed_path_resolution;
+mod sidecar_precedence;
 #[cfg(unix)]
 #[test]
 fn probe_codex_acp_version_parses_full_semver_output() {
@@ -1126,37 +1127,34 @@ fn test_command_basenames_dotted_name_no_extra_candidates() {
 
 // ── Phase B: cli_install_commands_for_os ────────────────────────────────────
 
-/// Claude and Codex have non-empty default cli_install_commands (install.sh).
+/// Claude still installs its external CLI; Codex relies on the CLI bundled by
+/// codex-acp so a stale PATH copy cannot gate or poison managed sessions.
 #[test]
-fn test_claude_and_codex_have_cli_install_commands() {
+fn test_vendor_cli_install_contracts() {
     let claude = super::known_acp_runtime_exact("claude").unwrap();
     let codex = super::known_acp_runtime_exact("codex").unwrap();
     assert!(
         !claude.cli_install_commands.is_empty(),
         "claude must have cli install commands"
     );
-    assert!(
-        !codex.cli_install_commands.is_empty(),
-        "codex must have cli install commands"
-    );
+    assert!(codex.cli_install_commands.is_empty());
+    assert!(!codex.adapter_install_commands.is_empty());
 }
 
-/// cli_install_commands_for_os returns a non-empty slice for claude and codex.
+/// Platform selection must preserve the same external-CLI contract.
 #[test]
-fn test_cli_install_commands_for_os_non_empty_for_claude_codex() {
+fn test_cli_install_commands_for_os_matches_vendor_contracts() {
     let claude = super::known_acp_runtime_exact("claude").unwrap();
     let codex = super::known_acp_runtime_exact("codex").unwrap();
     assert!(
         !claude.cli_install_commands_for_os().is_empty(),
         "claude must have install commands on every platform"
     );
-    assert!(
-        !codex.cli_install_commands_for_os().is_empty(),
-        "codex must have install commands on every platform"
-    );
+    assert!(codex.cli_install_commands_for_os().is_empty());
 }
 
-/// On Windows, every vendor CLI selects its official PowerShell installer.
+/// On Windows, external vendor CLIs select their official PowerShell installer;
+/// Codex still installs only its self-contained ACP adapter.
 #[cfg(windows)]
 #[test]
 fn test_cli_install_commands_for_os_selects_powershell_on_windows() {
@@ -1173,20 +1171,13 @@ fn test_cli_install_commands_for_os_selects_powershell_on_windows() {
         claude_cmds, claude.cli_install_commands,
         "Windows must NOT use the default curl|bash commands for claude"
     );
-    assert_ne!(
-        codex_cmds, codex.cli_install_commands,
-        "Windows must NOT use the default curl|bash commands for codex"
-    );
+    assert!(codex_cmds.is_empty());
     assert_eq!(goose_cmds, goose.cli_install_commands_windows);
 
     // Verify they are the PowerShell installers.
     assert!(
         claude_cmds.iter().any(|c| c.contains("powershell")),
         "claude Windows install must use powershell; got: {claude_cmds:?}"
-    );
-    assert!(
-        codex_cmds.iter().any(|c| c.contains("powershell")),
-        "codex Windows install must use powershell; got: {codex_cmds:?}"
     );
     assert!(
         goose_cmds.iter().any(|c| c.contains("download_cli.ps1")),

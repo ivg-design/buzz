@@ -90,9 +90,11 @@ pub(crate) const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
         avatar_url: CODEX_AVATAR_URL,
         mcp_command: Some("buzz-dev-mcp"),
         mcp_hooks: false,
-        underlying_cli: Some("codex"),
-        cli_install_commands: &["curl -fsSL https://chatgpt.com/codex/install.sh | sh"],
-        cli_install_commands_windows: &[windows_install_command!("codex", "https://chatgpt.com/codex/install.ps1")],
+        // codex-acp ships a compatible Codex CLI and uses it by default. Do not
+        // gate the adapter on, or install, a separate PATH-resolved Codex copy.
+        underlying_cli: None,
+        cli_install_commands: &[],
+        cli_install_commands_windows: &[],
         adapter_install_commands: &["npm install -g @agentclientprotocol/codex-acp"],
         cli_install_instructions_url: "https://developers.openai.com/codex/cli/",
         adapter_install_instructions_url: "https://github.com/agentclientprotocol/codex-acp",
@@ -114,9 +116,10 @@ pub(crate) const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
         context_limit_env_var: None,
         max_rounds_env_var: None,
         required_normalized_fields: &[],
-        login_hint: Some("Run `codex login` to authenticate."),
-        // Verified: `codex login status` exits 0 when logged in, non-zero otherwise.
-        auth_probe_args: Some(&["codex", "login", "status"]),
+        login_hint: Some("Run `codex-acp login` to authenticate."),
+        // `codex-acp cli` runs the adapter's bundled Codex CLI, matching the
+        // binary used by managed sessions instead of whichever `codex` shadows PATH.
+        auth_probe_args: Some(&["codex-acp", "cli", "login", "status"]),
     },
     KnownAcpRuntime {
         id: "buzz-agent",

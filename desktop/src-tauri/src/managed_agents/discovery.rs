@@ -351,8 +351,8 @@ pub fn normalize_agent_args(command: &str, agent_args: Vec<String>) -> Vec<Strin
     normalized
 }
 
-fn profile_target_dirs(root: &Path) -> [PathBuf; 2] {
-    if cfg!(debug_assertions) {
+fn profile_target_dirs(root: &Path, debug_build: bool) -> [PathBuf; 2] {
+    if debug_build {
         // `just dev` builds fresh debug sidecars; never prefer stale release output.
         [root.join("target/debug"), root.join("target/release")]
     } else {
@@ -360,23 +360,52 @@ fn profile_target_dirs(root: &Path) -> [PathBuf; 2] {
     }
 }
 
-fn command_search_dirs() -> Vec<PathBuf> {
-    let mut dirs = profile_target_dirs(&workspace_root_dir()).to_vec();
-    if let Ok(current_dir) = std::env::current_dir() {
-        dirs.extend(profile_target_dirs(&current_dir));
+fn command_search_dirs_for(
+    workspace_root: &Path,
+    current_dir: Option<&Path>,
+    executable_dir: Option<&Path>,
+    debug_build: bool,
+) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+
+    // A release binary may be packaged far from the source checkout recorded
+    // by CARGO_MANIFEST_DIR. Its sibling sidecars belong to that exact app
+    // build and must win over stale target output left in the checkout.
+    if !debug_build {
+        dirs.extend(executable_dir.map(Path::to_path_buf));
     }
 
-    dirs.extend(
-        std::env::current_exe()
-            .ok()
-            .and_then(|path| path.parent().map(Path::to_path_buf)),
-    );
+    dirs.extend(profile_target_dirs(workspace_root, debug_build));
+    if let Some(current_dir) = current_dir {
+        dirs.extend(profile_target_dirs(current_dir, debug_build));
+    }
+
+    // Development keeps the existing checkout-first behavior because `just
+    // dev` refreshes target/debug before launching the desktop shell.
+    if debug_build {
+        dirs.extend(executable_dir.map(Path::to_path_buf));
+    }
+
     dirs.into_iter().fold(Vec::new(), |mut unique, dir| {
         if !unique.contains(&dir) {
             unique.push(dir);
         }
         unique
     })
+}
+
+fn command_search_dirs() -> Vec<PathBuf> {
+    let current_dir = std::env::current_dir().ok();
+    let executable_dir = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf));
+
+    command_search_dirs_for(
+        &workspace_root_dir(),
+        current_dir.as_deref(),
+        executable_dir.as_deref(),
+        cfg!(debug_assertions),
+    )
 }
 
 fn is_executable_file(path: &Path) -> bool {

@@ -31,6 +31,7 @@ import {
 } from "@/shared/ui/dropdown-menu";
 import { Input } from "@/shared/ui/input";
 import { Popover, PopoverAnchor, PopoverContent } from "@/shared/ui/popover";
+import { AdminRoleConfirmation } from "./AdminRoleConfirmation";
 
 const ROLE_OPTIONS: Array<{
   value: RelayMemberRole;
@@ -73,6 +74,7 @@ export function DirectAddMemberForm({
   );
   const [role, setRole] = React.useState<RelayMemberRole>("member");
   const [isPickerOpen, setIsPickerOpen] = React.useState(false);
+  const [adminConfirmOpen, setAdminConfirmOpen] = React.useState(false);
   const searchInputRef = React.useRef<HTMLInputElement>(null);
   const shouldReduceMotion = useReducedMotion();
 
@@ -92,7 +94,7 @@ export function DirectAddMemberForm({
     (membersQuery.data ?? []).some(
       (m) => m.pubkey.toLowerCase() === parsedPubkey.toLowerCase(),
     );
-  const canAdd = selectedUsers.length > 0 && !addMutation.isPending;
+  const canAdd = selectedUsers.length === 1 && !addMutation.isPending;
   const searchResults = React.useMemo(
     () =>
       (userSearchQuery.data ?? []).filter(
@@ -141,18 +143,14 @@ export function DirectAddMemberForm({
     setSelectedUsers([]);
     setRole("member");
     setIsPickerOpen(false);
+    setAdminConfirmOpen(false);
     addMutation.reset();
   }
 
   function selectUser(user: UserSearchResult) {
-    setSelectedUsers((currentUsers) =>
-      currentUsers.some(
-        (currentUser) =>
-          currentUser.pubkey.toLowerCase() === user.pubkey.toLowerCase(),
-      )
-        ? currentUsers
-        : [...currentUsers, user],
-    );
+    // Relay roster commands are one-recipient events. A new choice replaces
+    // the old one so UI intent and the signed NIP-43 command stay atomic.
+    setSelectedUsers([user]);
     setQuery("");
     setIsPickerOpen(true);
     window.requestAnimationFrame(() => {
@@ -171,20 +169,12 @@ export function DirectAddMemberForm({
 
   async function handleAdd() {
     if (!canAdd) return;
+    const [user] = selectedUsers;
+    if (!user) return;
 
     try {
-      for (const user of selectedUsers) {
-        await addMutation.mutateAsync({ pubkey: user.pubkey, role });
-      }
-      toast.success(
-        selectedUsers.length === 1
-          ? role === "admin"
-            ? "Admin added"
-            : "Member added"
-          : role === "admin"
-            ? "Admins added"
-            : "Members added",
-      );
+      await addMutation.mutateAsync({ pubkey: user.pubkey, role });
+      toast.success(role === "admin" ? "Admin added" : "Member added");
       reset();
       onAdded?.();
     } catch {
@@ -193,228 +183,243 @@ export function DirectAddMemberForm({
   }
 
   return (
-    <form
-      className="space-y-4"
-      data-testid="direct-add-member-form"
-      onSubmit={(event) => {
-        event.preventDefault();
-        handleAdd();
-      }}
-    >
-      <div className="space-y-1.5">
-        {showLabel ? (
-          <label className="text-sm font-medium" htmlFor="member-search">
-            Person
-          </label>
-        ) : null}
-        <div className="flex gap-2">
-          <Popover
-            modal={false}
-            onOpenChange={setIsPickerOpen}
-            open={isPickerOpen && deferredQuery.length > 0}
-          >
-            <PopoverAnchor asChild>
-              <div
-                className="min-w-0 flex-1 rounded-md border border-input bg-background focus-within:ring-1 focus-within:ring-ring"
-                data-testid="member-recipient-field"
+    <>
+      <form
+        className="space-y-4"
+        data-testid="direct-add-member-form"
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (role === "admin") {
+            setAdminConfirmOpen(true);
+          } else {
+            void handleAdd();
+          }
+        }}
+      >
+        <div className="space-y-1.5">
+          {showLabel ? (
+            <label className="text-sm font-medium" htmlFor="member-search">
+              Person
+            </label>
+          ) : null}
+          <div className="flex gap-2">
+            <Popover
+              modal={false}
+              onOpenChange={setIsPickerOpen}
+              open={isPickerOpen && deferredQuery.length > 0}
+            >
+              <PopoverAnchor asChild>
+                <div
+                  className="min-w-0 flex-1 rounded-md border border-input bg-background focus-within:ring-1 focus-within:ring-ring"
+                  data-testid="member-recipient-field"
+                >
+                  <div
+                    className={`grid min-h-10 min-w-0 grid-cols-[minmax(0,1fr)_auto] gap-x-3 p-1.5 ${selectedUsers.length > 1 ? "items-start" : "items-center"}`}
+                  >
+                    <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+                      {selectedUsers.length === 0 ? (
+                        <Search className="h-4 w-4 shrink-0 text-muted-foreground/55" />
+                      ) : null}
+                      {selectedUsers.map((user) => (
+                        <motion.div
+                          key={user.pubkey}
+                          layout="position"
+                          transition={actionTransition}
+                        >
+                          <SelectedRecipientChip
+                            disabled={addMutation.isPending}
+                            inspectable={false}
+                            label={formatSearchUserName(user)}
+                            onRemove={() => removeUser(user.pubkey)}
+                            poofOnRemove={false}
+                            testIds={{
+                              chip: `member-search-selection-remove-${user.pubkey}`,
+                            }}
+                            user={user}
+                          />
+                        </motion.div>
+                      ))}
+                      <Input
+                        aria-autocomplete="list"
+                        aria-controls="member-search-results"
+                        aria-expanded={isPickerOpen}
+                        autoCapitalize="none"
+                        autoCorrect="off"
+                        className="h-7 w-auto min-w-16 flex-1 border-0 bg-transparent px-0 py-0.5 text-sm shadow-none outline-hidden placeholder:text-muted-foreground/55 focus-visible:ring-0"
+                        data-testid="member-pubkey-input"
+                        disabled={addMutation.isPending}
+                        id="member-search"
+                        onChange={(event) => {
+                          setQuery(event.target.value);
+                          setIsPickerOpen(true);
+                        }}
+                        onFocus={() => setIsPickerOpen(true)}
+                        onKeyDown={(event) => {
+                          if (
+                            event.key === "Backspace" &&
+                            query.length === 0 &&
+                            selectedUsers.length > 0
+                          ) {
+                            event.preventDefault();
+                            const lastUser = selectedUsers.at(-1);
+                            if (lastUser) removeUser(lastUser.pubkey);
+                          }
+                        }}
+                        placeholder={
+                          selectedUsers.length === 0
+                            ? "Search people or paste an npub"
+                            : ""
+                        }
+                        ref={searchInputRef}
+                        role="combobox"
+                        spellCheck={false}
+                        value={query}
+                      />
+                    </div>
+                    <AnimatePresence initial={false}>
+                      {selectedUsers.length > 0 ? (
+                        <motion.div
+                          animate={{ opacity: 1, scale: 1, x: 0 }}
+                          className="shrink-0"
+                          exit={{ opacity: 0, scale: 0.96, x: -4 }}
+                          initial={{ opacity: 0, scale: 0.96, x: -4 }}
+                          transition={actionTransition}
+                        >
+                          <DropdownMenu modal={false}>
+                            <DropdownMenuTrigger asChild>
+                              <button
+                                aria-label="Choose member role"
+                                className="inline-flex items-center gap-1.5 bg-transparent text-sm text-muted-foreground outline-hidden transition-colors hover:text-foreground focus-visible:text-foreground disabled:cursor-not-allowed disabled:opacity-60"
+                                data-testid="member-role"
+                                disabled={addMutation.isPending}
+                                type="button"
+                              >
+                                {selectedRoleLabel}
+                                <ChevronDown className="h-3.5 w-3.5 shrink-0" />
+                              </button>
+                            </DropdownMenuTrigger>
+                            <DropdownMenuContent
+                              align="end"
+                              onCloseAutoFocus={(event) =>
+                                event.preventDefault()
+                              }
+                              sideOffset={4}
+                              style={{ minWidth: "13rem" }}
+                            >
+                              <DropdownMenuRadioGroup
+                                onValueChange={(value) =>
+                                  setRole(value as RelayMemberRole)
+                                }
+                                value={role}
+                              >
+                                {roleOptions.map((option) => (
+                                  <DropdownMenuRadioItem
+                                    key={option.value}
+                                    value={option.value}
+                                  >
+                                    {option.label}
+                                  </DropdownMenuRadioItem>
+                                ))}
+                              </DropdownMenuRadioGroup>
+                            </DropdownMenuContent>
+                          </DropdownMenu>
+                        </motion.div>
+                      ) : null}
+                    </AnimatePresence>
+                  </div>
+                </div>
+              </PopoverAnchor>
+              <PopoverContent
+                align="start"
+                className="w-(--radix-popover-trigger-width) overflow-hidden p-0"
+                data-testid="member-search-popover"
+                onCloseAutoFocus={(event) => event.preventDefault()}
+                onOpenAutoFocus={(event) => event.preventDefault()}
+                sideOffset={6}
               >
                 <div
-                  className={`grid min-h-10 min-w-0 grid-cols-[minmax(0,1fr)_auto] gap-x-3 p-1.5 ${selectedUsers.length > 1 ? "items-start" : "items-center"}`}
+                  className="max-h-64 overflow-y-auto overscroll-contain py-1"
+                  data-testid="member-search-results"
+                  id="member-search-results"
+                  role="listbox"
                 >
-                  <div className="flex min-w-0 flex-wrap items-center gap-1.5">
-                    {selectedUsers.length === 0 ? (
-                      <Search className="h-4 w-4 shrink-0 text-muted-foreground/55" />
-                    ) : null}
-                    {selectedUsers.map((user) => (
-                      <motion.div
-                        key={user.pubkey}
-                        layout="position"
-                        transition={actionTransition}
-                      >
-                        <SelectedRecipientChip
-                          disabled={addMutation.isPending}
-                          inspectable={false}
-                          label={formatSearchUserName(user)}
-                          onRemove={() => removeUser(user.pubkey)}
-                          poofOnRemove={false}
-                          testIds={{
-                            chip: `member-search-selection-remove-${user.pubkey}`,
-                          }}
+                  {userSearchQuery.isLoading ? (
+                    <p className="px-3 py-3 text-sm text-muted-foreground">
+                      Searching…
+                    </p>
+                  ) : searchResults.length > 0 || directResult ? (
+                    <>
+                      {directResult ? (
+                        <SearchResult
+                          onSelect={() => selectUser(directResult)}
+                          user={directResult}
+                        />
+                      ) : null}
+                      {searchResults.map((user) => (
+                        <SearchResult
+                          key={user.pubkey}
+                          onSelect={() => selectUser(user)}
                           user={user}
                         />
-                      </motion.div>
-                    ))}
-                    <Input
-                      aria-autocomplete="list"
-                      aria-controls="member-search-results"
-                      aria-expanded={isPickerOpen}
-                      autoCapitalize="none"
-                      autoCorrect="off"
-                      className="h-7 w-auto min-w-16 flex-1 border-0 bg-transparent px-0 py-0.5 text-sm shadow-none outline-hidden placeholder:text-muted-foreground/55 focus-visible:ring-0"
-                      data-testid="member-pubkey-input"
-                      disabled={addMutation.isPending}
-                      id="member-search"
-                      onChange={(event) => {
-                        setQuery(event.target.value);
-                        setIsPickerOpen(true);
-                      }}
-                      onFocus={() => setIsPickerOpen(true)}
-                      onKeyDown={(event) => {
-                        if (
-                          event.key === "Backspace" &&
-                          query.length === 0 &&
-                          selectedUsers.length > 0
-                        ) {
-                          event.preventDefault();
-                          const lastUser = selectedUsers.at(-1);
-                          if (lastUser) removeUser(lastUser.pubkey);
-                        }
-                      }}
-                      placeholder={
-                        selectedUsers.length === 0
-                          ? "Search people or paste an npub"
-                          : ""
-                      }
-                      ref={searchInputRef}
-                      role="combobox"
-                      spellCheck={false}
-                      value={query}
-                    />
-                  </div>
-                  <AnimatePresence initial={false}>
-                    {selectedUsers.length > 0 ? (
-                      <motion.div
-                        animate={{ opacity: 1, scale: 1, x: 0 }}
-                        className="shrink-0"
-                        exit={{ opacity: 0, scale: 0.96, x: -4 }}
-                        initial={{ opacity: 0, scale: 0.96, x: -4 }}
-                        transition={actionTransition}
-                      >
-                        <DropdownMenu modal={false}>
-                          <DropdownMenuTrigger asChild>
-                            <button
-                              aria-label="Choose member role"
-                              className="inline-flex items-center gap-1.5 bg-transparent text-sm text-muted-foreground outline-hidden transition-colors hover:text-foreground focus-visible:text-foreground disabled:cursor-not-allowed disabled:opacity-60"
-                              data-testid="member-role"
-                              disabled={addMutation.isPending}
-                              type="button"
-                            >
-                              {selectedRoleLabel}
-                              <ChevronDown className="h-3.5 w-3.5 shrink-0" />
-                            </button>
-                          </DropdownMenuTrigger>
-                          <DropdownMenuContent
-                            align="end"
-                            onCloseAutoFocus={(event) => event.preventDefault()}
-                            sideOffset={4}
-                            style={{ minWidth: "13rem" }}
-                          >
-                            <DropdownMenuRadioGroup
-                              onValueChange={(value) =>
-                                setRole(value as RelayMemberRole)
-                              }
-                              value={role}
-                            >
-                              {roleOptions.map((option) => (
-                                <DropdownMenuRadioItem
-                                  key={option.value}
-                                  value={option.value}
-                                >
-                                  {option.label}
-                                </DropdownMenuRadioItem>
-                              ))}
-                            </DropdownMenuRadioGroup>
-                          </DropdownMenuContent>
-                        </DropdownMenu>
-                      </motion.div>
-                    ) : null}
-                  </AnimatePresence>
+                      ))}
+                    </>
+                  ) : (
+                    <p className="px-3 py-3 text-sm text-muted-foreground">
+                      No people found. Paste a full npub or hex public key to
+                      add someone directly.
+                    </p>
+                  )}
                 </div>
-              </div>
-            </PopoverAnchor>
-            <PopoverContent
-              align="start"
-              className="w-(--radix-popover-trigger-width) overflow-hidden p-0"
-              data-testid="member-search-popover"
-              onCloseAutoFocus={(event) => event.preventDefault()}
-              onOpenAutoFocus={(event) => event.preventDefault()}
-              sideOffset={6}
-            >
-              <div
-                className="max-h-64 overflow-y-auto overscroll-contain py-1"
-                data-testid="member-search-results"
-                id="member-search-results"
-                role="listbox"
-              >
-                {userSearchQuery.isLoading ? (
-                  <p className="px-3 py-3 text-sm text-muted-foreground">
-                    Searching…
-                  </p>
-                ) : searchResults.length > 0 || directResult ? (
-                  <>
-                    {directResult ? (
-                      <SearchResult
-                        onSelect={() => selectUser(directResult)}
-                        user={directResult}
-                      />
-                    ) : null}
-                    {searchResults.map((user) => (
-                      <SearchResult
-                        key={user.pubkey}
-                        onSelect={() => selectUser(user)}
-                        user={user}
-                      />
-                    ))}
-                  </>
-                ) : (
-                  <p className="px-3 py-3 text-sm text-muted-foreground">
-                    No people found. Paste a full npub or hex public key to add
-                    someone directly.
-                  </p>
-                )}
-              </div>
-            </PopoverContent>
-          </Popover>
-          <AnimatePresence initial={false}>
-            {selectedUsers.length > 0 ? (
-              <motion.div
-                animate={{ opacity: 1, scale: 1, x: 0 }}
-                className="shrink-0"
-                exit={{ opacity: 0, scale: 0.96, x: -4 }}
-                initial={{ opacity: 0, scale: 0.96, x: -4 }}
-                transition={actionTransition}
-              >
-                <Button
-                  className="h-11"
-                  data-testid="confirm-add-member"
-                  disabled={!canAdd}
-                  size="sm"
-                  type="submit"
+              </PopoverContent>
+            </Popover>
+            <AnimatePresence initial={false}>
+              {selectedUsers.length > 0 ? (
+                <motion.div
+                  animate={{ opacity: 1, scale: 1, x: 0 }}
+                  className="shrink-0"
+                  exit={{ opacity: 0, scale: 0.96, x: -4 }}
+                  initial={{ opacity: 0, scale: 0.96, x: -4 }}
+                  transition={actionTransition}
                 >
-                  {addMutation.isPending ? "Inviting…" : submitLabel}
-                </Button>
-              </motion.div>
-            ) : null}
-          </AnimatePresence>
+                  <Button
+                    className="h-11"
+                    data-testid="confirm-add-member"
+                    disabled={!canAdd}
+                    size="sm"
+                    type="submit"
+                  >
+                    {addMutation.isPending ? "Inviting…" : submitLabel}
+                  </Button>
+                </motion.div>
+              ) : null}
+            </AnimatePresence>
+          </div>
+          {isAlreadyMember ? (
+            <p className="text-xs text-destructive">
+              This person is already a community member.
+            </p>
+          ) : null}
+          {userSearchQuery.error instanceof Error ? (
+            <p className="text-xs text-destructive">
+              {userSearchQuery.error.message}
+            </p>
+          ) : null}
         </div>
-        {isAlreadyMember ? (
-          <p className="text-xs text-destructive">
-            This person is already a community member.
-          </p>
-        ) : null}
-        {userSearchQuery.error instanceof Error ? (
-          <p className="text-xs text-destructive">
-            {userSearchQuery.error.message}
-          </p>
-        ) : null}
-      </div>
 
-      {addMutation.error instanceof Error ? (
-        <p className="rounded-xl border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
-          {addMutation.error.message}
-        </p>
-      ) : null}
-    </form>
+        {addMutation.error instanceof Error ? (
+          <p className="rounded-xl border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+            {addMutation.error.message}
+          </p>
+        ) : null}
+      </form>
+      <AdminRoleConfirmation
+        count={selectedUsers.length}
+        disabled={addMutation.isPending}
+        onConfirm={() => void handleAdd()}
+        onOpenChange={setAdminConfirmOpen}
+        open={adminConfirmOpen}
+      />
+    </>
   );
 }
 

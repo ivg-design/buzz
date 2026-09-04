@@ -5,8 +5,21 @@ use super::{
     parse_entity_deep_link, parse_join_deep_link, parse_message_deep_link,
     parse_nostr_bind_deep_link, PendingCommunityDeepLink, PendingCommunityDeepLinks,
     PendingEntityDeepLinks, PendingNavigationDeepLink, PendingNavigationDeepLinks,
-    ENTITY_LINK_TABS,
+    ENTITY_LINK_TABS, MAX_COMMUNITY_DEEP_LINK_URL_LEN, MAX_INVITE_CODE_LEN,
+    MAX_PENDING_COMMUNITY_DEEP_LINKS, MAX_POLICY_RECEIPT_LEN,
 };
+
+fn valid_v2_code(seed: u8) -> String {
+    buzz_core_pkg::invite::encode_v2_code(&[seed; buzz_core_pkg::invite::V2_SECRET_LEN])
+}
+
+fn valid_legacy_code() -> String {
+    format!("e30.{}", "A".repeat(43))
+}
+
+fn valid_policy_receipt() -> String {
+    format!("e30.{}", "A".repeat(43))
+}
 
 fn entity_link_golden() -> serde_json::Value {
     serde_json::from_str(include_str!("../../../test-fixtures/entity-links.json"))
@@ -249,6 +262,25 @@ fn pending_community_links_dedupe_exact_intents() {
 }
 
 #[test]
+fn pending_community_links_are_bounded_and_drop_new_overflow() {
+    let queue = PendingCommunityDeepLinks::default();
+    for index in 0..MAX_PENDING_COMMUNITY_DEEP_LINKS {
+        assert!(queue.enqueue(pending(
+            &format!("item-{index}"),
+            &format!("wss://relay-{index}.example"),
+            Some(&format!("code-{index}")),
+        )));
+    }
+    assert!(!queue.enqueue(pending(
+        "overflow",
+        "wss://overflow.example",
+        Some("overflow"),
+    )));
+    assert_eq!(queue.lock().len(), MAX_PENDING_COMMUNITY_DEEP_LINKS);
+    assert_eq!(queue.first().unwrap().id, "item-0");
+}
+
+#[test]
 fn pending_entity_links_survive_until_acknowledged_in_order() {
     let queue = PendingEntityDeepLinks::default();
     let first = queue.enqueue("buzz://project?owner=aa&d=first".to_owned());
@@ -282,7 +314,7 @@ fn valid_nostr_bind_url() -> Url {
 #[test]
 fn parse_add_community_deep_link_extracts_relay_and_name() {
     let url = Url::parse(
-        "buzz://add-community?relay=wss%3A%2F%2Facme.communities.buzz.xyz&name=Acme%20Team&ignored=value",
+        "buzz://add-community?relay=wss%3A%2F%2Facme.communities.buzz.xyz&name=Acme%20Team",
     )
     .unwrap();
     let payload = parse_add_community_deep_link(&url).unwrap();
@@ -311,9 +343,29 @@ fn parse_add_community_deep_link_rejects_invalid_relays() {
         "buzz://add-community?relay=not-a-url",
         "buzz://add-community?relay=https%3A%2F%2Facme.example",
         "buzz://add-community?relay=wss%3A%2F%2F",
+        "buzz://add-community?relay=wss%3A%2F%2Fuser%3Apass%40acme.example",
+        "buzz://add-community?relay=wss%3A%2F%2Facme.example%2Frooms",
+        "buzz://add-community?relay=wss%3A%2F%2Facme.example%3Fx%3D1",
+        "buzz://add-community?relay=wss%3A%2F%2Facme.example%23fragment",
+        "buzz://add-community?relay=wss%3A%2F%2FAcme.Example",
+        "buzz://add-community?relay=wss%3A%2F%2Facme.example%3A443",
+        "buzz://add-community?relay=wss%3A%2F%2Facme.example%2F",
+        "buzz://add-community?relay=wss%3A%2F%2Facme.example&relay=wss%3A%2F%2Fother.example",
+        "buzz://add-community?relay=wss%3A%2F%2Facme.example&ignored=value",
     ] {
         assert!(parse_add_community_deep_link(&Url::parse(raw).unwrap()).is_none());
     }
+}
+
+#[test]
+fn parse_add_community_deep_link_rejects_oversized_input_before_queueing() {
+    let oversized_name = "a".repeat(MAX_COMMUNITY_DEEP_LINK_URL_LEN);
+    let url = Url::parse(&format!(
+        "buzz://add-community?relay=wss%3A%2F%2Facme.example&name={oversized_name}"
+    ))
+    .unwrap();
+    assert!(url.as_str().len() > MAX_COMMUNITY_DEEP_LINK_URL_LEN);
+    assert!(parse_add_community_deep_link(&url).is_none());
 }
 
 #[test]
@@ -425,21 +477,52 @@ fn parse_message_deep_link_treats_empty_thread_as_absent() {
 
 #[test]
 fn parse_join_deep_link_extracts_relay_and_code() {
-    let url = Url::parse("buzz://join?relay=wss%3A%2F%2Frelay.example&code=abc.def").unwrap();
+    let code = valid_v2_code(7);
+    let url = Url::parse(&format!(
+        "buzz://join?relay=wss%3A%2F%2Frelay.example&code={code}"
+    ))
+    .unwrap();
     let payload = parse_join_deep_link(&url).expect("required params present");
     assert_eq!(payload["relayUrl"], "wss://relay.example");
-    assert_eq!(payload["code"], "abc.def");
+    assert_eq!(payload["code"], code);
     assert!(payload["policyReceipt"].is_null());
 }
 
 #[test]
+fn parse_join_deep_link_accepts_canonical_legacy_v1_code() {
+    let code = valid_legacy_code();
+    let url = Url::parse(&format!(
+        "buzz://join?relay=wss%3A%2F%2Frelay.example&code={code}"
+    ))
+    .unwrap();
+    assert_eq!(parse_join_deep_link(&url).unwrap()["code"], code);
+}
+
+#[test]
+fn pending_join_debug_redacts_bearer_material() {
+    let pending = PendingCommunityDeepLink {
+        id: "id".to_owned(),
+        kind: "join".to_owned(),
+        relay_url: "wss://relay.example".to_owned(),
+        code: Some("v2.super-secret".to_owned()),
+        policy_receipt: Some("receipt.super-secret".to_owned()),
+        name: None,
+    };
+    let debug = format!("{pending:?}");
+    assert!(debug.contains("[redacted]"));
+    assert!(!debug.contains("super-secret"));
+}
+
+#[test]
 fn parse_join_deep_link_extracts_policy_receipt() {
-    let url = Url::parse(
-        "buzz://join?relay=wss%3A%2F%2Frelay.example&code=abc.def&policy_receipt=receipt.value",
-    )
+    let code = valid_v2_code(8);
+    let receipt = valid_policy_receipt();
+    let url = Url::parse(&format!(
+        "buzz://join?relay=wss%3A%2F%2Frelay.example&code={code}&policy_receipt={receipt}"
+    ))
     .unwrap();
     let payload = parse_join_deep_link(&url).expect("required params present");
-    assert_eq!(payload["policyReceipt"], "receipt.value");
+    assert_eq!(payload["policyReceipt"], receipt);
 }
 
 #[test]
@@ -456,14 +539,51 @@ fn parse_join_deep_link_rejects_empty_code() {
 
 #[test]
 fn parse_join_deep_link_rejects_missing_relay() {
-    let url = Url::parse("buzz://join?code=abc.def").unwrap();
+    let url = Url::parse(&format!("buzz://join?code={}", valid_v2_code(9))).unwrap();
     assert!(parse_join_deep_link(&url).is_none());
 }
 
 #[test]
 fn parse_join_deep_link_rejects_non_websocket_relay() {
-    let url = Url::parse("buzz://join?relay=https%3A%2F%2Frelay.example&code=abc.def").unwrap();
+    let url = Url::parse(&format!(
+        "buzz://join?relay=https%3A%2F%2Frelay.example&code={}",
+        valid_v2_code(10)
+    ))
+    .unwrap();
     assert!(parse_join_deep_link(&url).is_none());
+}
+
+#[test]
+fn parse_join_deep_link_rejects_noncanonical_duplicate_and_unknown_fields() {
+    let code = valid_v2_code(11);
+    for raw in [
+        format!("buzz://join?relay=wss%3A%2F%2Frelay.example&code=v2.short"),
+        format!("buzz://join?relay=wss%3A%2F%2Frelay.example&code=e30.bad"),
+        format!("buzz://join?relay=wss%3A%2F%2Frelay.example&code={code}&code={code}"),
+        format!("buzz://join?relay=wss%3A%2F%2Frelay.example&code={code}&extra=x"),
+        format!("buzz://join/path?relay=wss%3A%2F%2Frelay.example&code={code}"),
+        format!("buzz://join?relay=wss%3A%2F%2Frelay.example&code={code}#fragment"),
+    ] {
+        assert!(parse_join_deep_link(&Url::parse(&raw).unwrap()).is_none(), "{raw}");
+    }
+}
+
+#[test]
+fn parse_join_deep_link_rejects_oversized_code_and_policy_receipt() {
+    let oversized_code = "a".repeat(MAX_INVITE_CODE_LEN + 1);
+    let code_url = Url::parse(&format!(
+        "buzz://join?relay=wss%3A%2F%2Frelay.example&code={oversized_code}"
+    ))
+    .unwrap();
+    assert!(parse_join_deep_link(&code_url).is_none());
+
+    let code = valid_v2_code(12);
+    let oversized_receipt = "a".repeat(MAX_POLICY_RECEIPT_LEN + 1);
+    let receipt_url = Url::parse(&format!(
+        "buzz://join?relay=wss%3A%2F%2Frelay.example&code={code}&policy_receipt={oversized_receipt}"
+    ))
+    .unwrap();
+    assert!(parse_join_deep_link(&receipt_url).is_none());
 }
 
 #[test]

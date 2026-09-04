@@ -30,6 +30,8 @@ import {
 } from "@/shared/ui/dropdown-menu";
 import { VirtualizedList } from "@/shared/ui/VirtualizedList";
 import { CommunityInviteDialog } from "./CommunityInviteDialog";
+import { PendingInviteList } from "./PendingInviteList";
+import { AdminRoleConfirmation } from "./AdminRoleConfirmation";
 
 function formatDisplayName(member: RelayMember, displayName?: string | null) {
   const trimmedDisplayName = displayName?.trim();
@@ -101,6 +103,7 @@ function RelayMemberRow({
     ? normalizePubkey(currentPubkey) === normalizePubkey(member.pubkey)
     : false;
   const isBusy = removeMutation.isPending || changeRoleMutation.isPending;
+  const [adminConfirmOpen, setAdminConfirmOpen] = React.useState(false);
   const canRemove =
     !isSelf &&
     member.role !== "owner" &&
@@ -191,18 +194,7 @@ function RelayMemberRow({
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end">
             {canPromote ? (
-              <DropdownMenuItem
-                onClick={() =>
-                  void mutateWithToast(
-                    () =>
-                      changeRoleMutation.mutateAsync({
-                        pubkey: member.pubkey,
-                        role: "admin",
-                      }),
-                    "Made community admin",
-                  )
-                }
-              >
+              <DropdownMenuItem onClick={() => setAdminConfirmOpen(true)}>
                 Make admin
               </DropdownMenuItem>
             ) : null}
@@ -241,6 +233,22 @@ function RelayMemberRow({
           </DropdownMenuContent>
         </DropdownMenu>
       ) : null}
+      <AdminRoleConfirmation
+        disabled={changeRoleMutation.isPending}
+        onConfirm={() => {
+          setAdminConfirmOpen(false);
+          void mutateWithToast(
+            () =>
+              changeRoleMutation.mutateAsync({
+                pubkey: member.pubkey,
+                role: "admin",
+              }),
+            "Made community admin",
+          );
+        }}
+        onOpenChange={setAdminConfirmOpen}
+        open={adminConfirmOpen}
+      />
     </div>
   );
 }
@@ -377,6 +385,10 @@ export function CommunityMembersSettingsCard({
             />
           )}
         </div>
+      </SettingsOptionGroup>
+
+      <SettingsOptionGroup title="Pending invite links">
+        <PendingInviteList />
       </SettingsOptionGroup>
 
       <CommunityInviteDialog

@@ -1,16 +1,17 @@
-//! Relay invite HTTP API — mint and claim stateless invite codes.
+//! Relay invite HTTP API — mint and atomically claim invite codes.
 //!
 //! Routes (both NIP-98 signed, outside the Nostr event data plane):
 //!
-//! - `POST /api/invites` — mint an invite code. Caller must hold the `owner`
+//! - `POST /api/invites` — mint a durable, opaque invite code. Caller must hold the `owner`
 //!   or `admin` role in the tenant community (mirrors the kind:9030 authz).
 //! - `POST /api/invites/claim` — claim an invite code. Deliberately **exempt
 //!   from the relay-membership gate**: the whole point is that the caller is
 //!   not a member yet. NIP-98 proves control of the joining pubkey; the HMAC
 //!   on the code proves an admin authorized the join.
 //!
-//! Token format, key derivation, and security trade-offs live in
-//! [`crate::invite_token`].
+//! The database-backed v2 token contract lives in [`buzz_core::invite`].
+//! [`crate::invite_token`] retains the legacy v1 drain-window verifier and
+//! join-policy receipt helpers.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -53,9 +54,9 @@ pub struct MintInviteRequest {
     /// [`invite_token::MAX_INVITE_TTL_SECS`]; defaults to 72 h.
     #[serde(default)]
     pub ttl_secs: Option<u64>,
-    /// Maximum number of uses before the invite is exhausted. `None` (omitted
-    /// or `null`) means unlimited — preserves current behavior. When present,
-    /// must be an integer from 1 through [`MAX_INVITE_USES`].
+    /// Maximum number of uses before the invite is exhausted. Omitted or
+    /// `null` defaults to one use. When present, must be an integer from 1
+    /// through [`MAX_INVITE_USES`].
     #[serde(default)]
     pub max_uses: Option<i32>,
 }
@@ -83,11 +84,11 @@ fn validate_mint_request(
         }
     }
 
-    Ok((ttl, request.max_uses))
+    Ok((ttl, Some(request.max_uses.unwrap_or(1))))
 }
 
 /// Body for `POST /api/invites/claim`.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct ClaimInviteRequest {
     /// The invite code to redeem.
     pub code: String,
@@ -97,7 +98,7 @@ pub struct ClaimInviteRequest {
 }
 
 /// Body for `POST /api/invites/accept-policy`.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct AcceptPolicyRequest {
     /// Invite code the acceptance receipt will be bound to.
     pub code: String,
@@ -344,11 +345,15 @@ pub async fn mint_invite(
     let expires_at_unix = invite.expires_at.timestamp() as u64;
 
     Ok(Json(serde_json::json!({
+        "id": invite.invite_id,
         "code": invite.code,
         "expires_at": expires_at_unix,
         "max_uses": invite.max_uses,
         "uses_remaining": invite.uses_remaining,
-        "url": format!("{scheme}://{}/invite/{}", tenant.host(), invite.code),
+        // The bearer stays in the fragment: browsers do not send fragments in
+        // HTTP request targets or Referer headers. The landing page extracts
+        // and scrubs it before any policy/API work.
+        "url": format!("{scheme}://{}/invite#code={}", tenant.host(), invite.code),
     })))
 }
 
@@ -411,7 +416,13 @@ pub async fn claim_invite(
                     .map(|policy| policy.version.as_str()),
             )
             .await
-            .map_err(|e| internal_error(&format!("v2 invite claim: {e}")))?;
+            .map_err(|error| match error {
+                buzz_db::DbError::AccessDenied(_) => api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "community writes are temporarily unavailable",
+                ),
+                other => internal_error(&format!("v2 invite claim: {other}")),
+            })?;
 
         return match outcome {
             buzz_db::relay_invite::ClaimOutcome::Joined { .. } => {
@@ -663,7 +674,10 @@ mod postgres_tests {
 
     /// Build a closed-relay (`require_relay_membership = true`) test state with
     /// a fresh community on `host`; returns `None` when Postgres is unavailable.
-    async fn invite_test_state(host: &str) -> Option<Arc<AppState>> {
+    async fn invite_test_state_with_nip_oa(
+        host: &str,
+        allow_nip_oa_auth: bool,
+    ) -> Option<Arc<AppState>> {
         let mut config = crate::config::Config::from_env().ok()?;
         let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
@@ -674,6 +688,7 @@ mod postgres_tests {
         // The claim route must work on relays where membership is enforced —
         // that is the entire point of an invite.
         config.require_relay_membership = true;
+        config.allow_nip_oa_auth = allow_nip_oa_auth;
 
         let pool = sqlx::PgPool::connect(&database_url).await.ok()?;
         let db = buzz_db::Db::from_pool(pool.clone());
@@ -709,6 +724,10 @@ mod postgres_tests {
         );
         state.nip98_replay = Arc::new(AlwaysFreshReplayGuard);
         Some(Arc::new(state))
+    }
+
+    async fn invite_test_state(host: &str) -> Option<Arc<AppState>> {
+        invite_test_state_with_nip_oa(host, false).await
     }
 
     async fn post_json(
@@ -797,7 +816,7 @@ mod postgres_tests {
         for (request, expected) in [
             (
                 super::MintInviteRequest::default(),
-                (crate::invite_token::DEFAULT_INVITE_TTL_SECS, None),
+                (crate::invite_token::DEFAULT_INVITE_TTL_SECS, Some(1)),
             ),
             (
                 super::MintInviteRequest {
@@ -907,6 +926,115 @@ mod postgres_tests {
             .await;
             assert_eq!(response.status(), StatusCode::OK, "{body}");
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn invited_human_admits_unrostered_agent_via_nip_oa() {
+        use crate::api::relay_members::{check_relay_membership, MembershipDecision};
+
+        let host = format!("invites-agent-{}.example", Uuid::new_v4().simple());
+        let owner = Keys::generate();
+        let human = Keys::generate();
+        let agent = Keys::generate();
+        let state = invite_test_state_with_nip_oa(&host, true)
+            .await
+            .expect("requires reachable Postgres and relay test state");
+        assert!(state.config.require_relay_membership);
+        assert!(state.config.allow_nip_oa_auth);
+        let tenant = crate::tenant::bind_community(&state.db, &host)
+            .await
+            .expect("bind test tenant");
+        state
+            .db
+            .add_relay_member(
+                tenant.community(),
+                &owner.public_key().to_hex(),
+                "owner",
+                None,
+            )
+            .await
+            .expect("seed owner");
+
+        let code = mint_code(
+            state.clone(),
+            &host,
+            &owner,
+            serde_json::json!({ "max_uses": 1 }),
+        )
+        .await;
+        let claim = post_json(
+            state.clone(),
+            &host,
+            "/api/invites/claim",
+            &human,
+            serde_json::json!({ "code": code }).to_string(),
+        )
+        .await;
+        assert_eq!(claim.status(), StatusCode::OK);
+        assert!(state
+            .db
+            .is_relay_member(tenant.community(), &human.public_key().to_hex())
+            .await
+            .expect("human membership lookup"));
+        assert!(!state
+            .db
+            .is_relay_member(tenant.community(), &agent.public_key().to_hex())
+            .await
+            .expect("agent membership lookup"));
+
+        assert_eq!(
+            check_relay_membership(
+                &state,
+                tenant.community(),
+                agent.public_key().as_bytes(),
+                None,
+                Some(nostr::Timestamp::now().as_secs()),
+            )
+            .await
+            .expect("closed-relay membership check"),
+            MembershipDecision::Denied
+        );
+        let auth_tag = buzz_sdk::nip_oa::compute_auth_tag(&human, &agent.public_key(), "kind=9")
+            .expect("compute owner attestation");
+        assert_eq!(
+            check_relay_membership(
+                &state,
+                tenant.community(),
+                agent.public_key().as_bytes(),
+                Some(&auth_tag),
+                Some(nostr::Timestamp::now().as_secs()),
+            )
+            .await
+            .expect("owner-backed membership check"),
+            MembershipDecision::ViaOwner(human.public_key())
+        );
+        assert!(
+            crate::api::relay_members::materialize_nip_oa_owner(
+                &state,
+                &tenant,
+                &agent.public_key(),
+                &human.public_key(),
+            )
+            .await
+        );
+        assert!(state
+            .db
+            .is_agent_owner(
+                tenant.community(),
+                agent.public_key().as_bytes(),
+                human.public_key().as_bytes(),
+            )
+            .await
+            .expect("agent owner lookup"));
+        assert!(
+            !state
+                .db
+                .is_relay_member(tenant.community(), &agent.public_key().to_hex())
+                .await
+                .expect("post-auth agent membership lookup"),
+            "managed-agent owner materialization must not add a roster row"
+        );
     }
 
     #[test]
@@ -1139,7 +1267,7 @@ mod postgres_tests {
         let json = read_json(response).await;
         let code = json.get("code").and_then(Value::as_str).expect("code");
         let url = json.get("url").and_then(Value::as_str).expect("url");
-        assert!(url.contains("/invite/"), "unexpected url: {url}");
+        assert!(url.contains("/invite#code=v2."), "unexpected url: {url}");
 
         // Claim on a closed relay by a pubkey that is not yet a member.
         let claim_body = serde_json::json!({ "code": code }).to_string();

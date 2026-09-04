@@ -5,6 +5,7 @@ pub mod bridge;
 pub mod events;
 pub mod gifs;
 pub mod git;
+pub mod invite_admin;
 pub mod invites;
 pub mod jobs;
 pub mod media;

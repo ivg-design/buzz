@@ -1,6 +1,9 @@
 import { createHash } from "node:crypto";
 import { expect, test } from "@playwright/test";
 
+const INVITE_CODE = `v2.${"A".repeat(43)}`;
+const LEGACY_INVITE_CODE = `${"A".repeat(80)}.${"B".repeat(43)}`;
+
 test("home page loads with Buzz branding", async ({ page }) => {
   await page.goto("/");
   await expect(
@@ -66,7 +69,8 @@ test("invite requires age and legal consent before opening Buzz", async ({
       ]),
     });
   });
-  await page.goto("/invite/demo-code");
+  await page.goto(`/invite#code=${INVITE_CODE}`);
+  await expect(page).toHaveURL(/\/invite$/);
 
   await expect(
     page.getByRole("link", { name: "Download it now" }),
@@ -162,7 +166,7 @@ test("invite can enroll a NIP-07 identity for browser access", async ({
     const request = route.request();
     const body = request.postData() ?? "";
     expect(JSON.parse(body)).toEqual({
-      code: "browser-code",
+      code: INVITE_CODE,
     });
 
     const authorization = request.headers().authorization;
@@ -195,10 +199,69 @@ test("invite can enroll a NIP-07 identity for browser access", async ({
     });
   });
 
-  await page.goto("/invite/browser-code");
+  await page.goto(`/invite#code=${INVITE_CODE}`);
   await page.getByRole("button", { name: "Join in browser" }).click();
   await expect(page).toHaveURL("/");
   expect(claimObserved).toBe(true);
+});
+
+test("StrictMode preserves the invite across double initialization while scrubbing history", async ({
+  page,
+}) => {
+  await page.route("**/api/join-policy", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ policy: null }),
+    });
+  });
+  await page.route("https://api.github.com/**", async (route) => {
+    await route.fulfill({ status: 500 });
+  });
+
+  const requests: Array<{ url: string; referer?: string }> = [];
+  page.on("request", (request) => {
+    requests.push({
+      url: request.url(),
+      referer: request.headers().referer,
+    });
+  });
+
+  await page.goto(`/invite#code=${INVITE_CODE}`);
+  await expect(page).toHaveURL(/\/invite$/);
+  await expect(
+    page.getByRole("button", { name: "Accept invite in Buzz" }),
+  ).toBeEnabled();
+  expect(requests.every(({ url }) => !url.includes(INVITE_CODE))).toBe(true);
+  expect(requests.every(({ referer }) => !referer?.includes(INVITE_CODE))).toBe(
+    true,
+  );
+  await page.getByRole("button", { name: "Accept invite in Buzz" }).click();
+  await expect(page).toHaveURL(/\/invite$/);
+  expect(await page.evaluate(() => window.location.href)).not.toContain(
+    INVITE_CODE,
+  );
+});
+
+test("legacy invite path is scrubbed immediately after compatibility extraction", async ({
+  page,
+}) => {
+  await page.route("**/api/join-policy", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ policy: null }),
+    });
+  });
+  await page.route("https://api.github.com/**", (route) =>
+    route.fulfill({ status: 500 }),
+  );
+
+  await page.goto(`/invite/${LEGACY_INVITE_CODE}`);
+  await expect(page).toHaveURL(/\/invite$/);
+  expect(await page.evaluate(() => window.location.href)).not.toContain(
+    LEGACY_INVITE_CODE,
+  );
 });
 
 test("invite asks Safari users to choose their Mac download", async ({
@@ -227,7 +290,7 @@ test("invite asks Safari users to choose their Mac download", async ({
     await route.fulfill({ status: 500 });
   });
 
-  await page.goto("/invite/demo-code");
+  await page.goto(`/invite#code=${INVITE_CODE}`);
   const download = page.getByRole("link", { name: "Download it now" });
   await expect(download).toHaveAttribute("aria-haspopup", "dialog");
   await download.click();
@@ -249,7 +312,7 @@ test("invite asks Safari users to choose their Mac download", async ({
   const openedPage = await openedPagePromise;
   await expect(chooser).toBeHidden();
   await expect(openedPage).toHaveURL("https://github.com/block/buzz/releases");
-  await expect(page).toHaveURL(/\/invite\/demo-code$/);
+  await expect(page).toHaveURL(/\/invite$/);
   await openedPage.close();
 
   await download.click();
@@ -339,7 +402,7 @@ test("invite download falls back for mobile and non-desktop devices", async ({
       });
     });
 
-    await page.goto("/invite/demo-code");
+    await page.goto(`/invite#code=${INVITE_CODE}`);
     await expect(
       page.getByRole("link", { name: "Download it now" }),
       device.name,

@@ -66,6 +66,8 @@ export type CommunityOnboardingTransactionPatch = Partial<
     | "previousCommunityId"
     | "addedCommunity"
     | "communityName"
+    | "inviteCode"
+    | "policyReceipt"
     | "error"
     | "acknowledged"
   >
@@ -154,15 +156,23 @@ export function startCommunityOnboarding(
   const relayUrl = canonicalRelayUrl(input.relayUrl);
   const existing = loadCommunityOnboardingTransaction(storage);
   if (existing?.relayUrl === relayUrl) {
+    const suppliedInviteCode = input.inviteCode?.trim() || undefined;
     const updated = {
       ...existing,
+      // A newly supplied bearer is an admission request, not merely metadata
+      // for the prior connection attempt. Force it through claim before any
+      // reconnect and bind its ingress source and policy receipt together.
+      source: suppliedInviteCode ? input.source : existing.source,
       firstCommunityPage:
         input.firstCommunityPage ?? existing.firstCommunityPage,
-      inviteCode: input.inviteCode?.trim() || existing.inviteCode,
+      stage: suppliedInviteCode ? "claiming" : existing.stage,
+      inviteCode: suppliedInviteCode ?? existing.inviteCode,
       communityName: input.communityName?.trim() || existing.communityName,
       token: input.token?.trim() || existing.token,
       reposDir: input.reposDir ?? existing.reposDir,
-      policyReceipt: input.policyReceipt ?? existing.policyReceipt,
+      policyReceipt: suppliedInviteCode
+        ? input.policyReceipt
+        : (input.policyReceipt ?? existing.policyReceipt),
       updatedAt: now.toISOString(),
       error: undefined,
       // A freshly opened link deserves fresh feedback — re-present the gate
@@ -212,6 +222,25 @@ export function updateCurrentCommunityOnboardingTransaction(
 ): CommunityOnboardingTransaction | null {
   if (!current || (expectedId && current.id !== expectedId)) return current;
   return updateCommunityOnboardingTransaction(current, patch, storage, now);
+}
+
+/**
+ * Switching relays invalidates every bearer tied to the previous authority.
+ * Keeping this as one shared patch prevents a Relay A code or policy receipt
+ * from being submitted to Relay B during membership recovery.
+ */
+export function communityChangeOnboardingPatch(
+  communityName: string,
+  relayUrl: string,
+): CommunityOnboardingTransactionPatch {
+  return {
+    communityName,
+    relayUrl,
+    stage: "connecting",
+    inviteCode: undefined,
+    policyReceipt: undefined,
+    error: undefined,
+  };
 }
 
 export function markCommunityOnboardingComplete(

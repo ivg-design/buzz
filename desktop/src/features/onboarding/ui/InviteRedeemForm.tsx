@@ -382,7 +382,7 @@ export function InviteRedeemForm({
                   id="invite-input"
                   onChange={handleInviteInputChange}
                   placeholder={
-                    placeholder ?? "https://relay.example.com/invite/abc123"
+                    placeholder ?? "https://relay.example.com/invite#code=v2.…"
                   }
                   spellCheck={false}
                   type="text"
@@ -418,7 +418,7 @@ export function InviteRedeemForm({
             placeholder={
               isAddCommunity
                 ? "https://community.example.com or paste an invite link"
-                : "https://relay.example.com/invite/abc123 or paste a code"
+                : "https://relay.example.com/invite#code=v2.… or paste a code"
             }
             spellCheck={false}
             type="text"

@@ -8,6 +8,11 @@ import {
   listRelayMembers,
   removeRelayMember,
 } from "@/shared/api/relayMembers";
+import {
+  listPendingInvites,
+  revokeInvite,
+  type PendingInvite,
+} from "@/shared/api/invites";
 import type { RelayMember } from "@/shared/api/types";
 
 export const relayMembersQueryKey = ["relayMembers"] as const;
@@ -15,6 +20,7 @@ export const myRelayMembershipQueryKey = ["myRelayMembership"] as const;
 export const myRelayMembershipLookupQueryKey = [
   "myRelayMembershipLookup",
 ] as const;
+export const pendingInvitesQueryKey = ["pendingInvites"] as const;
 
 export function useRelayMembersQuery(enabled = true) {
   return useQuery({
@@ -22,6 +28,40 @@ export function useRelayMembersQuery(enabled = true) {
     queryKey: relayMembersQueryKey,
     queryFn: listRelayMembers,
     staleTime: 30_000,
+  });
+}
+
+export function usePendingInvitesQuery(enabled = true) {
+  return useQuery({
+    enabled,
+    queryKey: pendingInvitesQueryKey,
+    queryFn: listPendingInvites,
+    staleTime: 10_000,
+  });
+}
+
+export function useRevokeInviteMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (inviteId: string) => revokeInvite(inviteId),
+    onMutate: async (inviteId) => {
+      await queryClient.cancelQueries({ queryKey: pendingInvitesQueryKey });
+      const previous = queryClient.getQueryData<PendingInvite[]>(
+        pendingInvitesQueryKey,
+      );
+      queryClient.setQueryData<PendingInvite[]>(pendingInvitesQueryKey, (old) =>
+        old?.filter((invite) => invite.id !== inviteId),
+      );
+      return { previous };
+    },
+    onError: (_error, _inviteId, context) => {
+      if (context?.previous) {
+        queryClient.setQueryData(pendingInvitesQueryKey, context.previous);
+      }
+    },
+    onSettled: async () => {
+      await queryClient.invalidateQueries({ queryKey: pendingInvitesQueryKey });
+    },
   });
 }
 

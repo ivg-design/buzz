@@ -55,20 +55,27 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(digest)
 }
 
-fn nip98_post_header(keys: &Keys, url: &str, body: &str) -> String {
+fn nip98_header(keys: &Keys, url: &str, method: &str, body: Option<&str>) -> String {
+    let mut tags = vec![
+        Tag::parse(["u", url]).unwrap(),
+        Tag::parse(["method", method]).unwrap(),
+        Tag::parse(["nonce", &uuid::Uuid::new_v4().to_string()]).unwrap(),
+    ];
+    if let Some(body) = body {
+        tags.push(Tag::parse(["payload", &sha256_hex(body.as_bytes())]).unwrap());
+    }
     let event = EventBuilder::new(Kind::Custom(27_235), "")
-        .tags(vec![
-            Tag::parse(["u", url]).unwrap(),
-            Tag::parse(["method", "POST"]).unwrap(),
-            Tag::parse(["payload", &sha256_hex(body.as_bytes())]).unwrap(),
-            Tag::parse(["nonce", &uuid::Uuid::new_v4().to_string()]).unwrap(),
-        ])
+        .tags(tags)
         .sign_with_keys(keys)
         .expect("sign NIP-98 event");
     format!(
         "Nostr {}",
         BASE64.encode(serde_json::to_string(&event).expect("serialize NIP-98 event"))
     )
+}
+
+fn nip98_post_header(keys: &Keys, url: &str, body: &str) -> String {
+    nip98_header(keys, url, "POST", Some(body))
 }
 
 async fn e2e_db_pool() -> sqlx::Pool<sqlx::Postgres> {
@@ -165,6 +172,17 @@ async fn invite_post_with_host(
         .send()
         .await
         .unwrap_or_else(|e| panic!("POST {path} failed: {e}"))
+}
+
+async fn invite_request(keys: &Keys, method: reqwest::Method, path: &str) -> reqwest::Response {
+    let url = format!("{}{}", relay_http_url(), path);
+    let authorization = nip98_header(keys, &url, method.as_str(), None);
+    reqwest::Client::new()
+        .request(method, &url)
+        .header("Authorization", authorization)
+        .send()
+        .await
+        .unwrap_or_else(|error| panic!("request {path} failed: {error}"))
 }
 
 /// Create a real channel via a signed kind:9007 event submitted to POST /events.
@@ -272,10 +290,11 @@ async fn test_invite_mint_and_claim_admits_new_pubkey() {
         .get("code")
         .and_then(serde_json::Value::as_str)
         .expect("mint response includes code");
+    let expected_url = format!("{}/invite#code={code}", relay_http_url());
     assert_eq!(
         mint_json.get("url").and_then(serde_json::Value::as_str),
-        Some(format!("{}/invite/{code}", relay_http_url()).as_str()),
-        "minted URL should be the shareable HTTPS/HTTP invite URL"
+        Some(expected_url.as_str()),
+        "minted URL should keep its bearer in the fragment"
     );
 
     let claim_body = serde_json::json!({ "code": code }).to_string();
@@ -290,6 +309,14 @@ async fn test_invite_mint_and_claim_admits_new_pubkey() {
         claim_json.get("role").and_then(serde_json::Value::as_str),
         Some("member")
     );
+
+    let reconnected = BuzzTestClient::connect(&relay_url(), &joiner)
+        .await
+        .expect("claimed identity reconnects as a relay member");
+    reconnected
+        .disconnect()
+        .await
+        .expect("claimed identity disconnects cleanly");
 
     let repeat_response = invite_post(&joiner, "/api/invites/claim", &claim_body).await;
     assert_eq!(repeat_response.status(), reqwest::StatusCode::OK);
@@ -329,6 +356,51 @@ async fn test_invite_mint_requires_owner_or_admin() {
     let outsider = Keys::generate();
     let response = invite_post(&outsider, "/api/invites", "{}").await;
     assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_owner_and_admin_list_and_revoke_redacted_invites() {
+    let owner = test_owner_keys();
+    let admin = Keys::generate();
+    let member = Keys::generate();
+    let outsider = Keys::generate();
+    let joiner = Keys::generate();
+    seed_relay_owner(&owner).await;
+    seed_relay_member(&relay_authority(), &admin, "admin").await;
+    seed_relay_member(&relay_authority(), &member, "member").await;
+
+    let mint_response = invite_post(&owner, "/api/invites", r#"{"max_uses":1}"#).await;
+    assert_eq!(mint_response.status(), reqwest::StatusCode::OK);
+    let mint_json: serde_json::Value = mint_response.json().await.expect("mint JSON");
+    let invite_id = mint_json["id"].as_str().expect("minted invite id");
+    let code = mint_json["code"].as_str().expect("minted invite code");
+
+    for manager in [&owner, &admin] {
+        let response = invite_request(manager, reqwest::Method::GET, "/api/invites").await;
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let text = response.text().await.expect("invite list body");
+        assert!(text.contains(invite_id));
+        assert!(!text.contains(code));
+        assert!(!text.contains("token_hash"));
+        assert!(!text.contains("\"code\""));
+    }
+    for unauthorized in [&member, &outsider] {
+        let response = invite_request(unauthorized, reqwest::Method::GET, "/api/invites").await;
+        assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+    }
+
+    let path = format!("/api/invites/{invite_id}");
+    let revoke = invite_request(&admin, reqwest::Method::DELETE, &path).await;
+    assert_eq!(revoke.status(), reqwest::StatusCode::OK);
+    let repeat = invite_request(&owner, reqwest::Method::DELETE, &path).await;
+    assert_eq!(repeat.status(), reqwest::StatusCode::NOT_FOUND);
+
+    let claim_body = serde_json::json!({ "code": code }).to_string();
+    let claim = invite_post(&joiner, "/api/invites/claim", &claim_body).await;
+    assert_eq!(claim.status(), reqwest::StatusCode::FORBIDDEN);
+    let claim_json: serde_json::Value = claim.json().await.expect("claim error JSON");
+    assert_eq!(claim_json["error"], "invite_invalid");
 }
 
 #[tokio::test]

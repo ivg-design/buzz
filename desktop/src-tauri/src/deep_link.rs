@@ -1,12 +1,21 @@
-use std::{collections::VecDeque, sync::Mutex};
+use std::{collections::VecDeque, fmt, sync::Mutex};
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
 use serde::Serialize;
 use tauri::{Emitter, Manager, State};
 use url::Url;
 
 use crate::nostr_bind;
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+const MAX_COMMUNITY_DEEP_LINK_URL_LEN: usize = 4_096;
+const MAX_RELAY_URL_LEN: usize = 2_048;
+const MAX_INVITE_CODE_LEN: usize = 1_024;
+const MAX_POLICY_RECEIPT_LEN: usize = 2_048;
+const MAX_COMMUNITY_NAME_LEN: usize = 128;
+const MAX_PENDING_COMMUNITY_DEEP_LINKS: usize = 32;
+
+#[derive(Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PendingCommunityDeepLink {
     id: String,
@@ -15,6 +24,26 @@ pub(crate) struct PendingCommunityDeepLink {
     code: Option<String>,
     policy_receipt: Option<String>,
     name: Option<String>,
+}
+
+impl fmt::Debug for PendingCommunityDeepLink {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PendingCommunityDeepLink")
+            .field("id", &self.id)
+            .field("kind", &self.kind)
+            .field("relay_url", &self.relay_url)
+            .field(
+                "code",
+                &self.code.as_ref().map(|_| "[redacted]"),
+            )
+            .field(
+                "policy_receipt",
+                &self.policy_receipt.as_ref().map(|_| "[redacted]"),
+            )
+            .field("name", &self.name)
+            .finish()
+    }
 }
 
 #[derive(Default)]
@@ -94,8 +123,17 @@ pub(crate) fn acknowledge_pending_navigation_deep_link(
 }
 
 impl PendingCommunityDeepLinks {
-    fn enqueue(&self, pending: PendingCommunityDeepLink) {
-        let mut queue = self.0.lock().expect("pending deep-link queue poisoned");
+    fn lock(&self) -> std::sync::MutexGuard<'_, VecDeque<PendingCommunityDeepLink>> {
+        self.0.lock().unwrap_or_else(|poisoned| {
+            eprintln!("buzz-desktop: recovering poisoned pending community deep-link queue");
+            poisoned.into_inner()
+        })
+    }
+
+    /// Returns true only when a new intent was retained. Duplicate and
+    /// overflow inputs are not re-emitted to the frontend.
+    fn enqueue(&self, pending: PendingCommunityDeepLink) -> bool {
+        let mut queue = self.lock();
         if queue.iter().any(|item| {
             item.kind == pending.kind
                 && item.relay_url == pending.relay_url
@@ -103,21 +141,21 @@ impl PendingCommunityDeepLinks {
                 && item.policy_receipt == pending.policy_receipt
                 && item.name == pending.name
         }) {
-            return;
+            return false;
+        }
+        if queue.len() >= MAX_PENDING_COMMUNITY_DEEP_LINKS {
+            return false;
         }
         queue.push_back(pending);
+        true
     }
 
     fn first(&self) -> Option<PendingCommunityDeepLink> {
-        self.0
-            .lock()
-            .expect("pending deep-link queue poisoned")
-            .front()
-            .cloned()
+        self.lock().front().cloned()
     }
 
     fn acknowledge(&self, id: &str) -> bool {
-        let mut queue = self.0.lock().expect("pending deep-link queue poisoned");
+        let mut queue = self.lock();
         if queue.front().is_some_and(|item| item.id == id) {
             queue.pop_front();
             true
@@ -207,7 +245,7 @@ fn queue_community_deep_link(
     code: Option<String>,
     policy_receipt: Option<String>,
     name: Option<String>,
-) {
+) -> bool {
     app.state::<PendingCommunityDeepLinks>()
         .enqueue(PendingCommunityDeepLink {
             id: uuid::Uuid::new_v4().to_string(),
@@ -216,7 +254,7 @@ fn queue_community_deep_link(
             code,
             policy_receipt,
             name,
-        });
+        })
 }
 
 fn queue_navigation_deep_link(app: &tauri::AppHandle, kind: &str, payload: &serde_json::Value) {
@@ -342,6 +380,9 @@ fn parse_message_deep_link(url: &Url) -> Option<serde_json::Value> {
 /// `code`; returns `None` otherwise so the frontend never sees a half-formed
 /// payload.
 fn parse_join_deep_link(url: &Url) -> Option<serde_json::Value> {
+    if !valid_community_link_envelope(url, &["relay", "code", "policy_receipt"]) {
+        return None;
+    }
     let mut code: Option<String> = None;
     let mut policy_receipt: Option<String> = None;
     for (k, v) in url.query_pairs() {
@@ -355,7 +396,16 @@ fn parse_join_deep_link(url: &Url) -> Option<serde_json::Value> {
             _ => {}
         }
     }
-    let code = code?;
+    let code = code?.trim().to_owned();
+    if !is_canonical_invite_code(&code) {
+        return None;
+    }
+    if policy_receipt
+        .as_deref()
+        .is_some_and(|receipt| !is_canonical_policy_receipt(receipt))
+    {
+        return None;
+    }
     let relay_url = parse_websocket_relay_param(url)?;
     Some(serde_json::json!({
         "relayUrl": relay_url,
@@ -477,23 +527,101 @@ struct AddCommunityDeepLinkPayload {
     name: Option<String>,
 }
 
+fn valid_community_link_envelope(url: &Url, allowed_params: &[&str]) -> bool {
+    if url.as_str().len() > MAX_COMMUNITY_DEEP_LINK_URL_LEN
+        || !matches!(url.path(), "" | "/")
+        || url.fragment().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return false;
+    }
+    let mut seen = std::collections::HashSet::new();
+    url.query_pairs().all(|(key, _)| {
+        allowed_params.contains(&key.as_ref()) && seen.insert(key.into_owned())
+    })
+}
+
+fn canonical_base64url(value: &str, expected_len: Option<usize>) -> bool {
+    if value.is_empty()
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return false;
+    }
+    let Ok(decoded) = URL_SAFE_NO_PAD.decode(value) else {
+        return false;
+    };
+    expected_len.is_none_or(|len| decoded.len() == len) && URL_SAFE_NO_PAD.encode(decoded) == value
+}
+
+fn is_canonical_invite_code(code: &str) -> bool {
+    if code.len() > MAX_INVITE_CODE_LEN {
+        return false;
+    }
+    if code.starts_with(buzz_core_pkg::invite::V2_PREFIX) {
+        return buzz_core_pkg::invite::validate_v2_code(code).is_ok();
+    }
+    let Some((payload, signature)) = code.split_once('.') else {
+        return false;
+    };
+    !payload.contains('.')
+        && !signature.contains('.')
+        && canonical_base64url(payload, None)
+        && canonical_base64url(signature, Some(32))
+}
+
+fn is_canonical_policy_receipt(receipt: &str) -> bool {
+    if receipt.len() > MAX_POLICY_RECEIPT_LEN {
+        return false;
+    }
+    let Some((payload, signature)) = receipt.split_once('.') else {
+        return false;
+    };
+    !payload.contains('.')
+        && !signature.contains('.')
+        && canonical_base64url(payload, None)
+        && canonical_base64url(signature, Some(32))
+}
+
 fn parse_websocket_relay_param(url: &Url) -> Option<String> {
-    let relay_url = url
+    let mut relays = url
         .query_pairs()
-        .find(|(key, _)| key == "relay")
-        .map(|(_, value)| value.into_owned())
-        .filter(|value| !value.is_empty())?;
+        .filter(|(key, _)| key == "relay")
+        .map(|(_, value)| value.into_owned());
+    let relay_url = relays.next()?.trim().to_owned();
+    if relays.next().is_some() || relay_url.is_empty() || relay_url.len() > MAX_RELAY_URL_LEN {
+        return None;
+    }
     let parsed = Url::parse(&relay_url).ok()?;
-    if !matches!(parsed.scheme(), "ws" | "wss") || parsed.host_str().is_none() {
+    if !matches!(parsed.scheme(), "ws" | "wss")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || !matches!(parsed.path(), "" | "/")
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || parsed.origin().ascii_serialization() != relay_url
+    {
         return None;
     }
     Some(relay_url)
 }
 
 fn parse_add_community_deep_link(url: &Url) -> Option<AddCommunityDeepLinkPayload> {
+    if !valid_community_link_envelope(url, &["relay", "name"]) {
+        return None;
+    }
+    let name = optional_non_empty_param(url, "name");
+    if name.as_deref().is_some_and(|value| {
+        value.len() > MAX_COMMUNITY_NAME_LEN || value.chars().any(char::is_control)
+    }) {
+        return None;
+    }
     Some(AddCommunityDeepLinkPayload {
         relay_url: parse_websocket_relay_param(url)?,
-        name: optional_non_empty_param(url, "name"),
+        name,
     })
 }
 
@@ -604,63 +732,84 @@ fn parse_nostr_bind_deep_link(url: &Url) -> Result<NostrBindDeepLinkPayload, Str
 /// - `buzz://connect?relay=<ws(s)://...>` — emits `deep-link-connect` to the frontend
 /// - `buzz://repo|project|pr|issue?…` — emits `deep-link-entity` to the frontend
 pub(crate) fn handle_deep_link_url(app: &tauri::AppHandle, url_str: &str) {
+    if url_str.len() > MAX_COMMUNITY_DEEP_LINK_URL_LEN {
+        eprintln!("buzz-desktop: rejecting oversized deep link URL");
+        return;
+    }
     let url = match Url::parse(url_str) {
         Ok(u) => u,
         Err(e) => {
-            eprintln!("buzz-desktop: invalid deep link URL {url_str:?}: {e}");
+            eprintln!("buzz-desktop: invalid deep link URL: {e}");
             return;
         }
     };
 
     if url.scheme() != crate::build_identity::deep_link_scheme() {
-        eprintln!("buzz-desktop: ignoring unsupported deep link scheme: {url_str}");
+        eprintln!(
+            "buzz-desktop: ignoring unsupported deep link scheme: {}",
+            url.scheme()
+        );
         return;
     }
 
     match url.host_str() {
         Some("connect") => {
+            if !valid_community_link_envelope(&url, &["relay"]) {
+                eprintln!("buzz-desktop: malformed connect deep link");
+                return;
+            }
             let Some(relay_url) = parse_websocket_relay_param(&url) else {
-                eprintln!("buzz-desktop: connect deep link missing/invalid relay: {url_str}");
+                eprintln!("buzz-desktop: connect deep link missing/invalid relay");
                 return;
             };
             activate_main_window(app);
-            queue_community_deep_link(app, "connect", relay_url.clone(), None, None, None);
-            let _ = app.emit("deep-link-connect", relay_url);
+            if queue_community_deep_link(app, "connect", relay_url.clone(), None, None, None) {
+                let _ = app.emit("deep-link-connect", relay_url);
+            }
         }
         Some("join") => {
             // `buzz://join?relay=<ws(s)://...>&code=<invite code>` — fired by
             // the relay's /invite/<code> landing page. The frontend claims the
             // invite against the relay's HTTP API, then adds the workspace.
             let Some(payload) = parse_join_deep_link(&url) else {
-                eprintln!("buzz-desktop: join deep link missing/invalid relay or code: {url_str}");
+                eprintln!("buzz-desktop: join deep link missing/invalid relay or code");
                 return;
             };
             activate_main_window(app);
             let relay_url = payload["relayUrl"].as_str().unwrap_or_default().to_owned();
             let code = payload["code"].as_str().map(str::to_owned);
             let policy_receipt = payload["policyReceipt"].as_str().map(str::to_owned);
-            queue_community_deep_link(app, "join", relay_url, code, policy_receipt, None);
-            let _ = app.emit("deep-link-join", payload);
+            if queue_community_deep_link(
+                app,
+                "join",
+                relay_url,
+                code,
+                policy_receipt,
+                None,
+            ) {
+                let _ = app.emit("deep-link-join", payload);
+            }
         }
         Some("add-community") => {
             let Some(payload) = parse_add_community_deep_link(&url) else {
-                eprintln!("buzz-desktop: add-community deep link missing/invalid relay: {url_str}");
+                eprintln!("buzz-desktop: add-community deep link missing/invalid relay");
                 return;
             };
             activate_main_window(app);
-            queue_community_deep_link(
+            if queue_community_deep_link(
                 app,
                 "add-community",
                 payload.relay_url.clone(),
                 None,
                 None,
                 payload.name.clone(),
-            );
-            let _ = app.emit("deep-link-add-community", payload);
+            ) {
+                let _ = app.emit("deep-link-add-community", payload);
+            }
         }
         Some("channel") => {
             let Some(payload) = parse_channel_deep_link(&url) else {
-                eprintln!("buzz-desktop: channel deep link missing/invalid channel: {url_str}");
+                eprintln!("buzz-desktop: channel deep link missing/invalid channel");
                 return;
             };
             activate_main_window(app);
@@ -682,7 +831,7 @@ pub(crate) fn handle_deep_link_url(app: &tauri::AppHandle, url_str: &str) {
             // structure on this side (serde JSON) and let the TS code own
             // any further normalisation.
             let Some(payload) = parse_message_deep_link(&url) else {
-                eprintln!("buzz-desktop: message deep link missing channel or id: {url_str}");
+                eprintln!("buzz-desktop: message deep link missing channel or id");
                 return;
             };
             activate_main_window(app);
@@ -696,7 +845,7 @@ pub(crate) fn handle_deep_link_url(app: &tauri::AppHandle, url_str: &str) {
                 &url,
                 crate::build_identity::deep_link_scheme().as_ref(),
             ) else {
-                eprintln!("buzz-desktop: malformed entity deep link: {url_str}");
+                eprintln!("buzz-desktop: malformed entity deep link");
                 return;
             };
             activate_main_window(app);
@@ -709,14 +858,14 @@ pub(crate) fn handle_deep_link_url(app: &tauri::AppHandle, url_str: &str) {
                 let _ = app.emit("deep-link-nostr-bind", payload);
             }
             Err(error) => {
-                eprintln!("buzz-desktop: rejecting nostr-bind deep link: {error}: {url_str}");
+                eprintln!("buzz-desktop: rejecting nostr-bind deep link: {error}");
             }
         },
         Some(action) => {
             eprintln!("buzz-desktop: unknown deep link action: {action}");
         }
         None => {
-            eprintln!("buzz-desktop: deep link missing action: {url_str}");
+            eprintln!("buzz-desktop: deep link missing action");
         }
     }
 }

@@ -1,212 +1,111 @@
-/**
- * Unit tests for parseInviteInput — the strict invite URL/code parser
- * added in Phase 2 (D3). Covers all three plan-specced input forms,
- * HTTPS→WSS / HTTP→WS canonicalization, and rejection cases.
- */
 import assert from "node:assert/strict";
 import test from "node:test";
 
 import { parseInviteInput } from "./inviteHelpers.ts";
 
-// ---------------------------------------------------------------------------
-// HTTPS invite URLs → canonical wss:// relay
-// ---------------------------------------------------------------------------
+const V2_CODE = `v2.${"A".repeat(43)}`;
+const V1_CODE = `e30.${"A".repeat(43)}`;
 
-test("parseInviteInput_https_invite_url_returns_wss_relay_and_code", () => {
-  const result = parseInviteInput("https://relay.example.com/invite/abc123");
-  assert.deepEqual(result, {
-    relayWsUrl: "wss://relay.example.com",
-    code: "abc123",
-  });
-});
-
-test("parseInviteInput_http_invite_url_returns_ws_relay_and_code", () => {
-  const result = parseInviteInput("http://relay.example.com/invite/abc123");
-  assert.deepEqual(result, {
-    relayWsUrl: "ws://relay.example.com",
-    code: "abc123",
-  });
-});
-
-test("parseInviteInput_https_with_port_preserves_port", () => {
-  const result = parseInviteInput(
-    "https://relay.example.com:8443/invite/abc123",
+test("new HTTPS invite uses one exact code fragment", () => {
+  assert.deepEqual(
+    parseInviteInput(`https://relay.example.com/invite#code=${V2_CODE}`),
+    { relayWsUrl: "wss://relay.example.com", code: V2_CODE },
   );
-  assert.deepEqual(result, {
-    relayWsUrl: "wss://relay.example.com:8443",
-    code: "abc123",
-  });
-});
-
-test("parseInviteInput_https_trailing_slash_tolerated", () => {
-  const result = parseInviteInput("https://relay.example.com/invite/abc123/");
-  assert.deepEqual(result, {
-    relayWsUrl: "wss://relay.example.com",
-    code: "abc123",
-  });
-});
-
-test("parseInviteInput_https_url_encoded_code_decoded", () => {
-  const result = parseInviteInput(
-    "https://relay.example.com/invite/hello%20world",
+  assert.deepEqual(
+    parseInviteInput(`http://localhost:3000/invite#code=${V2_CODE}`),
+    { relayWsUrl: "ws://localhost:3000", code: V2_CODE },
   );
-  assert.deepEqual(result, {
-    relayWsUrl: "wss://relay.example.com",
-    code: "hello world",
-  });
 });
 
-// ---------------------------------------------------------------------------
-// buzz://join deep link URLs
-// ---------------------------------------------------------------------------
-
-test("parseInviteInput_buzz_join_with_wss_relay_returns_relay_and_code", () => {
-  const result = parseInviteInput(
-    "buzz://join?relay=wss://relay.example.com&code=abc123",
-  );
-  assert.deepEqual(result, {
-    relayWsUrl: "wss://relay.example.com",
-    code: "abc123",
-  });
-});
-
-test("parseInviteInput_buzz_join_with_ws_relay_returns_relay_and_code", () => {
-  const result = parseInviteInput(
-    "buzz://join?relay=ws://localhost:3000&code=testcode",
-  );
-  assert.deepEqual(result, {
-    relayWsUrl: "ws://localhost:3000",
-    code: "testcode",
-  });
-});
-
-test("parseInviteInput_buzz_join_with_encoded_relay_param", () => {
-  const result = parseInviteInput(
-    "buzz://join?relay=wss%3A%2F%2Frelay.example.com&code=abc123",
-  );
-  assert.deepEqual(result, {
-    relayWsUrl: "wss://relay.example.com",
-    code: "abc123",
-  });
-});
-
-test("parseInviteInput_buzz_join_rejects_non_ws_relay", () => {
-  const result = parseInviteInput(
-    "buzz://join?relay=https://relay.example.com&code=abc123",
-  );
-  assert.equal(result, null);
-});
-
-test("parseInviteInput_buzz_join_rejects_missing_code", () => {
+test("legacy one-segment HTTPS paths remain compatible and bounded", () => {
+  for (const code of [V1_CODE, V2_CODE]) {
+    assert.deepEqual(
+      parseInviteInput(`https://relay.example.com:8443/invite/${code}`),
+      { relayWsUrl: "wss://relay.example.com:8443", code },
+    );
+  }
   assert.equal(
-    parseInviteInput("buzz://join?relay=wss://relay.example.com"),
+    parseInviteInput(`https://relay.example.com/invite/${V1_CODE}/`),
+    null,
+  );
+  assert.equal(
+    parseInviteInput(`https://relay.example.com/invite/${V1_CODE}/extra`),
     null,
   );
 });
 
-test("parseInviteInput_buzz_join_rejects_missing_relay", () => {
-  assert.equal(parseInviteInput("buzz://join?code=abc123"), null);
+test("fragment links reject duplicate, unknown, encoded, query, and malformed fields", () => {
+  for (const input of [
+    `https://relay.example.com/invite#code=${V2_CODE}&code=${V2_CODE}`,
+    `https://relay.example.com/invite#code=${V2_CODE}&next=/`,
+    `https://relay.example.com/invite#next=/&code=${V2_CODE}`,
+    `https://relay.example.com/invite#code=%76%32.${"A".repeat(43)}`,
+    `https://relay.example.com/invite?code=${V2_CODE}`,
+    "https://relay.example.com/invite#code=v2.short",
+    "https://relay.example.com/invite#code=e30.bad",
+    "https://relay.example.com/invite#section",
+    "https://relay.example.com/invite",
+  ]) {
+    assert.equal(parseInviteInput(input), null, input);
+  }
 });
 
-// ---------------------------------------------------------------------------
-// Bare codes
-// ---------------------------------------------------------------------------
-
-test("parseInviteInput_bare_code_returns_code_only", () => {
-  const result = parseInviteInput("abc123");
-  assert.deepEqual(result, { code: "abc123" });
+test("HTTPS invite rejects credentials and non-invite paths", () => {
+  for (const input of [
+    `https://user:pass@relay.example.com/invite#code=${V2_CODE}`,
+    `https://relay.example.com/api/invites/${V2_CODE}`,
+    "https://relay.example.com/",
+    "wss://relay.example.com",
+    "ftp://relay.example.com/invite",
+  ]) {
+    assert.equal(parseInviteInput(input), null, input);
+  }
 });
 
-test("parseInviteInput_bare_code_trims_whitespace", () => {
-  const result = parseInviteInput("  abc123  ");
-  assert.deepEqual(result, { code: "abc123" });
-});
-
-// ---------------------------------------------------------------------------
-// Rejection cases
-// ---------------------------------------------------------------------------
-
-test("parseInviteInput_rejects_empty_input", () => {
-  assert.equal(parseInviteInput(""), null);
-  assert.equal(parseInviteInput("   "), null);
-});
-
-test("parseInviteInput_rejects_credentials_in_https_url", () => {
-  assert.equal(
-    parseInviteInput("https://user:pass@relay.example.com/invite/abc123"),
-    null,
-  );
-});
-
-test("parseInviteInput_rejects_fragment_in_https_url", () => {
-  assert.equal(
-    parseInviteInput("https://relay.example.com/invite/abc123#section"),
-    null,
-  );
-});
-
-test("parseInviteInput_rejects_non_invite_https_pathname", () => {
-  // /api/invites is not /invite/<code>
-  assert.equal(
-    parseInviteInput("https://relay.example.com/api/invites/abc123"),
-    null,
-  );
-  // Root path
-  assert.equal(parseInviteInput("https://relay.example.com/"), null);
-  // Missing code segment
-  assert.equal(parseInviteInput("https://relay.example.com/invite/"), null);
-});
-
-test("parseInviteInput_rejects_buzz_join_with_credentials", () => {
-  assert.equal(
+test("buzz join accepts an exact canonical relay and invite code", () => {
+  assert.deepEqual(
     parseInviteInput(
-      "buzz://user:pass@join?relay=wss://relay.example.com&code=abc123",
+      `buzz://join?relay=wss%3A%2F%2Frelay.example.com&code=${V2_CODE}`,
     ),
-    null,
+    { relayWsUrl: "wss://relay.example.com", code: V2_CODE },
+  );
+  assert.deepEqual(
+    parseInviteInput(`buzz://join?relay=ws://localhost:3000&code=${V1_CODE}`),
+    { relayWsUrl: "ws://localhost:3000", code: V1_CODE },
   );
 });
 
-test("parseInviteInput_rejects_buzz_join_with_hash", () => {
+test("buzz join rejects ambiguous fields and noncanonical relay authorities", () => {
+  for (const input of [
+    `buzz://join?relay=wss://relay.example.com&code=${V2_CODE}&code=${V2_CODE}`,
+    `buzz://join?relay=wss://relay.example.com&code=${V2_CODE}&extra=x`,
+    `buzz://join/path?relay=wss://relay.example.com&code=${V2_CODE}`,
+    `buzz://join?relay=wss://user:pass@relay.example.com&code=${V2_CODE}`,
+    `buzz://join?relay=wss://relay.example.com/path&code=${V2_CODE}`,
+    `buzz://join?relay=wss://relay.example.com/?x=1&code=${V2_CODE}`,
+    `buzz://join?relay=wss://Relay.Example&code=${V2_CODE}`,
+    `buzz://join?relay=wss://relay.example.com/&code=${V2_CODE}`,
+    `buzz://join?relay=https://relay.example.com&code=${V2_CODE}`,
+    `buzz://join?code=${V2_CODE}`,
+    "buzz://join?relay=wss://relay.example.com",
+  ]) {
+    assert.equal(parseInviteInput(input), null, input);
+  }
+});
+
+test("bare invite codes are canonical and trimmed", () => {
+  assert.deepEqual(parseInviteInput(`  ${V2_CODE}  `), { code: V2_CODE });
+  assert.deepEqual(parseInviteInput(V1_CODE), { code: V1_CODE });
+  for (const input of ["", "abc123", "v2.short", "e30.bad", "not/a/code"]) {
+    assert.equal(parseInviteInput(input), null, input);
+  }
+});
+
+test("oversized invite input and code are rejected before use", () => {
+  assert.equal(parseInviteInput("a".repeat(4_097)), null);
   assert.equal(
     parseInviteInput(
-      "buzz://join?relay=wss://relay.example.com&code=abc123#frag",
-    ),
-    null,
-  );
-});
-
-test("parseInviteInput_rejects_ws_wss_scheme_urls", () => {
-  // ws/wss URLs are relay URLs, not invite URLs
-  assert.equal(parseInviteInput("wss://relay.example.com"), null);
-  assert.equal(parseInviteInput("ws://relay.example.com"), null);
-});
-
-test("parseInviteInput_rejects_input_with_slashes_as_bare_code", () => {
-  // Slashes suggest a URL but don't parse as a valid invite URL
-  assert.equal(parseInviteInput("not/a/code"), null);
-});
-
-test("parseInviteInput_rejects_input_with_scheme_as_bare_code", () => {
-  assert.equal(parseInviteInput("ftp://something"), null);
-});
-
-// ---------------------------------------------------------------------------
-// Nested relay param credential/fragment rejection (MINOR 6 regression)
-// ---------------------------------------------------------------------------
-
-test("parseInviteInput_buzz_join_rejects_credentials_in_nested_relay", () => {
-  assert.equal(
-    parseInviteInput(
-      "buzz://join?relay=wss%3A%2F%2Fuser%3Apass%40relay.example.com&code=abc",
-    ),
-    null,
-  );
-});
-
-test("parseInviteInput_buzz_join_rejects_fragment_in_nested_relay", () => {
-  assert.equal(
-    parseInviteInput(
-      "buzz://join?relay=wss%3A%2F%2Frelay.example.com%23frag&code=abc",
+      `https://relay.example.com/invite#code=v2.${"A".repeat(1_022)}`,
     ),
     null,
   );

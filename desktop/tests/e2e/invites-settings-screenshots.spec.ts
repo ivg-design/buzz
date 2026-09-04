@@ -10,11 +10,15 @@ const DIRECT_ADD_HEX =
 const DIRECT_ADD_NPUB =
   "npub1a2d567n60z37xu57245tzntkf4yk90swrus0wjdulrvah0u6jv5qusyp60";
 const SECOND_DIRECT_ADD_HEX =
-  "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  "554cef57437abac34522ac2c9f0490d685b72c80478cf9f7ed6f9570ee8624ea";
 const SECOND_DIRECT_ADD_NPUB =
-  "npub1424242424242424242424242424242424242424242424242424qamrcaj";
+  "npub124xw746r02avx3fz4skf7pys66zmwtyqg7x0naldd72hpm5xyn4qtjl6z8";
+const INVITE_CODE = `v2.${"A".repeat(43)}`;
+const INVITE_URL = `https://alpha.example.com/invite#code=${INVITE_CODE}`;
+let pendingInviteVisible = true;
 
 test.beforeEach(async ({ page }, testInfo) => {
+  pendingInviteVisible = true;
   await installMockBridge(page, {
     relayRequiresMembership: true,
     relayRole: testInfo.title.includes("admin can add members")
@@ -22,12 +26,37 @@ test.beforeEach(async ({ page }, testInfo) => {
       : "owner",
   });
   await page.route("**/api/invites", async (route) => {
+    if (route.request().method() === "GET") {
+      await route.fulfill({
+        contentType: "application/json",
+        json: {
+          invites: pendingInviteVisible
+            ? [
+                {
+                  id: "123e4567-e89b-12d3-a456-426614174000",
+                  expires_at: Math.floor(Date.now() / 1000) + 3 * 86_400,
+                  max_uses: 1,
+                  use_count: 0,
+                  uses_remaining: 1,
+                  created_by: TEST_IDENTITIES.tyler.pubkey,
+                  created_at: Math.floor(Date.now() / 1000),
+                },
+              ]
+            : [],
+        },
+        status: 200,
+      });
+      return;
+    }
     await route.fulfill({
       contentType: "application/json",
       json: {
-        code: "community-email-test",
+        id: "123e4567-e89b-12d3-a456-426614174001",
+        code: INVITE_CODE,
         expires_at: Math.floor(Date.now() / 1000) + 3 * 86_400,
-        url: "https://alpha.example.com/invite/community-email-test",
+        max_uses: 1,
+        uses_remaining: 1,
+        url: INVITE_URL,
       },
       status: 200,
     });
@@ -69,6 +98,8 @@ test("capture: consolidated invites settings", async ({ page }) => {
     page.getByText("People who use the link join as members."),
   ).toHaveCount(0);
   await expect(page.getByTestId("community-icon-save")).toHaveCount(0);
+  await expect(page.getByText("Pending invite links")).toBeVisible();
+  await expect(page.getByText("1 use left")).toBeVisible();
 
   const aliceName = page.getByText("alice", { exact: true });
   const aliceRow = page
@@ -114,13 +145,14 @@ test("capture: share-style community invite dialog", async ({ page }) => {
   await expect(page.getByTestId("member-pubkey-input")).toBeVisible();
   await expect(page.getByTestId("member-role")).toHaveCount(0);
   await expect(page.getByTestId("confirm-add-member")).toHaveCount(0);
-  await expect(page.getByTestId("invite-link-url")).toHaveValue(
-    "https://alpha.example.com/invite/community-email-test",
-  );
-  await expect(page.getByTestId("copy-invite-link")).toHaveText("Copy link");
+  await expect(page.getByTestId("invite-link-url")).toHaveValue("");
+  await expect(page.getByTestId("copy-invite-link")).toHaveText("Create link");
   await expect(page.getByTestId("invite-link-ttl-trigger")).toHaveText(
     "3 days",
   );
+  await page.getByTestId("copy-invite-link").click();
+  await expect(page.getByTestId("invite-link-url")).toHaveValue(INVITE_URL);
+  await expect(page.getByTestId("copy-invite-link")).toHaveText("Copy link");
 
   await page.getByTestId("member-pubkey-input").fill(DIRECT_ADD_NPUB);
   await expect(page.getByTestId("member-search-popover")).toBeVisible();
@@ -151,6 +183,7 @@ test("capture: share-style community invite dialog", async ({ page }) => {
   await page
     .getByTestId(`member-search-result-${SECOND_DIRECT_ADD_HEX}`)
     .click();
+  await expect(selectedChip).toHaveCount(0);
   await expect(
     page.getByTestId(`member-search-selection-remove-${SECOND_DIRECT_ADD_HEX}`),
   ).toBeVisible();
@@ -182,7 +215,7 @@ test("admin can add members but cannot assign the admin role", async ({
   await page.keyboard.press("Escape");
 });
 
-test("owner can add multiple admins directly by npub from live Invites UI", async ({
+test("owner direct-add replaces the prior recipient and grants one admin", async ({
   page,
 }) => {
   await page.getByTestId("community-invite-dialog-trigger").click();
@@ -195,39 +228,148 @@ test("owner can add multiple admins directly by npub from live Invites UI", asyn
   await page.getByTestId("member-role").click();
   await page.getByRole("menuitemradio", { name: "Admin" }).click();
   await page.getByTestId("confirm-add-member").click();
+  const confirmation = page.getByTestId("grant-admin-confirmation");
+  await expect(confirmation).toBeVisible();
+  await confirmation
+    .getByRole("button", { name: "Grant admin access" })
+    .click();
 
   await expect
     .poll(async () =>
       page.evaluate(
-        ({ targetPubkeys, role }) =>
-          targetPubkeys.every((targetPubkey) =>
-            (window.__BUZZ_E2E_COMMAND_PAYLOADS__ ?? []).some((entry) => {
-              if (entry.command !== "plugin:websocket|send") return false;
-              const wireMessage = (
-                entry.payload as {
-                  message?: { data?: unknown };
-                }
-              )?.message?.data;
-              if (typeof wireMessage !== "string") return false;
-              const message = JSON.parse(wireMessage) as unknown[];
-              if (message[0] !== "EVENT") return false;
-              const event = message[1] as
-                | { kind?: number; tags?: string[][] }
-                | undefined;
-              return (
-                event?.kind === 9030 &&
-                event.tags?.some(
-                  (tag) => tag[0] === "p" && tag[1] === targetPubkey,
-                ) &&
-                event.tags.some((tag) => tag[0] === "role" && tag[1] === role)
-              );
-            }),
-          ),
+        ({ targetPubkey, role }) =>
+          (window.__BUZZ_E2E_COMMAND_PAYLOADS__ ?? []).some((entry) => {
+            if (entry.command !== "plugin:websocket|send") return false;
+            const wireMessage = (
+              entry.payload as {
+                message?: { data?: unknown };
+              }
+            )?.message?.data;
+            if (typeof wireMessage !== "string") return false;
+            const message = JSON.parse(wireMessage) as unknown[];
+            if (message[0] !== "EVENT") return false;
+            const event = message[1] as
+              | { kind?: number; tags?: string[][] }
+              | undefined;
+            return (
+              event?.kind === 9030 &&
+              event.tags?.some(
+                (tag) => tag[0] === "p" && tag[1] === targetPubkey,
+              ) &&
+              event.tags.some((tag) => tag[0] === "role" && tag[1] === role)
+            );
+          }),
         {
-          targetPubkeys: [DIRECT_ADD_HEX, SECOND_DIRECT_ADD_HEX],
+          targetPubkey: SECOND_DIRECT_ADD_HEX,
           role: "admin",
         },
       ),
     )
     .toBe(true);
+
+  const firstRecipientWasPublished = await page.evaluate(
+    (targetPubkey) =>
+      (window.__BUZZ_E2E_COMMAND_PAYLOADS__ ?? []).some((entry) => {
+        if (entry.command !== "plugin:websocket|send") return false;
+        const wireMessage = (entry.payload as { message?: { data?: unknown } })
+          ?.message?.data;
+        if (typeof wireMessage !== "string") return false;
+        const message = JSON.parse(wireMessage) as unknown[];
+        const event = message[1] as
+          | { kind?: number; tags?: string[][] }
+          | undefined;
+        return (
+          message[0] === "EVENT" &&
+          event?.kind === 9030 &&
+          event.tags?.some((tag) => tag[0] === "p" && tag[1] === targetPubkey)
+        );
+      }),
+    DIRECT_ADD_HEX,
+  );
+  expect(firstRecipientWasPublished).toBe(false);
+});
+
+test("malformed npub cannot be selected or admitted", async ({ page }) => {
+  await page.getByTestId("community-invite-dialog-trigger").click();
+  await page.getByTestId("member-pubkey-input").fill("npub1not-a-valid-key");
+  await expect(page.getByTestId("confirm-add-member")).toHaveCount(0);
+  await expect(page.getByText(/No people found/)).toBeVisible();
+
+  await page.getByTestId("member-pubkey-input").fill("0".repeat(64));
+  await expect(page.getByTestId("confirm-add-member")).toHaveCount(0);
+  await expect(page.getByText(/No people found/)).toBeVisible();
+});
+
+test("owner explicitly confirms promotion before an admin event is signed", async ({
+  page,
+}) => {
+  const bobRow = page
+    .locator('[data-testid^="relay-member-row-"]')
+    .filter({ has: page.getByText("bob", { exact: true }) });
+  await bobRow.getByRole("button", { name: /Actions for/ }).click();
+  await page.getByRole("menuitem", { name: "Make admin" }).click();
+  await expect(page.getByTestId("grant-admin-confirmation")).toBeVisible();
+
+  const before = await page.evaluate(
+    () =>
+      (window.__BUZZ_E2E_COMMAND_PAYLOADS__ ?? []).filter((entry) => {
+        const wire = (entry.payload as { message?: { data?: unknown } })
+          ?.message?.data;
+        return (
+          entry.command === "plugin:websocket|send" &&
+          typeof wire === "string" &&
+          (JSON.parse(wire) as unknown[])[0] === "EVENT" &&
+          ((JSON.parse(wire) as unknown[])[1] as { kind?: number })?.kind ===
+            9032
+        );
+      }).length,
+  );
+  expect(before).toBe(0);
+
+  await page
+    .getByTestId("grant-admin-confirmation")
+    .getByRole("button", { name: "Grant admin access" })
+    .click();
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (window.__BUZZ_E2E_COMMAND_PAYLOADS__ ?? []).some((entry) => {
+          const wire = (entry.payload as { message?: { data?: unknown } })
+            ?.message?.data;
+          return (
+            entry.command === "plugin:websocket|send" &&
+            typeof wire === "string" &&
+            ((JSON.parse(wire) as unknown[])[1] as { kind?: number })?.kind ===
+              9032
+          );
+        }),
+      ),
+    )
+    .toBe(true);
+});
+
+test("revokes a pending invite after explicit confirmation", async ({
+  page,
+}) => {
+  let deletePath: string | null = null;
+  await page.route("**/api/invites/*", async (route) => {
+    deletePath = new URL(route.request().url()).pathname;
+    pendingInviteVisible = false;
+    await route.fulfill({
+      contentType: "application/json",
+      json: { status: "revoked" },
+      status: 200,
+    });
+  });
+
+  await page
+    .getByTestId("revoke-invite-123e4567-e89b-12d3-a456-426614174000")
+    .click();
+  const confirmation = page.getByTestId("revoke-invite-confirmation");
+  await expect(confirmation).toBeVisible();
+  await confirmation.getByRole("button", { name: "Revoke invite" }).click();
+  await expect(
+    page.getByTestId("pending-invite-123e4567-e89b-12d3-a456-426614174000"),
+  ).toHaveCount(0);
+  expect(deletePath).toBe("/api/invites/123e4567-e89b-12d3-a456-426614174000");
 });

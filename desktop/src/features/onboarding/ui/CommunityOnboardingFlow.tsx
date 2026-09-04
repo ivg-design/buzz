@@ -3,6 +3,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { Plus, Users } from "lucide-react";
 
 import {
+  communityChangeOnboardingPatch,
   markCommunityOnboardingComplete,
   useCommunityOnboarding,
 } from "@/features/onboarding/communityOnboarding";
@@ -222,6 +223,12 @@ export function CommunityOnboardingFlow({
     if (transaction?.stage === "connecting") onConnect();
   }, [onConnect, transaction?.stage]);
 
+  React.useEffect(() => {
+    if (isMembershipDenied && transaction?.stage === "claiming") {
+      setIsMembershipDenied(false);
+    }
+  }, [isMembershipDenied, transaction?.stage]);
+
   // "Entering" curtain: the app is mounting on the Welcome route underneath.
   // Fade out when Welcome reports its first settled render — or after a
   // safety timeout so a slow load can never strand the user on this screen.
@@ -391,11 +398,17 @@ export function CommunityOnboardingFlow({
             queryClient.setQueryData(["identity"], identity);
             queryClient.removeQueries({ queryKey: profileQueryKey });
             setIsMembershipDenied(false);
-            update({ stage: "connecting", error: undefined });
+            update({
+              stage: transaction.inviteCode ? "claiming" : "connecting",
+              error: undefined,
+            });
           }}
           onRetry={() => {
             setIsMembershipDenied(false);
-            update({ stage: "connecting", error: undefined });
+            update({
+              stage: transaction.inviteCode ? "claiming" : "connecting",
+              error: undefined,
+            });
           }}
           pubkey={deniedPubkey}
         />
@@ -403,12 +416,9 @@ export function CommunityOnboardingFlow({
           <CommunityChangeOverlay
             onClose={() => setIsCommunityChangeOpen(false)}
             onUpdated={(communityName, updatedRelayUrl) => {
-              update({
-                communityName,
-                relayUrl: updatedRelayUrl,
-                stage: "connecting",
-                error: undefined,
-              });
+              update(
+                communityChangeOnboardingPatch(communityName, updatedRelayUrl),
+              );
               setIsMembershipDenied(false);
             }}
           />

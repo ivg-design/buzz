@@ -456,7 +456,14 @@ function CommunityApp({
     if (connectingTransactionRef.current === transaction.id) return;
     connectingTransactionRef.current = transaction.id;
     if (transaction.communityId) {
+      const targetIsAlreadyActive =
+        transaction.communityId === activeCommunity?.id;
       await transitionCommunity(transaction.communityId);
+      // A successful invite claim for the active community does not switch
+      // community IDs, so the normal switch-driven reconnect never fires.
+      // Reconnect explicitly to replace the connection that was rejected
+      // before the identity became a member.
+      if (targetIsAlreadyActive) reconnectCommunity();
       return;
     }
     const previousCommunityId = activeCommunity?.id;

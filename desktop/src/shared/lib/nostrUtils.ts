@@ -24,6 +24,31 @@ export function safeNpub(pubkey: string): string | null {
 }
 
 const HEX_PUBKEY_REGEX = /^[0-9a-f]{64}$/;
+const SECP256K1_FIELD = (1n << 256n) - (1n << 32n) - 977n;
+
+function powMod(base: bigint, exponent: bigint, modulus: bigint): bigint {
+  let result = 1n;
+  let factor = base % modulus;
+  let power = exponent;
+  while (power > 0n) {
+    if ((power & 1n) === 1n) result = (result * factor) % modulus;
+    factor = (factor * factor) % modulus;
+    power >>= 1n;
+  }
+  return result;
+}
+
+/** Whether `hex` is the x-coordinate of a point on secp256k1. */
+function isValidXOnlyPubkey(hex: string): boolean {
+  if (!HEX_PUBKEY_REGEX.test(hex)) return false;
+  const x = BigInt(`0x${hex}`);
+  if (x >= SECP256K1_FIELD) return false;
+  const ySquared = (x * x * x + 7n) % SECP256K1_FIELD;
+  // secp256k1's field is 3 mod 4, so this exponent computes a square root
+  // exactly when ySquared is a quadratic residue.
+  const y = powMod(ySquared, (SECP256K1_FIELD + 1n) / 4n, SECP256K1_FIELD);
+  return (y * y) % SECP256K1_FIELD === ySquared;
+}
 
 /**
  * Parse user-entered public key input — either a 64-character hex pubkey or
@@ -35,13 +60,13 @@ const HEX_PUBKEY_REGEX = /^[0-9a-f]{64}$/;
  */
 export function parsePubkeyInput(input: string): string | null {
   const trimmed = input.trim().toLowerCase();
-  if (HEX_PUBKEY_REGEX.test(trimmed)) {
+  if (isValidXOnlyPubkey(trimmed)) {
     return trimmed;
   }
   if (trimmed.startsWith("npub1")) {
     try {
       const decoded = decode(trimmed);
-      if (decoded.type === "npub") {
+      if (decoded.type === "npub" && isValidXOnlyPubkey(decoded.data)) {
         return decoded.data;
       }
     } catch {

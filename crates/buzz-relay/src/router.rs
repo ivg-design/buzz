@@ -106,8 +106,17 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/operator/communities/transfer",
             post(api::operator::transfer_community),
         )
-        // Relay invites: mint (owner/admin) + claim (membership-gate exempt)
-        .route("/api/invites", post(api::invites::mint_invite))
+        // Relay invites: list/mint/revoke (owner/admin) + claim
+        // (membership-gate exempt). Management responses never expose a code
+        // or stored token hash.
+        .route(
+            "/api/invites",
+            get(api::invite_admin::list_invites).post(api::invites::mint_invite),
+        )
+        .route(
+            "/api/invites/{invite_id}",
+            axum::routing::delete(api::invite_admin::revoke_invite),
+        )
         .route("/api/join-policy", get(api::invites::join_policy))
         // Policy documents as standalone pages — desktop opens these in the
         // system browser instead of rendering the Markdown in-app.
@@ -194,7 +203,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
                         return files.oneshot(req).await.map(IntoResponse::into_response);
                     }
                     if should_serve_spa(path, serve_git_web_gui) {
-                        return Ok(read_spa_index(&index).await);
+                        let response = read_spa_index(&index).await;
+                        return Ok(if is_invite_landing_path(path) {
+                            with_invite_landing_headers(response)
+                        } else {
+                            response
+                        });
                     }
                 }
                 Ok(StatusCode::NOT_FOUND.into_response())
@@ -239,8 +253,10 @@ fn is_admin_static_path(path: &str) -> bool {
 }
 
 fn is_invite_landing_path(path: &str) -> bool {
-    path.strip_prefix("/invite/")
-        .is_some_and(|code| !code.is_empty() && !code.contains('/'))
+    path == "/invite"
+        || path
+            .strip_prefix("/invite/")
+            .is_some_and(|code| !code.is_empty() && !code.contains('/'))
 }
 
 fn should_serve_spa(path: &str, serve_git_web_gui: bool) -> bool {
@@ -270,6 +286,17 @@ fn with_admin_csp(mut response: axum::response::Response) -> axum::response::Res
     response.headers_mut().insert(
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(ADMIN_CSP),
+    );
+    response
+}
+
+fn with_invite_landing_headers(mut response: axum::response::Response) -> axum::response::Response {
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response.headers_mut().insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
     );
     response
 }
@@ -635,7 +662,8 @@ mod tests {
     }
 
     #[test]
-    fn invite_landing_path_requires_exactly_one_nonempty_code_segment() {
+    fn invite_landing_path_accepts_fragment_route_and_one_legacy_segment() {
+        assert!(is_invite_landing_path("/invite"));
         assert!(is_invite_landing_path("/invite/payload.mac"));
         assert!(!is_invite_landing_path("/invite/"));
         assert!(!is_invite_landing_path("/invite/code/extra"));
@@ -1249,6 +1277,22 @@ mod tests {
                 "{path} on the public host must keep its own headers"
             );
         }
+
+        let invite = spa_response(state, "public.example", "/invite/payload.mac").await;
+        assert_eq!(
+            invite
+                .headers()
+                .get(header::REFERRER_POLICY)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-referrer")
+        );
+        assert_eq!(
+            invite
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store")
+        );
     }
 
     #[test]

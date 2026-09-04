@@ -40,6 +40,8 @@ pub mod reaction;
 pub mod relay_admin_actions;
 /// Use-limited relay invite persistence (v2 opaque tokens).
 pub mod relay_invite;
+/// Owner/admin views and revocation for durable relay invites.
+pub mod relay_invite_admin;
 /// Relay-level membership persistence (NIP-43).
 pub mod relay_members;
 /// Deployment-global relay operator/moderator roster persistence.

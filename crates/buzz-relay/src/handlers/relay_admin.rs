@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use nostr::Event;
+use nostr::{Event, PublicKey};
 use tracing::{info, warn};
 
 use buzz_core::kind::{
@@ -29,20 +29,46 @@ use crate::handlers::side_effects::{
 };
 use crate::state::AppState;
 
-/// Extract the hex pubkey from the first `p` tag, returning it as a `String`.
-fn extract_p_tag_hex(event: &Event) -> Option<String> {
-    for tag in event.tags.iter() {
-        let parts = tag.as_slice();
-        if parts.first().map(|s| s.as_str()) == Some("p") {
-            if let Some(val) = parts.get(1).map(|s| s.as_str()) {
-                // Must be exactly 64 hex chars (uncompressed pubkey representation).
-                if val.len() == 64 && val.chars().all(|c| c.is_ascii_hexdigit()) {
-                    return Some(val.to_string());
-                }
-            }
-        }
+// Admin commands retain the existing two-sided freshness window, but use a
+// private replay TTL longer than the full acceptance horizon. A command
+// signed at the maximum future skew can otherwise remain fresh after the
+// shared 120-second NIP-98 marker expires.
+const RELAY_ADMIN_MAX_CLOCK_SKEW_SECS: i64 = 120;
+const RELAY_ADMIN_REPLAY_TTL_SECS: u64 = 300;
+
+fn validate_relay_admin_timestamp(event_ts: i64, now: i64) -> Result<(), String> {
+    let delta = event_ts - now;
+    if delta.abs() > RELAY_ADMIN_MAX_CLOCK_SKEW_SECS {
+        return Err(format!(
+            "event timestamp out of range: created_at={event_ts}, now={now}, delta={delta}s \
+             (max ±{RELAY_ADMIN_MAX_CLOCK_SKEW_SECS}s)"
+        ));
     }
-    None
+    Ok(())
+}
+
+/// Extract one canonical x-only secp256k1 pubkey from exactly one `p` tag.
+///
+/// NIP-43 roster commands are deliberately single-recipient. Rejecting
+/// duplicate `p` tags prevents a client from presenting one target in the UI
+/// while signing an ambiguous/batched command, and parsing through `PublicKey`
+/// rejects 64-character hex strings that are not points on secp256k1.
+fn extract_p_tag_hex(event: &Event) -> Option<String> {
+    let mut p_tags = event
+        .tags
+        .iter()
+        .filter(|tag| tag.as_slice().first().map(|value| value.as_str()) == Some("p"));
+    let parts = p_tags.next()?.as_slice();
+    if p_tags.next().is_some() {
+        return None;
+    }
+    let value = parts.get(1)?.as_str();
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let pubkey = PublicKey::from_hex(value).ok()?;
+    pubkey.xonly().ok()?;
+    Some(pubkey.to_hex())
 }
 
 /// Extract the value of the first tag with the given name.
@@ -166,6 +192,34 @@ fn admits_relay_admin_command(
     Ok(())
 }
 
+/// Claim a tenant-scoped, atomic seen-set entry for an authorized NIP-43
+/// command. The guard is shared across relay replicas through Redis and fails
+/// closed when unavailable. Commands are intentionally not stored in the
+/// public event table because they expose roster-control intent.
+async fn claim_relay_admin_replay(
+    tenant: &TenantContext,
+    state: &AppState,
+    event: &Event,
+) -> Result<(), String> {
+    let scope = format!("{}:nip43", tenant.community());
+    match state
+        .nip98_replay
+        .try_mark_in_scope(&scope, &event.id, RELAY_ADMIN_REPLAY_TTL_SECS)
+        .await
+    {
+        Ok(true) => Ok(()),
+        Ok(false) => Err("replay detected: relay admin event already handled".to_string()),
+        Err(error) => {
+            warn!(
+                community = %tenant.community(),
+                error = %error,
+                "relay admin replay guard failed; rejecting command fail-closed"
+            );
+            Err("replay protection unavailable".to_string())
+        }
+    }
+}
+
 /// Validate and execute a relay admin command (kinds 9030–9033).
 ///
 /// Admission: rejects a sender under a durable community ban before any
@@ -228,21 +282,15 @@ async fn execute_relay_admin_command(
     let kind = event.kind.as_u16() as u32;
     let sender_hex = event.pubkey.to_hex();
 
-    // This mirrors the NIP-42 auth event freshness check and prevents replay
-    // of captured admin commands. The window is intentionally tight — admin
-    // events should be freshly signed.
+    // Admin events must be freshly signed. Their private replay marker spans
+    // the full two-sided acceptance horizon (see the constant tripwire test).
     {
         let event_ts = event.created_at.as_secs() as i64;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        if (event_ts - now).abs() > 120 {
-            return Err(format!(
-                "event timestamp out of range: created_at={event_ts}, now={now}, delta={}s (max ±120s)",
-                event_ts - now
-            ));
-        }
+        validate_relay_admin_timestamp(event_ts, now)?;
     }
 
     let sender_member = state
@@ -290,6 +338,7 @@ async fn execute_relay_admin_command(
         // Empty or missing icon tag clears the workspace icon.
         let icon = extract_tag_value(event, "icon").unwrap_or_default();
         validate_workspace_icon(&icon)?;
+        claim_relay_admin_replay(tenant, state, event).await?;
 
         state
             .db
@@ -329,6 +378,7 @@ async fn execute_relay_admin_command(
             if role != "admin" && role != "member" {
                 return Err(format!("invalid role: {role}"));
             }
+            claim_relay_admin_replay(tenant, state, event).await?;
 
             // Note: idempotent — if target already exists at any role, this is a
             // silent no-op. The existing role is NOT overwritten. Use kind:9032
@@ -370,6 +420,7 @@ async fn execute_relay_admin_command(
             if target_hex == sender_hex {
                 return Err("cannot remove yourself".to_string());
             }
+            claim_relay_admin_replay(tenant, state, event).await?;
 
             // Dispatch removal by sender role:
             // - Admins: atomic conditional delete, only removes 'member' targets.
@@ -383,7 +434,6 @@ async fn execute_relay_admin_command(
                     .await
                     .map_err(|e| format!("database error: {e}"))?
             } else {
-                // Owner path — atomic delete that refuses to remove other owners.
                 state
                     .db
                     .remove_relay_member(tenant.community(), &target_hex)
@@ -442,6 +492,7 @@ async fn execute_relay_admin_command(
             if new_role != "admin" && new_role != "member" {
                 return Err(format!("invalid role: {new_role}"));
             }
+            claim_relay_admin_replay(tenant, state, event).await?;
 
             let updated = state
                 .db
@@ -450,7 +501,6 @@ async fn execute_relay_admin_command(
                 .map_err(|e| format!("database error: {e}"))?;
 
             if !updated {
-                // Distinguish "owner (protected)" from "doesn't exist"
                 let exists = state
                     .db
                     .get_relay_member(tenant.community(), &target_hex)
@@ -486,7 +536,10 @@ async fn execute_relay_admin_command(
 #[cfg(test)]
 mod postgres_tests {
     use super::*;
-    use nostr::{EventBuilder, Keys, Kind, Tag};
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+
+    use nostr::{EventBuilder, EventId, Keys, Kind, Tag};
 
     /// The vulnerability this file's ban gate closes: `ingest_event` exempts
     /// relay-admin kinds 9030–9033 from its durable write-path restriction
@@ -544,7 +597,7 @@ mod postgres_tests {
 
     #[test]
     fn extract_p_tag_valid_hex() {
-        let hex = "a".repeat(64);
+        let hex = Keys::generate().public_key().to_hex();
         let event = make_test_event(
             9030,
             vec![vec!["p", Box::leak(hex.clone().into_boxed_str())]],
@@ -572,6 +625,26 @@ mod postgres_tests {
     }
 
     #[test]
+    fn extract_p_tag_rejects_invalid_curve_point() {
+        let event = make_test_event(
+            9030,
+            vec![vec![
+                "p",
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            ]],
+        );
+        assert_eq!(extract_p_tag_hex(&event), None);
+    }
+
+    #[test]
+    fn extract_p_tag_rejects_multiple_recipients() {
+        let first = Box::leak(Keys::generate().public_key().to_hex().into_boxed_str());
+        let second = Box::leak(Keys::generate().public_key().to_hex().into_boxed_str());
+        let event = make_test_event(9030, vec![vec!["p", first], vec!["p", second]]);
+        assert_eq!(extract_p_tag_hex(&event), None);
+    }
+
+    #[test]
     fn extract_p_tag_missing() {
         let event = make_test_event(9030, vec![]);
         assert_eq!(extract_p_tag_hex(&event), None);
@@ -581,6 +654,32 @@ mod postgres_tests {
     fn extract_p_tag_ignores_non_p_tags() {
         let event = make_test_event(9030, vec![vec!["role", "admin"]]);
         assert_eq!(extract_p_tag_hex(&event), None);
+    }
+
+    #[test]
+    fn admin_replay_ttl_outlives_the_full_freshness_horizon() {
+        let now = 1_800_000_000_i64;
+        let most_future = now + RELAY_ADMIN_MAX_CLOCK_SKEW_SECS;
+        assert!(validate_relay_admin_timestamp(most_future, now).is_ok());
+        assert!(validate_relay_admin_timestamp(now - RELAY_ADMIN_MAX_CLOCK_SKEW_SECS, now).is_ok());
+        assert!(validate_relay_admin_timestamp(most_future + 1, now).is_err());
+
+        // At the shared default marker expiry the most-future command is
+        // still fresh, demonstrating why NIP-43 needs its longer private TTL.
+        assert!(validate_relay_admin_timestamp(
+            most_future,
+            now + buzz_auth::DEFAULT_REPLAY_TTL_SECS as i64,
+        )
+        .is_ok());
+        assert!(
+            RELAY_ADMIN_REPLAY_TTL_SECS as i64 > RELAY_ADMIN_MAX_CLOCK_SKEW_SECS * 2,
+            "the NIP-43 marker must outlive the full two-sided freshness horizon"
+        );
+        assert!(
+            validate_relay_admin_timestamp(most_future, now + RELAY_ADMIN_REPLAY_TTL_SECS as i64,)
+                .is_err(),
+            "the command must be stale before its private marker can expire"
+        );
     }
 
     #[test]
@@ -698,6 +797,40 @@ mod postgres_tests {
 
     const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz"; // sadscan:disable np.postgres.1
 
+    /// In-memory equivalent of Redis `SET NX`, scoped exactly as production.
+    /// Postgres integration fixtures deliberately point Redis at a dead port,
+    /// so security-sensitive NIP-43 tests must install an explicit guard
+    /// rather than accidentally depending on external Redis availability.
+    struct SeenOnceReplayGuard {
+        seen: Mutex<HashSet<(String, [u8; 32])>>,
+    }
+
+    impl SeenOnceReplayGuard {
+        fn new() -> Self {
+            Self {
+                seen: Mutex::new(HashSet::new()),
+            }
+        }
+    }
+
+    impl buzz_auth::Nip98ReplayGuard for SeenOnceReplayGuard {
+        fn try_mark_in_scope<'a>(
+            &'a self,
+            scope: &'a str,
+            event_id: &'a EventId,
+            _ttl_secs: u64,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<bool, buzz_auth::AuthError>> + Send + 'a>,
+        > {
+            let inserted = self
+                .seen
+                .lock()
+                .expect("NIP-43 replay set")
+                .insert((scope.to_owned(), *event_id.as_bytes()));
+            Box::pin(async move { Ok(inserted) })
+        }
+    }
+
     /// Build a real `AppState` + tenant for a fresh community on `host`, with
     /// `require_relay_membership` set as given. Mirrors
     /// `api::invites::tests::invite_test_state`.
@@ -740,7 +873,7 @@ mod postgres_tests {
             buzz_workflow::WorkflowConfig::default(),
         ));
         let media_storage = buzz_media::MediaStorage::new(&config.media).expect("media storage");
-        let (state, _audit_shutdown) = AppState::new(
+        let (mut state, _audit_shutdown) = AppState::new(
             config,
             db,
             redis_pool,
@@ -752,6 +885,7 @@ mod postgres_tests {
             Keys::generate(),
             media_storage,
         );
+        state.nip98_replay = Arc::new(SeenOnceReplayGuard::new());
         (Arc::new(state), tenant)
     }
 
@@ -894,6 +1028,112 @@ mod postgres_tests {
         assert_eq!(
             stored_icon(&state, &tenant).await.as_deref(),
             Some("https://example.com/closed.png")
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn role_change_event_replay_cannot_undo_a_later_demotion() {
+        let host = format!("admin-replay-{}.example", uuid::Uuid::new_v4().simple());
+        let (state, tenant) = workspace_profile_test_state(&host, true).await;
+        let owner = Keys::generate();
+        let target = Keys::generate();
+        state
+            .db
+            .add_relay_member(
+                tenant.community(),
+                &owner.public_key().to_hex(),
+                "owner",
+                None,
+            )
+            .await
+            .expect("seed owner");
+        state
+            .db
+            .add_relay_member(
+                tenant.community(),
+                &target.public_key().to_hex(),
+                "member",
+                None,
+            )
+            .await
+            .expect("seed target");
+
+        let role_event = |role: &str| {
+            EventBuilder::new(Kind::Custom(9032), "")
+                .tags(vec![
+                    Tag::parse(["p", target.public_key().to_hex().as_str()]).expect("target tag"),
+                    Tag::parse(["role", role]).expect("role tag"),
+                ])
+                .sign_with_keys(&owner)
+                .expect("sign role command")
+        };
+        let promote = role_event("admin");
+        let demote = role_event("member");
+
+        handle_relay_admin_event(&tenant, &state, &promote)
+            .await
+            .expect("promote target");
+        handle_relay_admin_event(&tenant, &state, &demote)
+            .await
+            .expect("demote target");
+        let replay = handle_relay_admin_event(&tenant, &state, &promote)
+            .await
+            .expect_err("an exact replay must be rejected");
+        assert!(
+            matches!(replay, RelayAdminError::Rejected(ref message) if message.contains("replay detected")),
+            "unexpected replay rejection: {replay:?}"
+        );
+
+        assert_eq!(
+            state
+                .db
+                .get_relay_member(tenant.community(), &target.public_key().to_hex())
+                .await
+                .expect("read target")
+                .expect("target remains")
+                .role,
+            "member",
+            "replaying the stored promote must not undo the later demotion"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn workspace_profile_event_replay_is_rejected() {
+        let host = format!("icon-replay-{}.example", uuid::Uuid::new_v4().simple());
+        let (state, tenant) = workspace_profile_test_state(&host, true).await;
+        let owner = Keys::generate();
+        state
+            .db
+            .add_relay_member(
+                tenant.community(),
+                &owner.public_key().to_hex(),
+                "owner",
+                None,
+            )
+            .await
+            .expect("seed owner");
+        let event = EventBuilder::new(Kind::Custom(9033), "")
+            .tags(vec![
+                Tag::parse(["icon", "https://example.com/icon.png"]).expect("icon tag")
+            ])
+            .sign_with_keys(&owner)
+            .expect("sign workspace profile command");
+
+        handle_relay_admin_event(&tenant, &state, &event)
+            .await
+            .expect("first workspace profile command succeeds");
+        let replay = handle_relay_admin_event(&tenant, &state, &event)
+            .await
+            .expect_err("exact workspace profile replay must be rejected");
+        assert!(
+            matches!(replay, RelayAdminError::Rejected(ref message) if message.contains("replay detected")),
+            "unexpected replay rejection: {replay:?}"
+        );
+        assert_eq!(
+            stored_icon(&state, &tenant).await.as_deref(),
+            Some("https://example.com/icon.png")
         );
     }
 }

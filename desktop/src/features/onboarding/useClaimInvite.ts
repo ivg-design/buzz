@@ -7,6 +7,7 @@ import {
   isInviteExpiredError,
 } from "@/shared/api/inviteHelpers";
 import { claimInvite } from "@/shared/api/invites";
+import { relayClient } from "@/shared/api/relayClient";
 
 /**
  * Drive the `claiming` stage after machine onboarding completes: claim the
@@ -33,7 +34,19 @@ export function useClaimInvite() {
       transaction.policyReceipt,
     )
       .then(() => {
-        update({ stage: "connecting", error: undefined }, transaction.id);
+        // The membership rejection can leave the original socket alive. Drop
+        // it after the claim commits so the connecting stage authenticates a
+        // fresh session against the newly admitted roster entry.
+        relayClient.disconnect();
+        update(
+          {
+            stage: "connecting",
+            error: undefined,
+            inviteCode: undefined,
+            policyReceipt: undefined,
+          },
+          transaction.id,
+        );
       })
       .catch((error: unknown) =>
         update(

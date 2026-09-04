@@ -7,5 +7,5 @@ export const Route = createFileRoute("/invite/$code")({
 
 function InvitePageRoute() {
   const { code } = Route.useParams();
-  return <InvitePage code={code} />;
+  return <InvitePage legacyCode={code} />;
 }

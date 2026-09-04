@@ -42,6 +42,20 @@ describe("parsePubkeyInput", () => {
     assert.equal(parsePubkeyInput(`${HEX}0`), null);
   });
 
+  it("rejects a shaped hex value that is not a secp256k1 point", () => {
+    assert.equal(parsePubkeyInput("0".repeat(64)), null);
+  });
+
+  it("rejects an npub that decodes to an invalid curve point", () => {
+    // Valid bech32/checksum, but the payload is the invalid all-zero x value.
+    assert.equal(
+      parsePubkeyInput(
+        "npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqzqujme",
+      ),
+      null,
+    );
+  });
+
   it("rejects non-hex non-npub input", () => {
     assert.equal(parsePubkeyInput(""), null);
     assert.equal(parsePubkeyInput("alice"), null);

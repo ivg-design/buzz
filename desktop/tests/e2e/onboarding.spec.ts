@@ -1138,7 +1138,9 @@ test("first-community choices route join, create, owner, and member intents", as
   await expect(
     page.getByRole("button", { name: "Copy public ID" }),
   ).toBeVisible();
-  await accessInput.fill("https://default.example.com/invite/abc123");
+  await accessInput.fill(
+    `https://default.example.com/invite#code=v2.${"A".repeat(43)}`,
+  );
   await expect(page.getByTestId("invite-redeem-submit")).toBeEnabled();
 });
 
@@ -4044,6 +4046,7 @@ test("denied on relay A then paste relay B invite URL switches community to B", 
   // Intercept the claimInvite POST to relay B so it succeeds.
   const relayBUrl = "wss://relay-b.example.com";
   const relayBHttpUrl = "https://relay-b.example.com";
+  const inviteCode = `v2.${"A".repeat(43)}`;
   const policyReceipt = "relay-signed-policy-receipt";
   await page.route(`${relayBHttpUrl}/api/join-policy`, async (route) => {
     await route.fulfill({
@@ -4063,7 +4066,7 @@ test("denied on relay A then paste relay B invite URL switches community to B", 
     `${relayBHttpUrl}/api/invites/accept-policy`,
     async (route) => {
       expect(route.request().postDataJSON()).toEqual({
-        code: "test-invite-code",
+        code: inviteCode,
         policy_version: "policy-v1",
         age_confirmed: true,
       });
@@ -4076,7 +4079,7 @@ test("denied on relay A then paste relay B invite URL switches community to B", 
   );
   await page.route(`${relayBHttpUrl}/api/invites/claim`, async (route) => {
     expect(route.request().postDataJSON()).toMatchObject({
-      code: "test-invite-code",
+      code: inviteCode,
       policy_receipt: policyReceipt,
     });
     await route.fulfill({
@@ -4095,7 +4098,7 @@ test("denied on relay A then paste relay B invite URL switches community to B", 
   await page.getByTestId("membership-denied-redeem-invite").click();
   await page
     .getByTestId("invite-redeem-input")
-    .fill(`${relayBHttpUrl}/invite/test-invite-code`);
+    .fill(`${relayBHttpUrl}/invite#code=${inviteCode}`);
   await page.getByTestId("invite-redeem-submit").click();
   await expect(page.getByText("I am 18 years of age or older.")).toBeVisible();
   await page.getByLabel("I am 18 years of age or older.").check();
@@ -4120,4 +4123,102 @@ test("denied on relay A then paste relay B invite URL switches community to B", 
       }),
     )
     .toBe(relayBUrl);
+});
+
+test("same-relay recovery claims the invite before reconnecting", async ({
+  page,
+}) => {
+  await seedActiveIdentity(page, BLANK_TYLER_IDENTITY);
+  await installMockBridge(
+    page,
+    { relayRequiresMembership: true, relayRole: null },
+    { skipOnboardingSeed: true },
+  );
+  await page.goto("/");
+
+  await page.getByTestId("onboarding-display-name").fill("Morty QA");
+  await page.getByTestId("onboarding-next").click();
+  await expect(page.getByTestId("membership-denied")).toBeVisible();
+
+  const relayUrls = await page.evaluate(() => {
+    const communities = JSON.parse(
+      window.localStorage.getItem("buzz-communities") ?? "[]",
+    ) as Array<{ relayUrl?: string }>;
+    const relayWsUrl = communities[0]?.relayUrl ?? "";
+    return {
+      relayHttpUrl: relayWsUrl
+        .replace(/^wss:/, "https:")
+        .replace(/^ws:/, "http:"),
+    };
+  });
+  const inviteCode = `v2.${"B".repeat(42)}A`;
+  await page.route(`${relayUrls.relayHttpUrl}/api/join-policy`, (route) =>
+    route.fulfill({ json: { policy: null }, status: 200 }),
+  );
+
+  let claimStarted = false;
+  let releaseClaim = () => {};
+  const claimGate = new Promise<void>((resolve) => {
+    releaseClaim = resolve;
+  });
+  await page.route(
+    `${relayUrls.relayHttpUrl}/api/invites/claim`,
+    async (route) => {
+      claimStarted = true;
+      expect(route.request().postDataJSON()).toMatchObject({
+        code: inviteCode,
+      });
+      await claimGate;
+      await route.fulfill({
+        json: {
+          status: "joined",
+          community_id: "e2e-default-community",
+          host: new URL(relayUrls.relayHttpUrl).host,
+          role: "member",
+        },
+        status: 200,
+      });
+    },
+  );
+
+  const connectCount = () =>
+    page.evaluate(
+      () =>
+        (window.__BUZZ_E2E_COMMAND_PAYLOADS__ ?? []).filter(
+          ({ command }) => command === "plugin:websocket|connect",
+        ).length,
+    );
+  const workspaceApplyCount = () =>
+    page.evaluate(
+      () =>
+        (window.__BUZZ_E2E_COMMAND_PAYLOADS__ ?? []).filter(
+          ({ command }) => command === "apply_workspace",
+        ).length,
+    );
+  const connectsBeforeClaim = await connectCount();
+  const appliesBeforeClaim = await workspaceApplyCount();
+  await page.getByTestId("membership-denied-redeem-invite").click();
+  await page
+    .getByTestId("invite-redeem-input")
+    .fill(`${relayUrls.relayHttpUrl}/invite#code=${inviteCode}`);
+  await page.getByTestId("invite-redeem-submit").click();
+
+  await expect.poll(() => claimStarted).toBe(true);
+  await expect(page.getByTestId("membership-denied")).toHaveCount(0);
+  await expect(page.getByText("Accepting your invite…")).toBeVisible();
+  await expect
+    .poll(() =>
+      page.evaluate(() => {
+        const raw = window.localStorage.getItem(
+          "buzz-community-onboarding-transaction.v1",
+        );
+        return raw ? (JSON.parse(raw) as { stage?: string }).stage : undefined;
+      }),
+    )
+    .toBe("claiming");
+  expect(await connectCount()).toBe(connectsBeforeClaim);
+
+  releaseClaim();
+  await expect.poll(workspaceApplyCount).toBeGreaterThan(appliesBeforeClaim);
+  await expect(page.getByText("Build your profile")).toBeVisible();
 });

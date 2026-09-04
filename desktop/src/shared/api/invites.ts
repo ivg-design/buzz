@@ -5,9 +5,8 @@ import {
   signRelayEvent,
 } from "@/shared/api/tauri";
 
-// Relay invite data layer. Both endpoints are NIP-98-authed HTTP POSTs
-// (mirrors the read path in moderation.ts, plus the payload tag the relay
-// requires for signed POST bodies):
+// Relay invite data layer. Every management/claim request is NIP-98 signed;
+// POST bodies additionally carry the payload hash required by the relay.
 //
 // - POST /api/invites        — mint a code (relay checks owner/admin role)
 // - POST /api/invites/claim  — claim a code, signed by the *joining* key.
@@ -22,11 +21,22 @@ const NIP98_KIND = 27235;
 const INVITE_REQUEST_TIMEOUT_MS = 15_000;
 
 export type MintedInvite = {
+  id: string;
   code: string;
   expiresAt: number;
   url: string;
   maxUses: number | null;
   usesRemaining: number | null;
+};
+
+export type PendingInvite = {
+  id: string;
+  expiresAt: number;
+  maxUses: number | null;
+  useCount: number;
+  usesRemaining: number | null;
+  createdBy: string;
+  createdAt: number;
 };
 
 export type JoinPolicy = {
@@ -60,16 +70,23 @@ async function sha256Hex(text: string): Promise<string> {
  * (api/invites.rs passes `require_payload: true`), and verifies the `u` tag
  * against the exact request URL — so the caller finalizes both before signing.
  */
-async function nip98PostHeader(url: string, body: string): Promise<string> {
+async function nip98Header(
+  url: string,
+  method: "DELETE" | "GET" | "POST",
+  body?: string,
+): Promise<string> {
+  const tags = [
+    ["u", url],
+    ["method", method],
+    ["nonce", crypto.randomUUID()],
+  ];
+  if (body !== undefined) {
+    tags.push(["payload", await sha256Hex(body)]);
+  }
   const authEvent = await signRelayEvent({
     kind: NIP98_KIND,
     content: "",
-    tags: [
-      ["u", url],
-      ["method", "POST"],
-      ["payload", await sha256Hex(body)],
-      ["nonce", crypto.randomUUID()],
-    ],
+    tags,
   });
   // NIP-98 events carry empty content and ASCII-only tags, so btoa is safe here.
   return `Nostr ${btoa(JSON.stringify(authEvent))}`;
@@ -81,7 +98,7 @@ async function invitePost<T>(
   body: string,
 ): Promise<T> {
   const url = `${httpBase.replace(/\/+$/, "")}${path}`;
-  const authorization = await nip98PostHeader(url, body);
+  const authorization = await nip98Header(url, "POST", body);
   const response = await fetch(url, {
     method: "POST",
     headers: {
@@ -89,6 +106,30 @@ async function invitePost<T>(
       "Content-Type": "application/json",
     },
     body,
+    signal: AbortSignal.timeout(INVITE_REQUEST_TIMEOUT_MS),
+  });
+  const json = (await response.json().catch(() => ({}))) as Record<
+    string,
+    unknown
+  >;
+  if (!response.ok) {
+    const message =
+      typeof json.error === "string" ? json.error : `HTTP ${response.status}`;
+    throw new Error(message);
+  }
+  return json as T;
+}
+
+async function inviteRequest<T>(
+  httpBase: string,
+  path: string,
+  method: "DELETE" | "GET",
+): Promise<T> {
+  const url = `${httpBase.replace(/\/+$/, "")}${path}`;
+  const authorization = await nip98Header(url, method);
+  const response = await fetch(url, {
+    method,
+    headers: { Authorization: authorization },
     signal: AbortSignal.timeout(INVITE_REQUEST_TIMEOUT_MS),
   });
   const json = (await response.json().catch(() => ({}))) as Record<
@@ -193,14 +234,16 @@ export async function acceptJoinPolicy(
 /** Mint an invite code on the active community's relay (owner/admin only). */
 export async function mintInvite(options?: {
   ttlSecs?: number;
-  maxUses?: number | null;
+  maxUses?: number;
 }): Promise<MintedInvite> {
   const base = await getRelayHttpUrl();
-  const payload: Record<string, unknown> = {};
+  const payload: Record<string, unknown> = {
+    max_uses: options?.maxUses ?? 1,
+  };
   if (options?.ttlSecs != null) payload.ttl_secs = options.ttlSecs;
-  if (options?.maxUses != null) payload.max_uses = options.maxUses;
   const body = JSON.stringify(payload);
   const raw = await invitePost<{
+    id: string;
     code: string;
     expires_at: number;
     url: string;
@@ -208,12 +251,48 @@ export async function mintInvite(options?: {
     uses_remaining: number | null;
   }>(base, "/api/invites", body);
   return {
+    id: raw.id,
     code: raw.code,
     expiresAt: raw.expires_at,
     url: raw.url,
     maxUses: raw.max_uses,
     usesRemaining: raw.uses_remaining,
   };
+}
+
+/** List non-secret metadata for live invite links (owner/admin only). */
+export async function listPendingInvites(): Promise<PendingInvite[]> {
+  const base = await getRelayHttpUrl();
+  const raw = await inviteRequest<{
+    invites: Array<{
+      id: string;
+      expires_at: number;
+      max_uses: number | null;
+      use_count: number;
+      uses_remaining: number | null;
+      created_by: string;
+      created_at: number;
+    }>;
+  }>(base, "/api/invites", "GET");
+  return raw.invites.map((invite) => ({
+    id: invite.id,
+    expiresAt: invite.expires_at,
+    maxUses: invite.max_uses,
+    useCount: invite.use_count,
+    usesRemaining: invite.uses_remaining,
+    createdBy: invite.created_by,
+    createdAt: invite.created_at,
+  }));
+}
+
+/** Revoke one invite by its non-secret row identifier (owner/admin only). */
+export async function revokeInvite(inviteId: string): Promise<void> {
+  const base = await getRelayHttpUrl();
+  await inviteRequest(
+    base,
+    `/api/invites/${encodeURIComponent(inviteId)}`,
+    "DELETE",
+  );
 }
 
 /**

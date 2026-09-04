@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   clearCommunityOnboardingTransaction,
+  communityChangeOnboardingPatch,
   isTransactionStillConnecting,
   loadCommunityOnboardingTransaction,
   markCommunityOnboardingComplete,
@@ -55,7 +56,7 @@ test("non-invite onboarding starts at connection", () => {
   assert.equal(transaction.stage, "connecting");
 });
 
-test("same-relay ingress resumes rather than replacing progress", () => {
+test("same-relay invite ingress forces a claim before reconnect", () => {
   const storage = createMemoryStorage();
   const first = startCommunityOnboarding(
     { source: "add-community", relayUrl: "wss://relay.example" },
@@ -73,14 +74,65 @@ test("same-relay ingress resumes rather than replacing progress", () => {
       source: "deep-link-join",
       relayUrl: "wss://relay.example/",
       inviteCode: "new-code",
+      policyReceipt: "new-receipt",
     },
     storage,
     new Date("2026-07-16T00:02:00Z"),
   );
   assert.equal(resumed.id, progressed.id);
-  assert.equal(resumed.stage, "profile");
+  assert.equal(resumed.stage, "claiming");
+  assert.equal(resumed.source, "deep-link-join");
   assert.equal(resumed.communityId, "community-id");
   assert.equal(resumed.inviteCode, "new-code");
+  assert.equal(resumed.policyReceipt, "new-receipt");
+});
+
+test("changing relay clears the prior relay's code and policy receipt", () => {
+  const transaction = startCommunityOnboarding(
+    {
+      source: "membership-recovery",
+      relayUrl: "wss://relay-a.example",
+      inviteCode: "relay-a-code",
+      policyReceipt: "relay-a-receipt",
+    },
+    createMemoryStorage(),
+  );
+  const changed = {
+    ...transaction,
+    ...communityChangeOnboardingPatch("Relay B", "wss://relay-b.example"),
+  };
+  assert.equal(changed.stage, "connecting");
+  assert.equal(changed.relayUrl, "wss://relay-b.example");
+  assert.equal(changed.inviteCode, undefined);
+  assert.equal(changed.policyReceipt, undefined);
+});
+
+test("successful invite transition can scrub redeemed bearer material", () => {
+  const storage = createMemoryStorage();
+  const transaction = startCommunityOnboarding(
+    {
+      source: "deep-link-join",
+      relayUrl: "wss://relay.example",
+      inviteCode: "single-use-secret",
+      policyReceipt: "bound-policy-receipt",
+    },
+    storage,
+  );
+  const connected = updateCommunityOnboardingTransaction(
+    transaction,
+    {
+      stage: "connecting",
+      inviteCode: undefined,
+      policyReceipt: undefined,
+    },
+    storage,
+  );
+
+  assert.equal(connected.inviteCode, undefined);
+  assert.equal(connected.policyReceipt, undefined);
+  const persisted = storage.getItem("buzz-community-onboarding-transaction.v1");
+  assert.ok(persisted);
+  assert.doesNotMatch(persisted, /single-use-secret|bound-policy-receipt/);
 });
 
 test("stale asynchronous updates cannot mutate a replacement transaction", () => {

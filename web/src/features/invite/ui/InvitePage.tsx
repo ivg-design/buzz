@@ -24,6 +24,34 @@ type JoinPolicy = {
 
 type PolicyDocument = { title: string; markdown: string };
 
+let strictModeInviteCode: string | undefined;
+let strictModeConsumeGeneration = 0;
+
+function takeInviteCodeFromUrl(legacyCode?: string): string {
+  const entries = Array.from(
+    new URLSearchParams(window.location.hash.replace(/^#/, "")).entries(),
+  );
+  const fragmentCode =
+    entries.length === 1 && entries[0]?.[0] === "code"
+      ? entries[0][1]
+      : undefined;
+  const extractedCode = legacyCode ?? fragmentCode;
+  if (extractedCode) {
+    strictModeInviteCode = extractedCode;
+    const generation = ++strictModeConsumeGeneration;
+    queueMicrotask(() => {
+      if (strictModeConsumeGeneration === generation) {
+        strictModeInviteCode = undefined;
+      }
+    });
+  }
+  const code = extractedCode ?? strictModeInviteCode ?? "";
+  // Scrub before effects, network requests, analytics, or a desktop handoff.
+  // `replaceState` removes the bearer without adding another history entry.
+  window.history.replaceState(window.history.state, "", "/invite");
+  return code.trim();
+}
+
 /** Convert relay invite sentinels into user-facing recovery guidance. */
 function inviteClaimErrorMessage(message: string): string {
   if (message.includes("invite_exhausted")) {
@@ -38,8 +66,9 @@ function inviteClaimErrorMessage(message: string): string {
   return message;
 }
 
-/** Landing page for a community invite link (`/invite/<code>`). */
-export function InvitePage({ code }: { code: string }) {
+/** Landing page for `/invite#code=…` plus a scrubbed legacy path route. */
+export function InvitePage({ legacyCode }: { legacyCode?: string }) {
+  const [code] = React.useState(() => takeInviteCodeFromUrl(legacyCode));
   const relay = relayWsUrl();
   const host = relay.replace(/^wss?:\/\//, "");
   const [policy, setPolicy] = React.useState<JoinPolicy | null | undefined>(
@@ -90,6 +119,7 @@ export function InvitePage({ code }: { code: string }) {
   }, []);
 
   const acceptPolicy = async (): Promise<string | undefined> => {
+    if (!code) throw new Error("This invite link is missing its code.");
     if (!policy) return undefined;
     const response = await fetch("/api/invites/accept-policy", {
       method: "POST",
@@ -122,7 +152,7 @@ export function InvitePage({ code }: { code: string }) {
     try {
       const receipt = await acceptPolicy();
       await claimInviteInBrowser(code, receipt);
-      window.location.assign("/");
+      window.location.replace("/");
     } catch (error) {
       const message =
         error instanceof Error ? error.message : "Could not claim this invite.";
@@ -134,6 +164,7 @@ export function InvitePage({ code }: { code: string }) {
 
   const browserSigningAvailable = hasNip07Provider();
   const disabled =
+    !code ||
     policy === undefined ||
     opening ||
     joiningBrowser ||
@@ -235,37 +266,25 @@ export function InvitePage({ code }: { code: string }) {
                 {joiningBrowser ? "Joining…" : "Join in browser"}
               </Button>
             ) : null}
-            {policy === null ? (
-              <Button
-                asChild
-                className={`h-10 w-full ${
-                  browserSigningAvailable
-                    ? "border border-black bg-white text-black hover:bg-black/5"
-                    : "bg-black text-white hover:bg-black/90 focus-visible:ring-black"
-                }`}
-              >
-                <a
-                  href={`buzz://join?relay=${encodeURIComponent(relay)}&code=${encodeURIComponent(code)}`}
-                >
-                  Accept invite in Buzz
-                </a>
-              </Button>
-            ) : (
-              <Button
-                className={`h-10 w-full disabled:cursor-not-allowed disabled:bg-black/30 disabled:text-white/70 ${
-                  browserSigningAvailable
-                    ? "border border-black bg-white text-black hover:bg-black/5"
-                    : "bg-black text-white hover:bg-black/90 focus-visible:ring-black"
-                }`}
-                disabled={disabled}
-                onClick={openInvite}
-              >
-                Accept invite in Buzz
-              </Button>
-            )}
+            <Button
+              className={`h-10 w-full disabled:cursor-not-allowed disabled:bg-black/30 disabled:text-white/70 ${
+                browserSigningAvailable
+                  ? "border border-black bg-white text-black hover:bg-black/5"
+                  : "bg-black text-white hover:bg-black/90 focus-visible:ring-black"
+              }`}
+              disabled={disabled}
+              onClick={openInvite}
+            >
+              Accept invite in Buzz
+            </Button>
             {browserJoinError ? (
               <p className="text-sm text-red-700" role="alert">
                 {browserJoinError}
+              </p>
+            ) : null}
+            {!code ? (
+              <p className="text-sm text-red-700" role="alert">
+                This invite link is missing its code. Ask for a new invite.
               </p>
             ) : null}
           </div>

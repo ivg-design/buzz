@@ -57,7 +57,6 @@ pub enum ClaimOutcome {
 }
 
 /// A freshly minted v2 invite, including the plaintext code and metadata.
-#[derive(Debug)]
 pub struct MintedInvite {
     /// The full v2 code string (`v2.<base64url secret>`). Returned to the caller
     /// exactly once; the database stores only the SHA-256 hash.
@@ -71,6 +70,19 @@ pub struct MintedInvite {
     pub uses_remaining: Option<i32>,
     /// The invite's database-generated UUID.
     pub invite_id: uuid::Uuid,
+}
+
+impl std::fmt::Debug for MintedInvite {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MintedInvite")
+            .field("code", &"[redacted]")
+            .field("expires_at", &self.expires_at)
+            .field("max_uses", &self.max_uses)
+            .field("uses_remaining", &self.uses_remaining)
+            .field("invite_id", &self.invite_id)
+            .finish()
+    }
 }
 
 fn validate_mint_inputs(ttl_secs: u64, max_uses: Option<i32>) -> Result<()> {
@@ -232,6 +244,12 @@ pub async fn claim_relay_invite(
     )
     .await?;
     let mut tx = sqlx::Transaction::begin(connection, None).await?;
+    // Claiming inserts membership and consumes use budget, so it shares the
+    // same durable community-deletion fence as mint and revoke. Acquire this
+    // before locking the invite row; a rejected claim rolls back untouched.
+    crate::deletion::DeletionStore::new(pool.clone())
+        .guard_transaction(&mut tx, community)
+        .await?;
 
     // 2. SELECT FOR UPDATE — lock the invite row for the duration of this txn.
     let row = sqlx::query(
@@ -546,9 +564,23 @@ mod postgres_tests {
         }
     }
 
+    #[test]
+    fn minted_invite_debug_redacts_the_bearer_code() {
+        let invite = MintedInvite {
+            code: "v2.super-secret-code".to_owned(),
+            expires_at: Utc::now(),
+            max_uses: Some(1),
+            uses_remaining: Some(1),
+            invite_id: Uuid::nil(),
+        };
+        let debug = format!("{invite:?}");
+        assert!(debug.contains("[redacted]"));
+        assert!(!debug.contains("super-secret-code"));
+    }
+
     #[tokio::test]
     #[ignore = "requires Postgres"]
-    async fn mint_after_quiescing_returns_typed_fence_without_persisting() {
+    async fn invite_writes_after_quiescing_are_fenced_without_consumption() {
         let (admin, database_name, database_url) =
             create_scratch_database("relay_invite_fence").await;
         let db = crate::Db::new(&crate::DbConfig {
@@ -568,6 +600,10 @@ mod postgres_tests {
             .await
             .expect("create fenced invite community")
             .id;
+        let invite = mint_relay_invite(&pool, community, "owner", 3600, Some(1))
+            .await
+            .expect("mint invite before quiescing");
+        let invite_hash = hash_v2_code(&invite.code);
         let request = store
             .submit(&host, "owner", None)
             .await
@@ -628,7 +664,27 @@ mod postgres_tests {
                 .fetch_one(&pool)
                 .await
                 .expect("count relay invites");
-        assert_eq!(invite_count, 0, "rejected mint must not persist an invite");
+        assert_eq!(
+            invite_count, 1,
+            "rejected mint must not persist a second invite"
+        );
+
+        let claimer = test_pubkey();
+        let error = claim_relay_invite(&pool, community, &invite_hash, &claimer, None)
+            .await
+            .expect_err("quiescing must reject invite claims");
+        assert!(matches!(error, crate::error::DbError::AccessDenied(_)));
+        assert_eq!(
+            use_count(&pool, community, invite.invite_id).await,
+            0,
+            "rejected claim must not consume the invite"
+        );
+        assert!(
+            !is_relay_member(&pool, community, &claimer)
+                .await
+                .expect("read rejected claimant membership"),
+            "rejected claim must not insert membership"
+        );
 
         drop(store);
         drop(pool);

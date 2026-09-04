@@ -6,7 +6,9 @@
 //! before the opaque lease crosses into the runner, and finalized only after
 //! ACP validates the producer receipt against its independently held binding.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
+#[cfg(unix)]
+use std::fs::OpenOptions;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
@@ -834,6 +836,9 @@ fn replace_private(path: &Path, journal: &Journal) -> Result<(), GitReceiptJourn
         }
         file.write_all(&bytes)?;
         file.sync_all()?;
+        #[cfg(windows)]
+        super::windows_private::replace_private_file(&temporary, path)?;
+        #[cfg(not(windows))]
         std::fs::rename(&temporary, path)?;
         sync_parent(path)?;
         Ok::<_, GitReceiptJournalError>(())
@@ -844,10 +849,11 @@ fn replace_private(path: &Path, journal: &Journal) -> Result<(), GitReceiptJourn
     result
 }
 
-fn sync_parent(path: &Path) -> Result<(), std::io::Error> {
+fn sync_parent(_path: &Path) -> Result<(), std::io::Error> {
     #[cfg(unix)]
     File::open(
-        path.parent()
+        _path
+            .parent()
             .ok_or_else(|| std::io::Error::other("journal path has no parent"))?,
     )?
     .sync_all()?;
@@ -865,7 +871,12 @@ fn private_new(path: &Path) -> Result<File, std::io::Error> {
         .open(path)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn private_new(path: &Path) -> Result<File, std::io::Error> {
+    super::windows_private::create_private_new(path)
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn private_new(_path: &Path) -> Result<File, std::io::Error> {
     Err(std::io::Error::other(
         "Git receipt journals require owner-only no-follow file support",
@@ -891,7 +902,12 @@ fn open_private_read(path: &Path) -> Result<File, GitReceiptJournalError> {
     Ok(file)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn open_private_read(path: &Path) -> Result<File, GitReceiptJournalError> {
+    super::windows_private::open_private_read(path).map_err(GitReceiptJournalError::from)
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn open_private_read(_path: &Path) -> Result<File, GitReceiptJournalError> {
     Err(GitReceiptJournalError::Invalid(
         "Git receipt journals require owner-only no-follow file support".into(),

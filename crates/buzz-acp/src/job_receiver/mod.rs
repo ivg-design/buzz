@@ -12,6 +12,9 @@ mod privilege;
 mod prompt;
 mod receipts;
 mod revocation;
+#[cfg_attr(windows, allow(unsafe_code))]
+#[cfg(windows)]
+mod windows_private;
 
 use std::path::{Path, PathBuf};
 

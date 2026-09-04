@@ -1,4 +1,6 @@
-use std::fs::{File, OpenOptions};
+use std::fs::File;
+#[cfg(not(windows))]
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -212,7 +214,7 @@ impl JobLedger {
             &frozen.idempotency_key,
         );
         let path = self.root.join(format!("{key}.json"));
-        let stored: StoredClaim = serde_json::from_slice(&std::fs::read(path)?)?;
+        let stored: StoredClaim = serde_json::from_slice(&read_private_bytes(&path)?)?;
         if !claims_match_exactly(&stored, frozen) {
             return Err(LedgerError::Invalid(
                 "durable claim changed after admission".into(),
@@ -258,7 +260,7 @@ impl JobLedger {
                 Ok(())
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                if std::fs::read_to_string(path)? == event_id {
+                if read_private_string(&path)? == event_id {
                     Ok(())
                 } else {
                     Err(LedgerError::Invalid(
@@ -276,7 +278,7 @@ impl JobLedger {
         kind: ReceiptKind,
     ) -> Result<bool, LedgerError> {
         let path = self.receipt_ack_path(claim, kind);
-        match std::fs::read_to_string(path) {
+        match read_private_string(&path) {
             Ok(stored) if stored == receipt_event(claim, kind).id.to_hex() => Ok(true),
             Ok(_) => Err(LedgerError::Invalid(
                 "receipt acknowledgement marker has the wrong event id".into(),
@@ -314,7 +316,7 @@ impl JobLedger {
             if !is_claim_record_path(&path) {
                 continue;
             }
-            let claim: StoredClaim = serde_json::from_slice(&std::fs::read(&path)?)?;
+            let claim: StoredClaim = serde_json::from_slice(&read_private_bytes(&path)?)?;
             if claim.version != LEDGER_VERSION {
                 return Err(LedgerError::Invalid(
                     "unsupported ledger record version".into(),
@@ -327,6 +329,8 @@ impl JobLedger {
 
     fn prepare_root(&self) -> Result<(), LedgerError> {
         std::fs::create_dir_all(&self.root)?;
+        #[cfg(windows)]
+        super::windows_private::secure_directory(&self.root)?;
         Ok(())
     }
 }
@@ -351,7 +355,7 @@ fn claims_match_exactly(left: &StoredClaim, right: &StoredClaim) -> bool {
 }
 
 fn compare_existing(path: &Path, candidate: &StoredClaim) -> Result<ClaimDecision, LedgerError> {
-    let raw = std::fs::read(path)?;
+    let raw = read_private_bytes(path)?;
     let existing: StoredClaim = serde_json::from_slice(&raw)?;
     if existing.version != LEDGER_VERSION
         || existing.community != candidate.community
@@ -402,10 +406,10 @@ fn is_claim_record_path(path: &Path) -> bool {
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
-fn sync_directory(path: &Path) -> Result<(), std::io::Error> {
+fn sync_directory(_path: &Path) -> Result<(), std::io::Error> {
     #[cfg(unix)]
     {
-        File::open(path)?.sync_all()?;
+        File::open(_path)?.sync_all()?;
     }
     // Windows does not provide a portable directory fsync through std. File
     // contents are still flushed; production crash-durability is guaranteed on
@@ -420,15 +424,43 @@ fn write_private_file(path: &Path, content: &[u8]) -> Result<(), std::io::Error>
     Ok(())
 }
 
+#[cfg(unix)]
 fn create_private_new(path: &Path) -> Result<File, std::io::Error> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    options.open(path)
+    use std::os::unix::fs::OpenOptionsExt;
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(windows)]
+fn create_private_new(path: &Path) -> Result<File, std::io::Error> {
+    super::windows_private::create_private_new(path)
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn create_private_new(path: &Path) -> Result<File, std::io::Error> {
+    OpenOptions::new().write(true).create_new(true).open(path)
+}
+
+#[cfg(windows)]
+fn read_private_bytes(path: &Path) -> Result<Vec<u8>, std::io::Error> {
+    use std::io::Read as _;
+    let mut file = super::windows_private::open_private_read(path)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+#[cfg(not(windows))]
+fn read_private_bytes(path: &Path) -> Result<Vec<u8>, std::io::Error> {
+    std::fs::read(path)
+}
+
+fn read_private_string(path: &Path) -> Result<String, std::io::Error> {
+    String::from_utf8(read_private_bytes(path)?)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
 #[cfg(test)]

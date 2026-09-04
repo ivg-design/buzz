@@ -1,8 +1,10 @@
 use std::collections::{BTreeSet, HashSet};
+#[cfg(windows)]
+use std::ffi::OsString;
 use std::io::Read as _;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::Command;
+use std::time::Duration;
 
 use buzz_core::job::JobRequest;
 use serde::Deserialize;
@@ -424,7 +426,12 @@ fn secure_private_directory(path: &Path) -> Result<(), GrantError> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn secure_private_directory(path: &Path) -> Result<(), GrantError> {
+    super::windows_private::secure_directory(path).map_err(GrantError::from)
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn secure_private_directory(_path: &Path) -> Result<(), GrantError> {
     Err(GrantError::Invalid(
         "job ledgers are disabled until this platform has owner-only ACL validation".into(),
@@ -501,7 +508,12 @@ fn open_private_grant_file(path: &Path) -> Result<std::fs::File, GrantError> {
     Ok(file)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn open_private_grant_file(path: &Path) -> Result<std::fs::File, GrantError> {
+    super::windows_private::open_private_read(path).map_err(GrantError::from)
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn open_private_grant_file(_path: &Path) -> Result<std::fs::File, GrantError> {
     Err(GrantError::Invalid(
         "grant files are disabled until this platform has owner-only ACL validation; use secure inline grant JSON"
@@ -894,13 +906,14 @@ fn git_success_with_timeout(root: &Path, args: &[&str], timeout: Duration) -> bo
 }
 
 fn git_run_with_timeout(root: &Path, args: &[&str], timeout: Duration) -> Option<Vec<u8>> {
-    let mut command = Command::new(system_git()?);
+    let git = system_git()?;
+    let mut command = Command::new(&git);
     command
         .arg("-C")
         .arg(root)
         .args(args)
         .env_clear()
-        .env("PATH", system_path())
+        .env("PATH", system_path(&git)?)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GCM_INTERACTIVE", "never")
         .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -909,40 +922,20 @@ fn git_run_with_timeout(root: &Path, args: &[&str], timeout: Duration) -> Option
         .env("GIT_NO_REPLACE_OBJECTS", "1")
         .env("GIT_ATTR_NOSYSTEM", "1")
         .env("GIT_ASKPASS", system_false())
-        .env("SSH_ASKPASS", system_false())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    let mut child = command.spawn().ok()?;
-    let stdout = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stdout
-            .take(MAX_GIT_OUTPUT_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .ok()
-            .map(|_| bytes)
-    });
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait().ok()? {
-            Some(status) => break status,
-            None if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            None => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = reader.join();
-                return None;
-            }
-        }
-    };
-    let bytes = reader.join().ok()??;
-    if !status.success() || bytes.len() as u64 > MAX_GIT_OUTPUT_BYTES {
+        .env("SSH_ASKPASS", system_false());
+    let output = crate::bounded_command::output_with_limits(
+        command,
+        crate::bounded_command::Limits {
+            timeout,
+            stdout_bytes: MAX_GIT_OUTPUT_BYTES,
+            stderr_bytes: MAX_GIT_OUTPUT_BYTES,
+        },
+    )
+    .ok()?;
+    if !output.status.success() {
         return None;
     }
-    Some(bytes)
+    Some(output.stdout)
 }
 
 fn checkout_config_is_safe(root: &Path) -> Option<()> {
@@ -1039,27 +1032,58 @@ fn dangerous_local_config_key(key: &str) -> bool {
 }
 
 #[cfg(unix)]
-fn system_git() -> Option<&'static Path> {
+fn system_git() -> Option<PathBuf> {
     [Path::new("/usr/bin/git"), Path::new("/bin/git")]
         .into_iter()
         .find(|path| path.is_file())
+        .and_then(|path| path.canonicalize().ok())
 }
 
-#[cfg(not(unix))]
-fn system_git() -> Option<&'static Path> {
-    // Fail closed until Windows has a trusted, installation-root anchored Git
-    // resolver. In particular, never search the checkout or ambient PATH.
+#[cfg(windows)]
+fn system_git() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    for base in [
+        std::env::var_os("ProgramFiles"),
+        std::env::var_os("ProgramFiles(x86)"),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        candidates.push(PathBuf::from(&base).join("Git/cmd/git.exe"));
+        candidates.push(PathBuf::from(base).join("Git/bin/git.exe"));
+    }
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        candidates.push(PathBuf::from(local).join("Programs/Git/cmd/git.exe"));
+    }
+    candidates.into_iter().find_map(|candidate| {
+        (candidate.is_absolute() && candidate.is_file())
+            .then(|| candidate.canonicalize().ok())
+            .flatten()
+    })
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn system_git() -> Option<PathBuf> {
     None
 }
 
 #[cfg(unix)]
-fn system_path() -> &'static str {
-    "/usr/bin:/bin"
+fn system_path(_git: &Path) -> Option<&'static str> {
+    Some("/usr/bin:/bin")
 }
 
-#[cfg(not(unix))]
-fn system_path() -> &'static str {
-    ""
+#[cfg(windows)]
+fn system_path(git: &Path) -> Option<OsString> {
+    let mut paths = vec![git.parent()?.to_path_buf()];
+    if let Some(root) = std::env::var_os("SystemRoot") {
+        paths.push(PathBuf::from(root).join("System32"));
+    }
+    std::env::join_paths(paths).ok()
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn system_path(_git: &Path) -> Option<&'static str> {
+    None
 }
 
 #[cfg(unix)]

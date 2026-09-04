@@ -1,4 +1,6 @@
-use std::fs::{File, OpenOptions};
+use std::fs::File;
+#[cfg(not(windows))]
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -312,6 +314,9 @@ impl LifecycleStore {
             .parent()
             .ok_or_else(|| LifecycleError::Invalid("lock path has no parent".into()))?;
         std::fs::create_dir_all(parent)?;
+        #[cfg(windows)]
+        let lock = super::windows_private::open_private_lock(&self.lock_path, true)?.0;
+        #[cfg(not(windows))]
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
@@ -325,7 +330,7 @@ impl LifecycleStore {
     }
 
     fn read(&self) -> Result<LifecycleState, LifecycleError> {
-        let state: LifecycleState = serde_json::from_slice(&std::fs::read(&self.path)?)?;
+        let state: LifecycleState = serde_json::from_slice(&read_private_bytes(&self.path)?)?;
         if state.version != LIFECYCLE_VERSION {
             return Err(LifecycleError::Invalid("unsupported state version".into()));
         }
@@ -346,7 +351,7 @@ fn write_new_or_validate(path: &Path, state: &LifecycleState) -> Result<(), Life
             Ok(())
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let existing: LifecycleState = serde_json::from_slice(&std::fs::read(path)?)?;
+            let existing: LifecycleState = serde_json::from_slice(&read_private_bytes(path)?)?;
             if existing.version == LIFECYCLE_VERSION
                 && existing.accepted_event_id == state.accepted_event_id
             {
@@ -361,10 +366,10 @@ fn write_new_or_validate(path: &Path, state: &LifecycleState) -> Result<(), Life
     }
 }
 
-fn sync_directory(path: &Path) -> Result<(), std::io::Error> {
+fn sync_directory(_path: &Path) -> Result<(), std::io::Error> {
     #[cfg(unix)]
     {
-        File::open(path)?.sync_all()?;
+        File::open(_path)?.sync_all()?;
     }
     // std does not expose a portable Windows directory fsync. File contents
     // are flushed there; full directory-entry crash durability is guaranteed
@@ -381,6 +386,9 @@ fn replace_private(path: &Path, state: &LifecycleState) -> Result<(), LifecycleE
         let mut file = private_new(&temporary)?;
         file.write_all(&serde_json::to_vec(state)?)?;
         file.sync_all()?;
+        #[cfg(windows)]
+        super::windows_private::replace_private_file(&temporary, path)?;
+        #[cfg(not(windows))]
         std::fs::rename(&temporary, path)?;
         sync_directory(parent)?;
         Ok::<_, LifecycleError>(())
@@ -391,15 +399,38 @@ fn replace_private(path: &Path, state: &LifecycleState) -> Result<(), LifecycleE
     result
 }
 
+#[cfg(unix)]
 fn private_new(path: &Path) -> Result<File, std::io::Error> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    options.open(path)
+    use std::os::unix::fs::OpenOptionsExt;
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(windows)]
+fn private_new(path: &Path) -> Result<File, std::io::Error> {
+    super::windows_private::create_private_new(path)
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn private_new(path: &Path) -> Result<File, std::io::Error> {
+    OpenOptions::new().write(true).create_new(true).open(path)
+}
+
+#[cfg(windows)]
+fn read_private_bytes(path: &Path) -> Result<Vec<u8>, std::io::Error> {
+    use std::io::Read as _;
+    let mut file = super::windows_private::open_private_read(path)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+#[cfg(not(windows))]
+fn read_private_bytes(path: &Path) -> Result<Vec<u8>, std::io::Error> {
+    std::fs::read(path)
 }
 
 #[cfg(test)]

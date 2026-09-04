@@ -1,7 +1,9 @@
 //! ACP-owned lifecycle fence for trusted, job-scoped Git operations.
 
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
+#[cfg(unix)]
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -926,6 +928,10 @@ struct LockIdentity {
     device: u64,
     #[cfg(unix)]
     inode: u64,
+    #[cfg(windows)]
+    volume: u32,
+    #[cfg(windows)]
+    index: u64,
 }
 
 fn initialize_lock_file(path: &Path) -> Result<LockIdentity, String> {
@@ -976,7 +982,25 @@ fn open_lock_file(
     Ok((file, identity))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn open_lock_file(
+    path: &Path,
+    create: bool,
+    expected_identity: Option<LockIdentity>,
+) -> Result<(File, LockIdentity), String> {
+    let (file, identity) = super::windows_private::open_private_lock(path, create)
+        .map_err(|_| "opening a private job privilege lock failed".to_owned())?;
+    let identity = LockIdentity {
+        volume: identity.volume,
+        index: identity.index,
+    };
+    if expected_identity.is_some_and(|expected| expected != identity) {
+        return Err("job privilege lock identity changed".into());
+    }
+    Ok((file, identity))
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn open_lock_file(
     _path: &Path,
     _create: bool,

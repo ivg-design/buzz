@@ -6073,6 +6073,8 @@ mod agent_draft_prompt_tests {
         assert!(prompt.contains("produces a duplicate card"));
         assert!(prompt.contains("requires a typed tool"));
         assert!(prompt.contains("does not prove that a Buzz repository exists"));
+        assert!(prompt.contains("ordinary Git or GitHub CLI/API route"));
+        assert!(prompt.contains("try another available authorized route"));
     }
 
     #[test]

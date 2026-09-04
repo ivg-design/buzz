@@ -42,9 +42,9 @@ const NEST_DIRS: &[&str] = &[
 /// canonical Nemo contract is shared with ACP project preloading so the local
 /// workspace file and the privileged prompt cannot drift independently.
 pub(crate) const AGENTS_MD: &str = concat!(
-    include_str!("nest_agents.md"),
-    "\n\n",
     include_str!("../../../../docs/NEMO_WORKSPACE_INSTRUCTIONS.md"),
+    "\n\n",
+    include_str!("nest_agents.md"),
     "\n\n<!-- BEGIN BUZZ MANAGED — regenerated automatically, do not edit below -->\n\
 ## Active Agents\n\n\
 *(No agents deployed yet. Add agents in the Buzz desktop app.)*\n\n\

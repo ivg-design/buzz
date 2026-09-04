@@ -42,8 +42,9 @@ fn nest_skill_contains_the_shared_nemo_contract_without_cli_workflows() {
 
 #[test]
 fn nest_agents_template_embeds_the_shared_nemo_contract() {
-    assert!(AGENTS_MD.starts_with("# Nemo workspace"));
+    assert!(AGENTS_MD.starts_with("<!-- nemo-golden-rules:start -->"));
     assert_eq!(AGENTS_MD.matches("## Golden rules").count(), 1);
+    assert!(AGENTS_MD.contains("## Local workspace file"));
     assert!(AGENTS_MD.contains("Protocol: `NEMO-A2A-1`"));
     assert!(AGENTS_MD.contains("full read/write access to its repository"));
     assert!(AGENTS_MD.contains("users do not maintain per-peer grants"));
@@ -508,7 +509,7 @@ fn refresh_agents_md_preserves_managed_section() {
     let content = fs::read_to_string(&agents_md).unwrap();
     // Static content should be refreshed (from template).
     assert!(
-        content.starts_with("# Nemo workspace"),
+        content.starts_with("<!-- nemo-golden-rules:start -->"),
         "template header must be present"
     );
     // Managed section should be preserved.

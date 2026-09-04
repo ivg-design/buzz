@@ -287,7 +287,7 @@ pub async fn restore_managed_agents_on_launch(
         .map(|k| k.public_key().to_hex());
 
     #[cfg(feature = "mesh-llm")]
-    let agents_to_start = {
+    let mut agents_to_start = {
         // Preflight against the same resolution spawn uses — `resolve_effective_config`
         // (definition → global fallback). A linked instance's own `provider`/`model`/
         // `relay_mesh` bytes never contribute. See `start_local_agent_with_preflight`

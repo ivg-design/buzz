@@ -762,6 +762,8 @@ fn prepare_nemo_worktree(checkout: &NemoCheckout, request: &JobRequest) -> Resul
         }
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let target_argument = git_worktree_path_argument(&target)
+                .ok_or_else(|| "the Nemo worktree path is not supported by Git".to_owned())?;
             let branch_ref = format!("refs/heads/{}", request.common.repository.branch);
             let existing = git_output(&source, &["rev-parse", "--verify", &branch_ref]);
             let added = match existing {
@@ -783,9 +785,7 @@ fn prepare_nemo_worktree(checkout: &NemoCheckout, request: &JobRequest) -> Resul
                             &format!("core.hooksPath={}", null_device()),
                             "worktree",
                             "add",
-                            target
-                                .to_str()
-                                .ok_or_else(|| "the Nemo worktree path is not UTF-8".to_owned())?,
+                            &target_argument,
                             &request.common.repository.branch,
                         ],
                     )
@@ -799,9 +799,7 @@ fn prepare_nemo_worktree(checkout: &NemoCheckout, request: &JobRequest) -> Resul
                         "add",
                         "-b",
                         &request.common.repository.branch,
-                        target
-                            .to_str()
-                            .ok_or_else(|| "the Nemo worktree path is not UTF-8".to_owned())?,
+                        &target_argument,
                         &request.common.repository.base_sha,
                     ],
                 ),
@@ -908,9 +906,12 @@ fn git_success_with_timeout(root: &Path, args: &[&str], timeout: Duration) -> bo
 fn git_run_with_timeout(root: &Path, args: &[&str], timeout: Duration) -> Option<Vec<u8>> {
     let git = system_git()?;
     let mut command = Command::new(&git);
+    command.arg("-C");
+    #[cfg(windows)]
+    command.arg(git_worktree_path_argument(root)?);
+    #[cfg(not(windows))]
+    command.arg(root);
     command
-        .arg("-C")
-        .arg(root)
         .args(args)
         .env_clear()
         .env("PATH", system_path(&git)?)
@@ -949,6 +950,37 @@ fn git_run_with_timeout(root: &Path, args: &[&str], timeout: Duration) -> Option
         return None;
     }
     Some(output.stdout)
+}
+
+#[cfg(windows)]
+fn git_worktree_path_argument(path: &Path) -> Option<String> {
+    const VERBATIM_PREFIX: &str = r"\\?\";
+    const VERBATIM_UNC_PREFIX: &str = r"\\?\UNC\";
+
+    let value = path.to_str()?;
+    if value
+        .get(..VERBATIM_UNC_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(VERBATIM_UNC_PREFIX))
+    {
+        return Some(format!(r"\\{}", value.get(VERBATIM_UNC_PREFIX.len()..)?));
+    }
+    if let Some(value) = value.strip_prefix(VERBATIM_PREFIX) {
+        let bytes = value.as_bytes();
+        if bytes.len() < 3
+            || !bytes[0].is_ascii_alphabetic()
+            || bytes[1] != b':'
+            || !matches!(bytes[2], b'\\' | b'/')
+        {
+            return None;
+        }
+        return Some(value.to_owned());
+    }
+    Some(value.to_owned())
+}
+
+#[cfg(not(windows))]
+fn git_worktree_path_argument(path: &Path) -> Option<String> {
+    path.to_str().map(str::to_owned)
 }
 
 #[cfg(windows)]
@@ -1616,6 +1648,20 @@ mod tests {
         let git = system_git().expect("supported Unix test host has system Git");
         assert!(git.is_absolute());
         assert!(!git.starts_with(std::env::current_dir().expect("cwd")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn git_paths_remove_only_supported_windows_verbatim_prefixes() {
+        assert_eq!(
+            git_worktree_path_argument(Path::new(r"\\?\C:\Users\Buzz\nemo")),
+            Some(r"C:\Users\Buzz\nemo".to_owned())
+        );
+        assert_eq!(
+            git_worktree_path_argument(Path::new(r"\\?\UNC\server\share\nemo")),
+            Some(r"\\server\share\nemo".to_owned())
+        );
+        assert!(git_worktree_path_argument(Path::new(r"\\?\Volume{abc}\nemo")).is_none());
     }
 
     #[test]

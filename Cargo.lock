@@ -830,8 +830,10 @@ name = "buzz-acp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "base64 0.22.1",
  "buzz-core",
+ "buzz-dev-mcp",
  "buzz-persona",
  "buzz-sdk",
  "chrono",
@@ -844,10 +846,12 @@ dependencies = [
  "nix 0.31.3",
  "nostr 0.44.7",
  "reqwest 0.13.4",
+ "rmcp",
  "rustls",
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite 0.29.0",
@@ -857,6 +861,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

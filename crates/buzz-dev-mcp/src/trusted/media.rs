@@ -1,14 +1,18 @@
 use base64::Engine;
 use nostr::{EventBuilder, JsonUtil, Kind, Tag};
+use tokio_util::sync::CancellationToken;
 
-use super::relay::bounded_response_with_limit;
 use super::TrustedRelay;
 
-pub async fn fetch(relay: &TrustedRelay, source: &str) -> Result<Option<Vec<u8>>, String> {
+pub async fn fetch(
+    relay: &TrustedRelay,
+    source: &str,
+    cancellation: &CancellationToken,
+) -> Result<Option<Vec<u8>>, String> {
     let Some(target) = scoped_media_target(&relay.base_url, source)? else {
         return Ok(None);
     };
-    relay.fresh_context().await?;
+    relay.fresh_context(cancellation).await?;
     let authorization = sign_media_get(&relay.keys, &relay.relay_host)?;
     let request = relay.with_auth(
         relay
@@ -16,11 +20,9 @@ pub async fn fetch(relay: &TrustedRelay, source: &str) -> Result<Option<Vec<u8>>
             .get(target)
             .header("Authorization", authorization),
     );
-    let bytes = bounded_response_with_limit(
-        request
-            .send()
-            .await
-            .map_err(|_| "private media fetch failed".to_owned())?,
+    let bytes = super::relay::send_bounded_cancellable(
+        request,
+        cancellation,
         "private media fetch",
         crate::view_image::MAX_SOURCE_BYTES,
     )

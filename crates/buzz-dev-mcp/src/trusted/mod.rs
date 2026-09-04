@@ -4,11 +4,14 @@ mod credentials;
 mod media;
 mod relay;
 mod scope;
+mod service;
 mod tools;
 
-pub use credentials::TrustedConfig;
+pub(crate) use credentials::scrub_harness_environment;
+pub use credentials::{HarnessTrustedIdentity, TrustedConfig, TrustedSessionScope};
 pub use relay::{PublishedEvent, TrustedRelay};
 pub use scope::{GrantMatch, GrantSet};
+pub use service::TrustedSessionMcp;
 pub use tools::{
     cancel, dispatch, handoff, inbox, send_chat, status, A2aCancelParams, A2aDispatchParams,
     A2aHandoffParams, A2aInboxParams, A2aStatusParams, ChatSendParams,
@@ -50,7 +53,8 @@ pub(crate) const HARNESS_ONLY_ENV: &[&str] = &[
 ];
 
 pub(crate) fn is_harness_only_env(name: &str) -> bool {
-    if HARNESS_ONLY_ENV.contains(&name)
+    let name = name.to_ascii_uppercase();
+    if HARNESS_ONLY_ENV.contains(&name.as_str())
         || name.starts_with("BUZZ_MCP_")
         || name.starts_with("BUZZ_ACP_JOB_")
         || name.starts_with("GIT_CONFIG_")
@@ -69,4 +73,36 @@ pub(crate) fn is_harness_only_env(name: &str) -> bool {
         ]
         .iter()
         .any(|marker| name.contains(marker))
+}
+
+/// Remove every known or namespaced harness-only value from a model-controlled
+/// async child process without mutating the harness process itself.
+pub(crate) fn scrub_async_command_environment(command: &mut tokio::process::Command) {
+    let names: Vec<std::ffi::OsString> = std::env::vars_os()
+        .filter_map(|(name, _)| {
+            name.to_str()
+                .is_some_and(is_harness_only_env)
+                .then_some(name)
+        })
+        .collect();
+    for name in names {
+        command.env_remove(name);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod child_environment_tests {
+    #[tokio::test]
+    async fn real_child_cannot_read_future_harness_secret() {
+        let name = format!("BUZZ_MCP_TEST_AUTH_{}", uuid::Uuid::new_v4());
+        let secret = format!("sentinel-{}", uuid::Uuid::new_v4());
+        std::env::set_var(&name, &secret);
+        let mut command = tokio::process::Command::new("/usr/bin/env");
+        super::scrub_async_command_environment(&mut command);
+        let output = command.output().await.expect("spawn environment reader");
+        std::env::remove_var(&name);
+        let child = String::from_utf8(output.stdout).expect("UTF-8 child environment");
+        assert!(!child.contains(&name));
+        assert!(!child.contains(&secret));
+    }
 }

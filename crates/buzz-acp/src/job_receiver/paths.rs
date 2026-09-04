@@ -11,8 +11,11 @@ pub fn request_paths_are_contained(repository_root: &Path, request: &JobRequest)
         let path = Path::new(value);
         if path.is_absolute()
             || value.contains('\\')
-            || path.components().any(|component| {
-                !matches!(component, Component::Normal(_)) || component.as_os_str() == ".git"
+            || path.components().any(|component| match component {
+                Component::Normal(name) => name
+                    .to_str()
+                    .is_some_and(|value| value.eq_ignore_ascii_case(".git")),
+                _ => true,
             })
         {
             return false;
@@ -87,6 +90,10 @@ mod tests {
         std::fs::create_dir_all(&outside).expect("outside");
         assert!(request_paths_are_contained(&root, &request("safe/new.rs")));
         assert!(!request_paths_are_contained(&root, &request(".git/config")));
+        assert!(!request_paths_are_contained(
+            &root,
+            &request("safe/.GiT/config")
+        ));
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink(&outside, root.join("escape")).expect("symlink");

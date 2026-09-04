@@ -6,8 +6,8 @@
 //! early-branch path:
 //!
 //! ```text
-//! Config::from_cli()
-//!   └─ SetupPayload::from_env()?
+//! SecureStartup::capture()
+//!   └─ SetupPayload::from_raw_env_value()?
 //!        ├─ Some(payload) → run_setup_listener(config, payload)  [this module]
 //!        └─ None          → normal pool path (unchanged)
 //! ```
@@ -209,23 +209,13 @@ pub(crate) struct SetupPayload {
 }
 
 impl SetupPayload {
-    /// Read and deserialize the setup payload from the env var, if present.
-    ///
-    /// Returns `Ok(None)` when the env var is absent (normal mode).
-    /// Returns `Err` if the var is present but malformed.
-    pub(crate) fn from_env() -> Result<Option<Self>> {
-        Self::from_raw_env_value(std::env::var(SETUP_PAYLOAD_ENV_VAR).ok())
-    }
-
     /// Parse an optional raw env-var value into a `SetupPayload`.
     ///
     /// `None` or empty string → `Ok(None)` (normal mode, no setup payload).
     /// Non-empty, valid JSON → `Ok(Some(payload))`.
     /// Non-empty, malformed JSON → `Err`.
     ///
-    /// This is the pure core of `from_env()` and is the preferred target for
-    /// unit tests — it requires no global env mutation and is safe to call
-    /// concurrently.
+    /// It requires no global env mutation and is safe to call concurrently.
     pub(crate) fn from_raw_env_value(raw: Option<String>) -> Result<Option<Self>> {
         let raw = match raw {
             Some(v) if !v.is_empty() => v,
@@ -309,7 +299,12 @@ impl SetupPayload {
 /// pool. Reconnects on relay close (mirroring normal mode) so the nudge
 /// listener survives transient disconnects; `nudged_event_ids` deduplication
 /// guards against replay on reconnect.
-pub(crate) async fn run_setup_listener(config: Config, payload: SetupPayload) -> Result<()> {
+pub(crate) async fn run_setup_listener(
+    config: Config,
+    payload: SetupPayload,
+    relay_auth_tag: Option<nostr::Tag>,
+    startup_owner: Option<String>,
+) -> Result<()> {
     tracing::info!(
         agent = %payload.agent_name,
         requirements = payload.requirements.len(),
@@ -317,12 +312,6 @@ pub(crate) async fn run_setup_listener(config: Config, payload: SetupPayload) ->
     );
 
     let pubkey_hex = config.keys.public_key().to_hex();
-
-    // Parse BUZZ_AUTH_TAG for relay membership / NIP-OA.
-    let relay_auth_tag: Option<nostr::Tag> = std::env::var("BUZZ_AUTH_TAG")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .and_then(|s| buzz_sdk::nip_oa::parse_auth_tag(&s).ok());
 
     let startup_watermark: u64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -349,8 +338,6 @@ pub(crate) async fn run_setup_listener(config: Config, payload: SetupPayload) ->
     let mut author_gate_ctx =
         crate::InboundAuthorGate::connect(&rest_client, &pubkey_hex, "setup startup").await;
 
-    // Resolve owner for author-gate (same priority as normal mode).
-    let startup_owner = crate::resolve_agent_owner(&config);
     let owner_cache = crate::OwnerCache::new(startup_owner);
 
     // Discover channels and subscribe (using a "mentions" rule so we get

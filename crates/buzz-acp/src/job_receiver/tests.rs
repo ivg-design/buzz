@@ -4,6 +4,56 @@ use buzz_core::job::{
     JobProject, JobRepository, JobSponsor, JOB_SCHEMA_VERSION,
 };
 use nostr::{EventBuilder, Kind};
+use std::sync::OnceLock;
+
+struct TestCheckout {
+    root: PathBuf,
+    head: String,
+}
+
+fn test_checkout() -> &'static TestCheckout {
+    static CHECKOUT: OnceLock<TestCheckout> = OnceLock::new();
+    CHECKOUT.get_or_init(|| {
+        let root = tempfile::Builder::new()
+            .prefix("buzz-acp-job-checkout-")
+            .tempdir()
+            .expect("temporary checkout")
+            .keep();
+        let run = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .output()
+                .expect("run git fixture command");
+            assert!(
+                output.status.success(),
+                "git fixture command failed: {args:?}"
+            );
+            String::from_utf8(output.stdout)
+                .expect("git output")
+                .trim()
+                .to_owned()
+        };
+        run(&["init"]);
+        run(&["config", "user.name", "Buzz Test"]);
+        run(&["config", "user.email", "buzz-test@example.invalid"]);
+        run(&["checkout", "-b", "codex/a2a"]);
+        std::fs::create_dir_all(root.join("src")).expect("fixture src");
+        std::fs::write(root.join("src/fixture.txt"), "fixture\n").expect("fixture file");
+        run(&["add", "src/fixture.txt"]);
+        run(&["commit", "-m", "test fixture"]);
+        run(&[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/mysteropodes/nemo.git",
+        ]);
+        let head = run(&["rev-parse", "HEAD"]);
+        TestCheckout { root, head }
+    })
+}
 
 pub(super) fn context(keys: &Keys) -> AuthenticatedContext {
     AuthenticatedContext {
@@ -29,6 +79,7 @@ pub(super) fn fixture(
     idempotency_key: &str,
     summary: &str,
 ) -> (JobRequest, Event) {
+    let checkout = test_checkout();
     let request = JobRequest {
         common: JobCommon {
             schema_version: JOB_SCHEMA_VERSION.into(),
@@ -44,7 +95,7 @@ pub(super) fn fixture(
                 github_issue: None,
                 github_pr: None,
                 github_run: None,
-                base_sha: "a".repeat(40),
+                base_sha: checkout.head.clone(),
                 branch: "codex/a2a".into(),
                 worktree_id: "a2a".into(),
                 paths: vec!["src".into()],
@@ -87,14 +138,17 @@ pub(super) fn project(request: &JobRequest) -> PromptProjectInfo {
 }
 
 pub(super) fn grants(request: &JobRequest) -> GrantSet {
+    let checkout = test_checkout();
     GrantSet::from_json(&format!(
-            r#"{{"version":1,"grants":[{{"project_address":"{}","home_channel":"{}","repository":"{}","requester_pubkeys":["{}"],"capabilities":["rust"],"path_prefixes":[],"branches":["{}"],"worktree_ids":["{}"]}}]}}"#,
+            r#"{{"version":1,"grants":[{{"project_address":"{}","home_channel":"{}","repository":"{}","requester_pubkeys":["{}"],"capabilities":["rust"],"path_prefixes":["src"],"base_sha":"{}","branch":"{}","worktree_id":"{}","checkout_root":{}}}]}}"#,
             request.common.project.address,
             request.common.project.home_channel,
             request.common.repository.canonical,
             request.common.sender_pubkey,
+            request.common.repository.base_sha,
             request.common.repository.branch,
             request.common.repository.worktree_id,
+            serde_json::to_string(&checkout.root).expect("checkout path json"),
         ))
         .expect("grant")
 }

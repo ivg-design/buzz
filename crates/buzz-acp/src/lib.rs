@@ -16,6 +16,8 @@ mod relay;
 mod reply_placement;
 mod scope;
 mod setup_mode;
+mod startup_pipe;
+mod trusted_mcp;
 mod usage;
 
 pub use usage::TurnUsage;
@@ -42,7 +44,7 @@ use config::{
 };
 use filter::SubscriptionRule;
 use futures_util::FutureExt;
-use nostr::{PublicKey, ToBech32};
+use nostr::PublicKey;
 use pool::{
     AgentPool, ControlSignal, IdleSwitchResult, OwnedAgent, PromptContext, PromptOutcome,
     PromptResult, PromptSource, SessionState, TimeoutKind,
@@ -137,34 +139,6 @@ fn emit_runtime_lifecycle(
     }
 }
 
-/// Resolve the agent's owner pubkey at startup.
-///
-/// Priority:
-/// 1. `BUZZ_AUTH_TAG` env var — NIP-OA attestation signed by the owner.
-///    Verified against the agent's own pubkey to extract the owner pubkey.
-/// 2. `--agent-owner` CLI flag / `BUZZ_ACP_AGENT_OWNER` env var.
-fn resolve_agent_owner(config: &Config) -> Option<String> {
-    // Try BUZZ_AUTH_TAG first (NIP-OA attestation).
-    if let Ok(auth_tag) = std::env::var("BUZZ_AUTH_TAG") {
-        if !auth_tag.is_empty() {
-            let agent_pk = config.keys.public_key();
-            match buzz_sdk::nip_oa::verify_auth_tag(&auth_tag, &agent_pk) {
-                Ok(owner_pk) => {
-                    let owner_hex = owner_pk.to_hex().to_ascii_lowercase();
-                    tracing::info!("owner resolved from BUZZ_AUTH_TAG: {owner_hex}");
-                    return Some(owner_hex);
-                }
-                Err(e) => {
-                    tracing::warn!("BUZZ_AUTH_TAG verification failed: {e} — falling back");
-                }
-            }
-        }
-    }
-
-    // Fall back to --agent-owner config.
-    config.agent_owner.clone()
-}
-
 /// Cache for the agent's owner pubkey.
 ///
 /// Owner is now provided via `--agent-owner` config flag (no REST lookup).
@@ -252,13 +226,16 @@ async fn admit_job_to_queue(
     };
     let scope = dispatch.scope.clone();
     let event_id = dispatch.event.id.to_hex();
-    if !queue.push_job(QueuedEvent {
-        channel_id,
-        scope: scope.clone(),
-        event: dispatch.event,
-        received_at: std::time::Instant::now(),
-        prompt_tag: "agent-job".into(),
-    }) {
+    if !queue.push_job_at(
+        QueuedEvent {
+            channel_id,
+            scope: scope.clone(),
+            event: dispatch.event,
+            received_at: std::time::Instant::now(),
+            prompt_tag: "agent-job".into(),
+        },
+        dispatch.checkout_root,
+    ) {
         return Ok(None);
     }
     match receiver.mark_prompt_started(&dispatch.claim).await {
@@ -284,10 +261,12 @@ async fn admit_job_to_queue(
         }
         Ok(false) => {
             queue.remove_event(&scope, &event_id);
+            queue.clear_job_working_directory(&scope);
             Ok(None)
         }
         Err(error) => {
             queue.remove_event(&scope, &event_id);
+            queue.clear_job_working_directory(&scope);
             Err(error)
         }
     }
@@ -2515,12 +2494,171 @@ mod replay_floor_tests {
 }
 
 pub fn run() -> Result<()> {
-    config::propagate_legacy_env_vars();
-    tokio_main()
+    reject_private_key_argv()?;
+    if std::env::args_os().skip(1).any(|argument| {
+        matches!(
+            argument.to_str(),
+            Some("--help" | "-h" | "--version" | "-V")
+        )
+    }) {
+        let _ = Config::from_cli();
+        return Ok(());
+    }
+    let helper_subcommand = ["models", "auth-methods", "authenticate"]
+        .iter()
+        .any(|name| is_subcommand(name));
+    let startup = if helper_subcommand {
+        // These commands still spawn an ACP adapter. They do not need the
+        // signer, so remove every harness-only input before Tokio or the child
+        // exists and apply the same Linux parent-process visibility guard.
+        scrub_sensitive_parent_environment()?;
+        None
+    } else {
+        Some(SecureStartup::capture()?)
+    };
+    tokio_main(startup)
+}
+
+/// Sensitive startup inputs captured before the async runtime, tracing, or
+/// model-controlled child processes exist. This type deliberately has no
+/// `Debug` or serialization implementation.
+struct SecureStartup {
+    config: Config,
+    relay_auth_tag: Option<nostr::Tag>,
+    startup_owner: Option<String>,
+    grants_json: Option<String>,
+    grants_file: Option<std::path::PathBuf>,
+    ledger_dir: Option<std::path::PathBuf>,
+    owner_github_login: Option<String>,
+    allow_insecure_loopback: bool,
+    setup_payload: Option<String>,
+}
+
+impl SecureStartup {
+    fn capture() -> Result<Self> {
+        let mut piped = startup_pipe::StartupInputs::read()?;
+        #[cfg(target_os = "macos")]
+        if piped.is_none() {
+            anyhow::bail!(
+                "secure startup input is required on macOS; launch through Buzz desktop or pipe buzz.acp-startup.v1 JSON with BUZZ_ACP_STARTUP_STDIN=1"
+            );
+        }
+        let config = match piped.as_mut() {
+            Some(inputs) => Config::from_cli_with_private_key(inputs.take_private_key()),
+            None => {
+                config::propagate_legacy_env_vars();
+                Config::from_cli()
+            }
+        }
+        .map_err(|e| anyhow::anyhow!("configuration error: {e}"))?;
+        let mut auth_tag_raw = match piped.as_mut() {
+            Some(inputs) => inputs.take_auth_tag(),
+            None => std::env::var("BUZZ_AUTH_TAG").ok(),
+        }
+        .filter(|value| !value.trim().is_empty());
+        let relay_auth_tag = auth_tag_raw
+            .as_deref()
+            .map(buzz_sdk::nip_oa::parse_auth_tag)
+            .transpose()
+            .map_err(|error| anyhow::anyhow!("BUZZ_AUTH_TAG is invalid: {error}"))?;
+        let startup_owner = match auth_tag_raw.as_deref() {
+            Some(raw) => Some(
+                buzz_sdk::nip_oa::verify_auth_tag(raw, &config.keys.public_key())
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "BUZZ_AUTH_TAG does not authorize the configured signer: {error}"
+                        )
+                    })?
+                    .to_hex()
+                    .to_ascii_lowercase(),
+            ),
+            None => config.agent_owner.clone(),
+        };
+        if let Some(raw) = auth_tag_raw.as_mut() {
+            use zeroize::Zeroize as _;
+            raw.zeroize();
+        }
+        let grants_json = match piped.as_mut() {
+            Some(inputs) => inputs.take_job_grants_json(),
+            None => std::env::var("BUZZ_ACP_JOB_GRANTS_JSON").ok(),
+        }
+        .filter(|value| !value.trim().is_empty());
+        let grants_file = piped
+            .as_ref()
+            .and_then(startup_pipe::StartupInputs::job_grants_file)
+            .or_else(|| std::env::var_os("BUZZ_ACP_JOB_GRANTS_FILE").map(std::path::PathBuf::from))
+            .filter(|path| !path.as_os_str().is_empty());
+        let ledger_dir = piped
+            .as_ref()
+            .and_then(startup_pipe::StartupInputs::job_ledger_dir)
+            .or_else(|| std::env::var_os("BUZZ_ACP_JOB_LEDGER_DIR").map(std::path::PathBuf::from))
+            .filter(|path| !path.as_os_str().is_empty());
+        let owner_github_login = match piped.as_mut() {
+            Some(inputs) => inputs.take_owner_github_login(),
+            None => std::env::var("BUZZ_ACP_OWNER_GITHUB_LOGIN").ok(),
+        }
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+        let allow_insecure_loopback = piped.as_ref().map_or_else(
+            || {
+                std::env::var("BUZZ_ACP_ALLOW_INSECURE_LOOPBACK_JOBS")
+                    .ok()
+                    .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes"))
+            },
+            startup_pipe::StartupInputs::allow_insecure_loopback_jobs,
+        );
+        let setup_payload = match piped.as_mut() {
+            Some(inputs) => inputs.take_setup_payload(),
+            None => std::env::var(setup_mode::SETUP_PAYLOAD_ENV_VAR).ok(),
+        };
+        scrub_sensitive_parent_environment()?;
+        Ok(Self {
+            config,
+            relay_auth_tag,
+            startup_owner,
+            grants_json,
+            grants_file,
+            ledger_dir,
+            owner_github_login,
+            allow_insecure_loopback,
+            setup_payload,
+        })
+    }
+}
+
+fn reject_private_key_argv() -> Result<()> {
+    if std::env::args_os().skip(1).any(|argument| {
+        argument == "--private-key"
+            || argument
+                .to_str()
+                .is_some_and(|value| value.starts_with("--private-key="))
+    }) {
+        anyhow::bail!(
+            "--private-key is disabled because process arguments are visible; use Buzz Desktop secure startup"
+        );
+    }
+    Ok(())
+}
+
+fn scrub_sensitive_parent_environment() -> Result<()> {
+    let names: Vec<std::ffi::OsString> = std::env::vars_os()
+        .filter_map(|(name, _)| {
+            name.to_str()
+                .is_some_and(acp::is_harness_only_env)
+                .then_some(name)
+        })
+        .collect();
+    for name in names {
+        std::env::remove_var(name);
+    }
+    #[cfg(target_os = "linux")]
+    nix::sys::prctl::set_dumpable(false)
+        .map_err(|error| anyhow::anyhow!("failed to protect harness process state: {error}"))?;
+    Ok(())
 }
 
 #[tokio::main]
-async fn tokio_main() -> Result<()> {
+async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
     // Install the ring crypto provider for rustls (required for wss:// connections).
     rustls::crypto::ring::default_provider()
         .install_default()
@@ -2564,18 +2702,29 @@ async fn tokio_main() -> Result<()> {
         .compact()
         .init();
 
-    let mut config = Config::from_cli().map_err(|e| anyhow::anyhow!("configuration error: {e}"))?;
+    let SecureStartup {
+        mut config,
+        relay_auth_tag,
+        startup_owner,
+        grants_json,
+        grants_file,
+        ledger_dir,
+        owner_github_login,
+        allow_insecure_loopback,
+        setup_payload,
+    } = startup.ok_or_else(|| anyhow::anyhow!("missing secure startup state"))?;
 
     // ── Setup-mode early branch ───────────────────────────────────────────────
     //
     // When the desktop determines an agent is not ready (missing credentials,
     // model, or provider), it spawns buzz-acp with BUZZ_ACP_SETUP_PAYLOAD set.
     // We enter the minimal setup-listener path and never start the agent pool.
-    if let Some(payload) = setup_mode::SetupPayload::from_env()
+    if let Some(payload) = setup_mode::SetupPayload::from_raw_env_value(setup_payload)
         .map_err(|e| anyhow::anyhow!("setup payload error: {e}"))?
     {
         tracing::info!("buzz-acp: setup payload present, entering setup-listener mode");
-        return setup_mode::run_setup_listener(config, payload).await;
+        return setup_mode::run_setup_listener(config, payload, relay_auth_tag, startup_owner)
+            .await;
     }
 
     tracing::info!("buzz-acp starting: {}", config.summary());
@@ -2632,16 +2781,14 @@ async fn tokio_main() -> Result<()> {
 
     let pubkey_hex = config.keys.public_key().to_hex();
 
-    // Parse BUZZ_AUTH_TAG into a nostr::Tag for NIP-OA relay membership delegation.
-    let relay_auth_tag: Option<nostr::Tag> = std::env::var("BUZZ_AUTH_TAG")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .and_then(|s| buzz_sdk::nip_oa::parse_auth_tag(&s).ok());
-
-    let mut relay =
-        HarnessRelay::connect(&config.relay_url, &config.keys, &pubkey_hex, relay_auth_tag)
-            .await
-            .map_err(|e| anyhow::anyhow!("relay connect error: {e}"))?;
+    let mut relay = HarnessRelay::connect(
+        &config.relay_url,
+        &config.keys,
+        &pubkey_hex,
+        relay_auth_tag.clone(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("relay connect error: {e}"))?;
 
     // Tell the relay background task the watermark so it can use
     // `since = watermark - 5s` on the first REQ instead of `since=now`.
@@ -2666,8 +2813,8 @@ async fn tokio_main() -> Result<()> {
     let presence_publisher = relay.event_publisher();
     let presence_keys = config.keys.clone();
 
-    // Priority: BUZZ_AUTH_TAG (NIP-OA attestation) → --agent-owner flag.
-    let startup_owner: Option<String> = resolve_agent_owner(&config);
+    // Owner was resolved from the typed NIP-OA tag before the parent
+    // environment was scrubbed, with `--agent-owner` as direct-key fallback.
     if let Some(ref owner) = startup_owner {
         tracing::info!("agent owner: {owner}");
     } else {
@@ -2835,8 +2982,38 @@ async fn tokio_main() -> Result<()> {
 
     let base_prompt_content = config.base_prompt_content.take();
     let cwd = current_working_directory()?;
+    let receiver_grants_json = grants_json.clone();
+    let receiver_grants_file = grants_file.clone();
+    let receiver_owner_github_login = owner_github_login.clone();
+    let receiver_sources = job_receiver::ReceiverSources {
+        grants_json: receiver_grants_json,
+        grants_file: receiver_grants_file,
+        ledger_root: ledger_dir,
+        allow_insecure_loopback,
+    };
+    let trusted_mcp_factory = {
+        let identity = buzz_dev_mcp::HarnessTrustedIdentity::new(
+            std::path::Path::new(&cwd),
+            config.relay_url.clone(),
+            config.keys.clone(),
+            relay_auth_tag,
+            owner_github_login,
+            grants_json,
+            grants_file,
+            allow_insecure_loopback,
+        )
+        .map_err(|error| anyhow::anyhow!("trusted MCP configuration error: {error}"))?;
+        let lifetime = Duration::from_secs(config.max_turn_duration_secs)
+            .saturating_mul(2)
+            .saturating_add(Duration::from_secs(300));
+        Some(
+            trusted_mcp::TrustedMcpFactory::new(identity, lifetime)
+                .map_err(|error| anyhow::anyhow!("trusted MCP configuration error: {error}"))?,
+        )
+    };
     let ctx = Arc::new(PromptContext {
         mcp_servers: build_mcp_servers(&config),
+        trusted_mcp_factory,
         initial_message: config.initial_message.clone(),
         idle_timeout: Duration::from_secs(config.idle_timeout_secs),
         max_turn_duration: Duration::from_secs(config.max_turn_duration_secs),
@@ -2875,40 +3052,40 @@ async fn tokio_main() -> Result<()> {
         harness_name: crate::config::normalize_agent_command_identity(&config.agent_command),
         relay_url: config.relay_url.clone(),
     });
-    let mut job_receiver =
-        if job_receiver::JobReceiver::has_configured_grants(std::path::Path::new(&ctx.cwd))
-            .map_err(|error| anyhow::anyhow!("agent job receiver configuration error: {error}"))?
-        {
-            let authenticated_context = ctx
-                .rest_client
-                .authenticated_context()
-                .await
-                .map_err(|error| anyhow::anyhow!("agent job tenant context error: {error}"))?;
-            let sponsor_pubkey = startup_owner.clone().ok_or_else(|| {
-                anyhow::anyhow!("agent jobs require a current configured agent owner")
-            })?;
-            let sponsor = buzz_core::job::JobSponsor {
-                pubkey: sponsor_pubkey,
-                github_login: std::env::var("BUZZ_ACP_OWNER_GITHUB_LOGIN")
-                    .ok()
-                    .filter(|value| !value.trim().is_empty())
-                    .unwrap_or_else(|| "buzz-owner".into()),
-            };
-            Some(
-                job_receiver::JobReceiver::from_env(
-                    authenticated_context,
-                    config.keys.clone(),
-                    ctx.rest_client.clone(),
-                    sponsor,
-                    std::path::Path::new(&ctx.cwd),
-                )
-                .map_err(|error| {
-                    anyhow::anyhow!("agent job receiver configuration error: {error}")
-                })?,
-            )
-        } else {
-            None
+    let mut job_receiver = if job_receiver::JobReceiver::has_configured_grants(
+        std::path::Path::new(&ctx.cwd),
+        &receiver_sources,
+    )
+    .map_err(|error| anyhow::anyhow!("agent job receiver configuration error: {error}"))?
+    {
+        let authenticated_context = ctx
+            .rest_client
+            .authenticated_context()
+            .await
+            .map_err(|error| anyhow::anyhow!("agent job tenant context error: {error}"))?;
+        let sponsor_pubkey = startup_owner.clone().ok_or_else(|| {
+            anyhow::anyhow!("agent jobs require a current configured agent owner")
+        })?;
+        let sponsor = buzz_core::job::JobSponsor {
+            pubkey: sponsor_pubkey,
+            github_login: receiver_owner_github_login
+                .clone()
+                .unwrap_or_else(|| "buzz-owner".into()),
         };
+        Some(
+            job_receiver::JobReceiver::from_sources(
+                authenticated_context,
+                config.keys.clone(),
+                ctx.rest_client.clone(),
+                sponsor,
+                std::path::Path::new(&ctx.cwd),
+                receiver_sources.clone(),
+            )
+            .map_err(|error| anyhow::anyhow!("agent job receiver configuration error: {error}"))?,
+        )
+    } else {
+        None
+    };
     if job_receiver
         .as_ref()
         .is_some_and(|receiver| receiver.enabled())
@@ -3267,8 +3444,7 @@ async fn tokio_main() -> Result<()> {
         // JoinSet is never joined by the normal flow — Tokio retains finished
         // tasks until `join_next`, so without this the set grows on every
         // refill/crash recovery and `!respawn_tasks.is_empty()` would stay true
-        // forever. Non-blocking (`now_or_never`), same pattern as
-        // `drain_ready_join_results` for `pool.join_set`. The authoritative
+        // forever. The authoritative
         // in-flight signal is `any_respawn_in_flight(&crash_history)` (each
         // slot's `respawn_in_flight` is cleared when its payload is received),
         // not JoinSet occupancy.
@@ -3301,9 +3477,13 @@ async fn tokio_main() -> Result<()> {
                 // Guard: join_next() returns None immediately when JoinSet is
                 // empty, which would cause a tight spin. Only poll when there
                 // are in-flight tasks.
-                Some(Err(e)) = join_set.join_next(), if !join_set.is_empty() => {
-                    Some(PoolEvent::Panic(e))
-                }
+                joined = join_set.join_next(), if !join_set.is_empty() => match joined {
+                    Some(Err(error)) => Some(PoolEvent::Panic(error)),
+                    // Successful task completion is reported through result_rx.
+                    // Reaping it here prevents JoinSet growth; every panic still
+                    // reaches the sole async panic branch with lifecycle maps.
+                    Some(Ok(())) | None => None,
+                },
                 // Goose-native steer ack from a watcher task. Outcomes drive
                 // queue side-effects (drop / release withheld event) and
                 // optionally the cancel+merge fallback signal. See the
@@ -3610,6 +3790,7 @@ async fn tokio_main() -> Result<()> {
                                                 job_cancellations.insert(scope.clone());
                                             } else {
                                                 job_emitters.remove(&scope);
+                                                queue.clear_job_working_directory(&scope);
                                                 if let Err(error) = cancel
                                                     .emitter
                                                     .control(
@@ -4113,6 +4294,12 @@ async fn tokio_main() -> Result<()> {
                 if job_scope.is_some() {
                     result.batch = None;
                 }
+                // Job scopes are one-shot. Drop their provider session and
+                // bearer-backed loopback MCP before returning the worker to the
+                // pool, regardless of how the turn ended.
+                if let Some(scope) = &job_scope {
+                    result.agent.state.invalidate_scope(scope);
+                }
                 // Stop the typing indicator for the completed turn's exact scope,
                 // not the whole channel — a sibling thread still running in the
                 // same channel must keep its indicator.
@@ -4132,6 +4319,12 @@ async fn tokio_main() -> Result<()> {
                     observer.clone(),
                     Some(&ctx.rest_client),
                 );
+                if let Some(scope) = &job_scope {
+                    // Removes the affinity owner as well as any defensive copy
+                    // of the provider session on an idle worker.
+                    pool.invalidate_scope_session(scope);
+                    queue.clear_job_working_directory(scope);
+                }
                 if let Some((emitter, disposition)) = job_terminal {
                     let publish = match disposition {
                         Some(disposition) => emitter.terminal(disposition).await,
@@ -4150,21 +4343,6 @@ async fn tokio_main() -> Result<()> {
                     }
                 }
                 if loop_action == LoopAction::Exit {
-                    break;
-                }
-                if drain_ready_join_results(
-                    &mut pool,
-                    &mut queue,
-                    &config,
-                    &mut heartbeat_in_flight,
-                    &removed_channels,
-                    &mut typing_channels,
-                    &mut crash_history,
-                    &respawn_tx,
-                    &mut respawn_tasks,
-                    observer.clone(),
-                ) == LoopAction::Exit
-                {
                     break;
                 }
                 for (scope, thread_tags) in
@@ -4908,6 +5086,9 @@ fn dispatch_pending(
         let result_tx = pool.result_tx();
         let ctx_clone = Arc::clone(ctx);
         let agent_index = agent.index;
+        let job_working_directory = queue
+            .job_working_directory(&scope)
+            .map(|path| path.to_string_lossy().into_owned());
 
         // Mid-turn non-cancelling steer seam: install the per-turn steer
         // receiver on the read loop so the main loop's mode-gate fork
@@ -4936,7 +5117,7 @@ fn dispatch_pending(
                 ctx_clone,
                 result_tx,
                 Some(control_rx),
-                task_turn_id,
+                pool::PromptExecution::new(job_working_directory, task_turn_id),
             )
             .await;
         });
@@ -5449,6 +5630,13 @@ fn recover_panicked_agent(
     };
     let i = meta.agent_index;
 
+    if let Some(scope) = &meta.scope {
+        // The task-owned agent was dropped by the panic, which closes its
+        // trusted listener. Remove the pool's affinity entry as well so a
+        // one-shot Job scope cannot leak bookkeeping or block later work.
+        pool.invalidate_scope_session(scope);
+    }
+
     // Requeue BEFORE mark_complete (same rationale as handle_prompt_result).
     if let Some(batch) = meta.recoverable_batch {
         if let Some(ch) = meta.channel_id {
@@ -5478,6 +5666,9 @@ fn recover_panicked_agent(
                 // the same channel keeps its typing indicator.
                 typing_channels.remove(scope);
                 queue.mark_complete(scope.clone());
+                if scope.is_job() {
+                    queue.clear_job_working_directory(scope);
+                }
             }
             None => {
                 typing_channels.retain(|scope, _| scope.channel_id() != ch);
@@ -5542,43 +5733,6 @@ fn recover_panicked_agent(
     });
 }
 
-#[allow(clippy::too_many_arguments)]
-fn drain_ready_join_results(
-    pool: &mut AgentPool,
-    queue: &mut EventQueue,
-    config: &Config,
-    heartbeat_in_flight: &mut bool,
-    removed_channels: &HashSet<Uuid>,
-    typing_channels: &mut HashMap<scope::SessionScope, ThreadTags>,
-    crash_history: &mut [SlotCircuit],
-    respawn_tx: &mpsc::Sender<RespawnResult>,
-    respawn_tasks: &mut tokio::task::JoinSet<()>,
-    observer: Option<observer::ObserverHandle>,
-) -> LoopAction {
-    while let Some(Some(join_result)) = pool.join_set.join_next().now_or_never() {
-        if let Err(join_error) = join_result {
-            tracing::error!("agent task panicked: {join_error}");
-            recover_panicked_agent(
-                pool,
-                queue,
-                config,
-                join_error,
-                heartbeat_in_flight,
-                removed_channels,
-                typing_channels,
-                crash_history,
-                respawn_tx,
-                respawn_tasks,
-                observer.clone(),
-            );
-            if pool.live_count() == 0 && !any_respawn_in_flight(crash_history) {
-                return LoopAction::Exit;
-            }
-        }
-    }
-    LoopAction::Continue
-}
-
 fn dispatch_heartbeat(
     pool: &mut AgentPool,
     ctx: &Arc<PromptContext>,
@@ -5610,7 +5764,7 @@ fn dispatch_heartbeat(
             ctx_clone,
             result_tx,
             None,
-            task_turn_id,
+            pool::PromptExecution::new(None, task_turn_id),
         )
         .await;
     });
@@ -6240,74 +6394,25 @@ fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
     if config.mcp_command.is_empty() {
         return vec![];
     }
-    vec![McpServer {
-        name: std::path::Path::new(&config.mcp_command)
+    let mut env = Vec::new();
+    if let Ok(display_name) = std::env::var("BUZZ_ACP_DISPLAY_NAME") {
+        if !display_name.is_empty() {
+            env.push(EnvVar {
+                name: "BUZZ_ACP_DISPLAY_NAME".into(),
+                value: display_name,
+            });
+        }
+    }
+    vec![McpServer::stdio(
+        std::path::Path::new(&config.mcp_command)
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("mcp")
             .to_string(),
-        command: config.mcp_command.clone(),
-        args: vec![],
-        env: {
-            let mut env = vec![
-                EnvVar {
-                    name: "BUZZ_RELAY_URL".into(),
-                    value: config.relay_url.clone(),
-                },
-                EnvVar {
-                    name: "BUZZ_PRIVATE_KEY".into(),
-                    // bech32 encoding of a valid secret key is infallible.
-                    // Panic here is correct: injecting a bogus secret would cause
-                    // delayed, hard-to-diagnose agent failures downstream.
-                    value: config
-                        .keys
-                        .secret_key()
-                        .to_bech32()
-                        .expect("secret key bech32 encoding should never fail"),
-                },
-            ];
-            // Forward BUZZ_AUTH_TAG (NIP-OA owner attestation credential)
-            // so the MCP server can attach it to every signed event.
-            if let Ok(auth_tag) = std::env::var("BUZZ_AUTH_TAG") {
-                if !auth_tag.is_empty() {
-                    env.push(EnvVar {
-                        name: "BUZZ_AUTH_TAG".into(),
-                        value: auth_tag,
-                    });
-                }
-            }
-            let grants_json = std::env::var("BUZZ_ACP_JOB_GRANTS_JSON")
-                .ok()
-                .filter(|value| !value.trim().is_empty());
-            let grants_file = std::env::var("BUZZ_ACP_JOB_GRANTS_FILE")
-                .ok()
-                .filter(|value| !value.trim().is_empty());
-            if let Some(value) = grants_json {
-                env.push(EnvVar {
-                    name: "BUZZ_ACP_JOB_GRANTS_JSON".into(),
-                    value,
-                });
-            } else if let Some(value) = grants_file {
-                env.push(EnvVar {
-                    name: "BUZZ_ACP_JOB_GRANTS_FILE".into(),
-                    value,
-                });
-            }
-            // Forward the agent's display name so dev-mcp can use it as the git
-            // author name instead of the raw npub. Read from the process env
-            // rather than Config: this is a pass-through of a contract owned
-            // upstream, and absent simply means dev-mcp falls back to the npub.
-            if let Ok(display_name) = std::env::var("BUZZ_ACP_DISPLAY_NAME") {
-                if !display_name.is_empty() {
-                    env.push(EnvVar {
-                        name: "BUZZ_ACP_DISPLAY_NAME".into(),
-                        value: display_name,
-                    });
-                }
-            }
-            env
-        },
-    }]
+        config.mcp_command.clone(),
+        vec![],
+        env,
+    )]
 }
 
 #[cfg(test)]
@@ -9468,26 +9573,23 @@ mod build_mcp_servers_tests {
     }
 
     #[test]
-    fn session_new_mcp_server_has_required_fields() {
+    fn generic_mcp_server_is_stdio_and_credential_free() {
         let config = test_config();
         let servers = build_mcp_servers(&config);
         assert_eq!(servers.len(), 1);
         let server = &servers[0];
-        assert_eq!(server.name, "test-mcp-server");
-
-        let names: Vec<&str> = server.env.iter().map(|e| e.name.as_str()).collect();
-        assert!(
-            names.contains(&"BUZZ_RELAY_URL"),
-            "missing BUZZ_RELAY_URL; got {names:?}"
-        );
-        assert!(
-            names.contains(&"BUZZ_PRIVATE_KEY"),
-            "missing BUZZ_PRIVATE_KEY; got {names:?}"
-        );
+        assert_eq!(server.name(), "test-mcp-server");
+        assert!(server.stdio_env().iter().all(|entry| {
+            !entry.name.contains("PRIVATE_KEY")
+                && !entry.name.contains("AUTH")
+                && !entry.name.contains("TOKEN")
+                && !entry.name.starts_with("BUZZ_ACP_JOB_")
+                && !entry.name.starts_with("BUZZ_MCP_")
+        }));
     }
 
     #[test]
-    fn session_new_mcp_server_forwards_buzz_auth_tag() {
+    fn generic_mcp_server_never_forwards_buzz_auth_tag() {
         let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("BUZZ_AUTH_TAG", "test-attestation-tag");
         let config = test_config();
@@ -9495,12 +9597,10 @@ mod build_mcp_servers_tests {
         std::env::remove_var("BUZZ_AUTH_TAG");
 
         let server = &servers[0];
-        let auth_tag_env = server.env.iter().find(|e| e.name == "BUZZ_AUTH_TAG");
-        assert!(
-            auth_tag_env.is_some(),
-            "BUZZ_AUTH_TAG should be forwarded when set"
-        );
-        assert_eq!(auth_tag_env.unwrap().value, "test-attestation-tag");
+        assert!(!server
+            .stdio_env()
+            .iter()
+            .any(|entry| entry.name == "BUZZ_AUTH_TAG"));
     }
 
     #[test]
@@ -9512,7 +9612,7 @@ mod build_mcp_servers_tests {
         std::env::remove_var("BUZZ_AUTH_TAG");
 
         let server = &servers[0];
-        let has_auth_tag = server.env.iter().any(|e| e.name == "BUZZ_AUTH_TAG");
+        let has_auth_tag = server.stdio_env().iter().any(|e| e.name == "BUZZ_AUTH_TAG");
         assert!(!has_auth_tag, "empty BUZZ_AUTH_TAG should not be forwarded");
     }
 
@@ -9525,7 +9625,7 @@ mod build_mcp_servers_tests {
         std::env::remove_var("BUZZ_ACP_DISPLAY_NAME");
 
         let entry = servers[0]
-            .env
+            .stdio_env()
             .iter()
             .find(|e| e.name == "BUZZ_ACP_DISPLAY_NAME");
         assert_eq!(
@@ -9546,7 +9646,7 @@ mod build_mcp_servers_tests {
         // falls back to the npub when the key is missing or blank.
         assert!(
             !servers[0]
-                .env
+                .stdio_env()
                 .iter()
                 .any(|e| e.name == "BUZZ_ACP_DISPLAY_NAME"),
             "unset display name should not add the key"
@@ -9563,7 +9663,7 @@ mod build_mcp_servers_tests {
 
         assert!(
             !servers[0]
-                .env
+                .stdio_env()
                 .iter()
                 .any(|e| e.name == "BUZZ_ACP_DISPLAY_NAME"),
             "empty display name should not be forwarded"
@@ -9571,7 +9671,7 @@ mod build_mcp_servers_tests {
     }
 
     #[test]
-    fn inline_job_grants_are_forwarded_to_trusted_mcp_with_file_fallback() {
+    fn grant_sources_never_enter_generic_mcp_wire_config() {
         let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("BUZZ_ACP_JOB_GRANTS_JSON", r#"{"version":1,"grants":[]}"#);
         std::env::set_var("BUZZ_ACP_JOB_GRANTS_FILE", "/tmp/ignored-grants.json");
@@ -9580,30 +9680,10 @@ mod build_mcp_servers_tests {
         std::env::remove_var("BUZZ_ACP_JOB_GRANTS_JSON");
         std::env::remove_var("BUZZ_ACP_JOB_GRANTS_FILE");
 
-        let env = &servers[0].env;
-        assert_eq!(
-            env.iter()
-                .find(|entry| entry.name == "BUZZ_ACP_JOB_GRANTS_JSON")
-                .map(|entry| entry.value.as_str()),
-            Some(r#"{"version":1,"grants":[]}"#)
-        );
-        assert!(
-            !env.iter()
-                .any(|entry| entry.name == "BUZZ_ACP_JOB_GRANTS_FILE"),
-            "inline grants must be the single authoritative source"
-        );
-
-        std::env::set_var("BUZZ_ACP_JOB_GRANTS_FILE", "/tmp/grants.json");
-        let servers = build_mcp_servers(&config);
-        std::env::remove_var("BUZZ_ACP_JOB_GRANTS_FILE");
-        assert_eq!(
-            servers[0]
-                .env
-                .iter()
-                .find(|entry| entry.name == "BUZZ_ACP_JOB_GRANTS_FILE")
-                .map(|entry| entry.value.as_str()),
-            Some("/tmp/grants.json")
-        );
+        assert!(!servers[0]
+            .stdio_env()
+            .iter()
+            .any(|entry| entry.name.starts_with("BUZZ_ACP_JOB_")));
     }
 
     #[test]
@@ -9623,7 +9703,7 @@ mod build_mcp_servers_tests {
         config.mcp_command = "/opt/bin/my-mcp-server".into();
         let servers = build_mcp_servers(&config);
         assert_eq!(servers.len(), 1);
-        assert_eq!(servers[0].name, "my-mcp-server");
+        assert_eq!(servers[0].name(), "my-mcp-server");
     }
 
     #[test]
@@ -9645,7 +9725,8 @@ mod build_mcp_servers_tests {
         let servers = build_mcp_servers(&config);
         assert_eq!(servers.len(), 1);
         assert_eq!(
-            servers[0].name, "mcp",
+            servers[0].name(),
+            "mcp",
             "Path::new(\".\").file_stem() is None — should fall back to \"mcp\""
         );
     }

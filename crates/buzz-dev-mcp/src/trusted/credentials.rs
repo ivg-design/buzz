@@ -25,6 +25,95 @@ pub struct TrustedConfig {
     pub(super) allow_insecure_loopback: bool,
 }
 
+/// Harness-owned signing identity and local grants used to create one scoped
+/// trusted MCP service per ACP provider session.
+///
+/// This type intentionally has no `Debug` or serialization implementation. It
+/// keeps the signer in Rust state and never converts it to an environment
+/// variable, command-line argument, or ACP payload.
+#[derive(Clone)]
+pub struct HarnessTrustedIdentity {
+    relay_url: String,
+    keys: Keys,
+    auth_tag: Option<nostr::Tag>,
+    auth_tag_json: Option<String>,
+    owner_pubkey: String,
+    owner_github_login: Option<String>,
+    grants: GrantSet,
+    allow_insecure_loopback: bool,
+}
+
+/// Non-secret collaboration scope baked into one trusted MCP instance.
+#[derive(Clone, Default)]
+pub struct TrustedSessionScope {
+    pub channel_id: Option<String>,
+    pub thread_root_id: Option<String>,
+    pub job_operation_id: Option<String>,
+    pub job_request_event_id: Option<String>,
+}
+
+impl HarnessTrustedIdentity {
+    /// Validate a harness-owned identity and load its operator-controlled grant
+    /// document without exposing either through process environment state.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        cwd: &Path,
+        relay_url: String,
+        keys: Keys,
+        auth_tag: Option<nostr::Tag>,
+        owner_github_login: Option<String>,
+        grants_json: Option<String>,
+        grants_file: Option<PathBuf>,
+        allow_insecure_loopback: bool,
+    ) -> Result<Self, String> {
+        if relay_url.trim().is_empty() {
+            return Err("trusted MCP requires a relay URL".into());
+        }
+        let (auth_tag_json, owner_pubkey) = match auth_tag.as_ref() {
+            Some(tag) => {
+                let json = serde_json::to_string(tag)
+                    .map_err(|_| "BUZZ_AUTH_TAG could not be normalized".to_owned())?;
+                let owner = buzz_sdk::nip_oa::verify_auth_tag(&json, &keys.public_key())
+                    .map_err(|_| {
+                        "BUZZ_AUTH_TAG does not authorize the configured signer".to_owned()
+                    })?
+                    .to_hex();
+                (Some(json), owner)
+            }
+            None => (None, keys.public_key().to_hex()),
+        };
+        Ok(Self {
+            relay_url,
+            keys,
+            auth_tag,
+            auth_tag_json,
+            owner_pubkey,
+            owner_github_login,
+            grants: GrantSet::load(cwd, grants_json, grants_file)?,
+            allow_insecure_loopback,
+        })
+    }
+
+    /// Create a validated relay client whose publish authority is fixed to one
+    /// ACP session. Callers cannot widen the scope through tool parameters.
+    pub fn scoped_relay(&self, scope: TrustedSessionScope) -> Result<super::TrustedRelay, String> {
+        super::TrustedRelay::new(TrustedConfig {
+            relay_url: self.relay_url.clone(),
+            keys: self.keys.clone(),
+            auth_tag: self.auth_tag.clone(),
+            auth_tag_json: self.auth_tag_json.clone(),
+            owner_pubkey: self.owner_pubkey.clone(),
+            owner_github_login: self.owner_github_login.clone(),
+            grants: self.grants.clone(),
+            session_channel_id: scope.channel_id,
+            session_thread_root_id: scope.thread_root_id,
+            job_operation_id: scope.job_operation_id,
+            job_request_event_id: scope.job_request_event_id,
+            allow_insecure_loopback: self.allow_insecure_loopback,
+        })
+    }
+}
+
 impl TrustedConfig {
     /// Capture credentials exactly once and scrub all harness-only inputs before
     /// tracing, shim creation, or any child process can observe them.
@@ -125,7 +214,7 @@ fn nonempty_env(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn scrub_harness_environment() {
+pub(crate) fn scrub_harness_environment() {
     let names: Vec<std::ffi::OsString> = std::env::vars_os()
         .filter_map(|(name, _)| {
             name.to_str()

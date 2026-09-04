@@ -21,107 +21,23 @@ mod tree;
 mod trusted;
 mod view_image;
 
+pub use trusted::{HarnessTrustedIdentity, TrustedSessionMcp, TrustedSessionScope};
+
 #[derive(Clone)]
 struct DevMcp {
     state: Arc<shell::SharedState>,
     todos: Arc<todo::TodoState>,
-    trusted: Option<Arc<trusted::TrustedRelay>>,
     tool_router: ToolRouter<DevMcp>,
 }
 
 #[tool_router]
 impl DevMcp {
-    fn new(state: Arc<shell::SharedState>, trusted: Option<Arc<trusted::TrustedRelay>>) -> Self {
+    fn new(state: Arc<shell::SharedState>) -> Self {
         Self {
             state,
             todos: Arc::new(todo::TodoState::new()),
-            trusted,
             tool_router: Self::tool_router(),
         }
-    }
-
-    #[tool(
-        name = "buzz_a2a_dispatch",
-        description = "Dispatch one signed A2A job request inside the exact local project, peer, capability, path, branch, and worktree grant. Repository URL, current base SHA, project, channel, signer, sponsor, and tenant come from trusted local state; they cannot be supplied by the caller."
-    )]
-    async fn buzz_a2a_dispatch(
-        &self,
-        Parameters(params): Parameters<trusted::A2aDispatchParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        Ok(match &self.trusted {
-            Some(relay) => trusted::dispatch(relay, params).await,
-            None => trusted_unavailable(),
-        })
-    }
-
-    #[tool(
-        name = "buzz_a2a_inbox",
-        description = "Read validated A2A requests and controls addressed to this agent in locally granted project channels. Auth tags and signing credentials are never returned."
-    )]
-    async fn buzz_a2a_inbox(
-        &self,
-        Parameters(params): Parameters<trusted::A2aInboxParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        Ok(match &self.trusted {
-            Some(relay) => trusted::inbox(relay, params).await,
-            None => trusted_unavailable(),
-        })
-    }
-
-    #[tool(
-        name = "buzz_a2a_status",
-        description = "Read one validated A2A request and its receipts, progress, controls, and terminal result. The request must match local project and peer grants."
-    )]
-    async fn buzz_a2a_status(
-        &self,
-        Parameters(params): Parameters<trusted::A2aStatusParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        Ok(match &self.trusted {
-            Some(relay) => trusted::status(relay, params).await,
-            None => trusted_unavailable(),
-        })
-    }
-
-    #[tool(
-        name = "buzz_a2a_cancel",
-        description = "Ask the addressed worker to cancel an active A2A job. Available only to the original requester in the exact channel-bound session; it cannot publish a cancellation acknowledgement."
-    )]
-    async fn buzz_a2a_cancel(
-        &self,
-        Parameters(params): Parameters<trusted::A2aCancelParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        Ok(match &self.trusted {
-            Some(relay) => trusted::cancel(relay, params).await,
-            None => trusted_unavailable(),
-        })
-    }
-
-    #[tool(
-        name = "buzz_a2a_handoff",
-        description = "Publish the current recipient's signed handoff request for an active A2A job. This never creates or executes the superseding request; the requester must dispatch that separately at a higher coordinator epoch."
-    )]
-    async fn buzz_a2a_handoff(
-        &self,
-        Parameters(params): Parameters<trusted::A2aHandoffParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        Ok(match &self.trusted {
-            Some(relay) => trusted::handoff(relay, params).await,
-            None => trusted_unavailable(),
-        })
-    }
-
-    #[tool(
-        name = "buzz_chat_send",
-        description = "Send a normal Buzz chat message to this ACP session's fixed channel and, when present, fixed thread. The caller cannot choose a channel, thread, recipient, event kind, or signing identity."
-    )]
-    async fn buzz_chat_send(
-        &self,
-        Parameters(params): Parameters<trusted::ChatSendParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        Ok(match &self.trusted {
-            Some(relay) => trusted::send_chat(relay, params).await,
-            None => trusted_unavailable(),
-        })
     }
 
     #[tool(
@@ -153,25 +69,8 @@ impl DevMcp {
     )]
     async fn view_image(
         &self,
-        Parameters(mut p): Parameters<view_image::ViewImageParams>,
+        Parameters(p): Parameters<view_image::ViewImageParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Some(relay) = &self.trusted {
-            match relay.fetch_private_media(&p.source).await {
-                Ok(Some(bytes)) => {
-                    use base64::Engine as _;
-                    p.source = format!(
-                        "data:image/png;base64,{}",
-                        base64::engine::general_purpose::STANDARD.encode(bytes)
-                    );
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    return Ok(CallToolResult::error(vec![rmcp::model::Content::text(
-                        error,
-                    )]));
-                }
-            }
-        }
         view_image::run(&self.state, p).await
     }
 
@@ -268,12 +167,9 @@ async fn async_main(_cmd: String) -> Result<(), Box<dyn std::error::Error>> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let cwd = std::env::current_dir()?;
-    let trusted = trusted::TrustedConfig::capture(&cwd)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?
-        .map(trusted::TrustedRelay::new)
-        .transpose()
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?
-        .map(Arc::new);
+    // A standalone/generic MCP never captures signing material. Typed Buzz
+    // publishing is hosted in-process by buzz-acp on a loopback-only server.
+    trusted::scrub_harness_environment();
 
     // Credential capture and process-environment scrubbing precede tracing.
     tracing_subscriber::fmt()
@@ -284,15 +180,9 @@ async fn async_main(_cmd: String) -> Result<(), Box<dyn std::error::Error>> {
     let shim = shim::Shim::install()?;
     let state = Arc::new(shell::SharedState::new(cwd, shim)?);
 
-    let service = DevMcp::new(state, trusted).serve(stdio()).await?;
+    let service = DevMcp::new(state).serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
-}
-
-fn trusted_unavailable() -> CallToolResult {
-    CallToolResult::error(vec![rmcp::model::Content::text(
-        "trusted Buzz tools are unavailable because no signing identity was configured",
-    )])
 }
 
 /// Suppress the console window that Windows otherwise allocates for every
@@ -320,4 +210,40 @@ pub(crate) fn configure_no_window_async(cmd: &mut tokio::process::Command) {
     }
     #[cfg(not(windows))]
     let _ = cmd;
+}
+
+#[cfg(test)]
+mod tool_inventory_tests {
+    use std::collections::HashSet;
+
+    use super::*;
+
+    #[test]
+    fn generic_and_trusted_tool_names_do_not_collide() {
+        let generic: HashSet<String> = DevMcp::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.into_owned())
+            .collect();
+        let trusted: HashSet<String> = trusted::TrustedSessionMcp::tool_names()
+            .into_iter()
+            .collect();
+        assert!(generic.is_disjoint(&trusted));
+        assert_eq!(
+            trusted,
+            HashSet::from_iter(
+                [
+                    "buzz_a2a_dispatch",
+                    "buzz_a2a_inbox",
+                    "buzz_a2a_status",
+                    "buzz_a2a_cancel",
+                    "buzz_a2a_handoff",
+                    "buzz_chat_send",
+                    "buzz_private_media_get",
+                ]
+                .map(str::to_owned)
+            )
+        );
+        assert!(generic.contains("view_image"));
+    }
 }

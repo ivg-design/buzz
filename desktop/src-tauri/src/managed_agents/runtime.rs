@@ -28,7 +28,9 @@ pub(crate) use metadata::{
 };
 
 mod setup_payload;
-use setup_payload::apply_setup_payload_env;
+use setup_payload::build_setup_payload;
+
+mod startup_pipe;
 
 mod stop;
 pub(crate) use stop::managed_agent_runtime_keys;
@@ -564,14 +566,13 @@ pub fn spawn_agent_child(
     if let Some(home) = super::default_agent_workdir() {
         command.current_dir(home);
     }
-    command.stdin(std::process::Stdio::null());
+    command.stdin(std::process::Stdio::piped());
     command.stdout(std::process::Stdio::from(stdout));
     command.stderr(std::process::Stdio::from(stderr));
     if let Some(ref path) = augmented_path {
         command.env("PATH", path);
     }
     command.env("RUST_LOG", child_rust_log_filter());
-    command.env("BUZZ_PRIVATE_KEY", &record.private_key_nsec);
     command.env("BUZZ_RELAY_URL", &effective_relay_url);
     command.env("BUZZ_ACP_LAZY_POOL", if lazy { "true" } else { "false" });
     command.env("BUZZ_ACP_IDLE_POOL_SLEEP", idle_pool_sleep_env(lazy));
@@ -600,8 +601,8 @@ pub fn spawn_agent_child(
 
     // ── Readiness check: set setup-payload if agent is not ready ─────────────
     // `spawned_setup_mode` is stamped on `ManagedAgentProcess` below.
-    let spawned_setup_mode =
-        apply_setup_payload_env(&mut command, record, &descriptor, runtime_meta);
+    let setup_payload = build_setup_payload(record, &descriptor, runtime_meta);
+    let spawned_setup_mode = setup_payload.is_some();
     // Emit BUZZ_ACP_IDLE_TIMEOUT only when explicitly set; the harness
     // DEFAULT_IDLE_TIMEOUT_SECS is the single source of truth. The deprecated
     // BUZZ_ACP_TURN_TIMEOUT pinned agents to a stale default (320s).
@@ -704,11 +705,7 @@ pub fn spawn_agent_child(
     command.env_remove("BUZZ_ACP_API_TOKEN");
     command.env_remove("BUZZ_API_TOKEN");
 
-    if let Some(ref auth_tag) = record.auth_tag {
-        command.env("BUZZ_AUTH_TAG", auth_tag);
-    } else {
-        command.env_remove("BUZZ_AUTH_TAG");
-    }
+    command.env_remove("BUZZ_AUTH_TAG");
 
     // Inbound author gate: who is this agent allowed to respond to?
     // Validation is strict here — a malformed allowlist on disk fails before
@@ -724,31 +721,14 @@ pub fn spawn_agent_child(
 
     command.env("BUZZ_ACP_RELAY_OBSERVER", "true");
 
-    // Git credential helper: NIP-98 auth for Buzz relay git via git-credential-nostr.
-    // Ephemeral GIT_CONFIG_COUNT env vars scoped to relay HTTP URL; NOSTR_PRIVATE_KEY mirrors BUZZ_PRIVATE_KEY.
-    if let Some(cred_helper) = resolve_command("git-credential-nostr") {
-        let relay_http_url = crate::relay::relay_http_base_url(&effective_relay_url);
-
-        command.env("NOSTR_PRIVATE_KEY", &record.private_key_nsec);
-        command.env("GIT_TERMINAL_PROMPT", "0");
-        command.env("GIT_CONFIG_COUNT", "2");
-        command.env(
-            "GIT_CONFIG_KEY_0",
-            format!("credential.{relay_http_url}/git.helper"),
-        );
-        let helper = cred_helper.to_string_lossy().replace('\\', "/");
-        command.env("GIT_CONFIG_VALUE_0", helper);
-        command.env(
-            "GIT_CONFIG_KEY_1",
-            format!("credential.{relay_http_url}/git.useHttpPath"),
-        );
-        command.env("GIT_CONFIG_VALUE_1", "true");
-    } else {
-        eprintln!(
-            "buzz-desktop: git-credential-nostr not found — agent {} will not have automatic Buzz git auth",
-            record.name,
-        );
-    }
+    // Raw Nostr signing material never enters the harness environment. Relay
+    // git auth must use a separately scoped, non-exportable credential flow.
+    command.env_remove("NOSTR_PRIVATE_KEY");
+    command.env_remove("GIT_CONFIG_COUNT");
+    command.env_remove("GIT_CONFIG_KEY_0");
+    command.env_remove("GIT_CONFIG_VALUE_0");
+    command.env_remove("GIT_CONFIG_KEY_1");
+    command.env_remove("GIT_CONFIG_VALUE_1");
 
     // User env (descriptor.env): fully-layered floor→runtime→definition→global→persona→agent,
     // reserved-key filtered. Written last so user-explicit values win over Buzz-set env.
@@ -795,6 +775,13 @@ pub fn spawn_agent_child(
         .env("BUZZ_MANAGED_AGENT", current_instance_id(app))
         .env("BUZZ_MANAGED_AGENT_START_NONCE", &start_nonce);
 
+    let startup_payload = startup_pipe::StartupPayload::capture(
+        &record.private_key_nsec,
+        record.auth_tag.as_deref(),
+        setup_payload.as_deref(),
+    )?;
+    startup_pipe::StartupPayload::configure_command(&mut command);
+
     // Stamp spawn config from values above, BEFORE spawning — a post-spawn
     // re-resolve races config edits and would stamp the wrong values.
     let spawn_config = super::spawn_snapshot::SpawnConfigSnapshot::from_inputs(
@@ -827,13 +814,18 @@ pub fn spawn_agent_child(
         command.creation_flags(CREATE_NO_WINDOW);
     }
 
-    let child = spawn_with_effort_proof(&mut command, effort).map_err(|error| {
+    let mut child = spawn_with_effort_proof(&mut command, effort).map_err(|error| {
         format!(
             "failed to spawn `{}` for agent {}: {error}",
             resolved_acp_command.display(),
             record.name
         )
     })?;
+    if let Err(error) = startup_payload.deliver(&mut child) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
 
     // Codex: stamp adapter availability for the Phase-2 badge drift check.
     // Cold cache returns `None` → drift check skipped until discovery warms it.

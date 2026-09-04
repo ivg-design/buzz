@@ -20,6 +20,7 @@ path = "src/main.rs"
 buzz-core = { workspace = true }
 buzz-sdk = { workspace = true }
 buzz-persona = { path = "../buzz-persona" }
+buzz-dev-mcp = { path = "../buzz-dev-mcp" }
 
 # Nostr
 nostr = { workspace = true }
@@ -32,6 +33,8 @@ tokio-tungstenite = { workspace = true }
 
 # Codec (bounded line reads)
 tokio-util = { workspace = true }
+rmcp = { workspace = true, features = ["transport-streamable-http-server"] }
+axum = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 futures-util = { workspace = true }
 
@@ -54,6 +57,7 @@ sha2 = { workspace = true }
 base64 = "0.22"
 hex = { workspace = true }
 fs2 = "0.4"
+zeroize = { workspace = true }
 
 # Logging
 tracing = { workspace = true }
@@ -75,8 +79,9 @@ evalexpr = { workspace = true }
 # Process-group kill (safe wrapper around killpg) — Unix-only; kill_process_group
 # has a #[cfg(not(unix))] fallback in acp.rs.
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", default-features = false, features = ["signal"] }
+nix = { version = "0.31", default-features = false, features = ["signal", "process"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 httparse = "1"
+tempfile = "3"

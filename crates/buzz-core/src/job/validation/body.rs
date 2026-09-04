@@ -179,9 +179,11 @@ pub(crate) fn validate_repository(repo: &JobRepository) -> Result<(), JobValidat
         let candidate = Path::new(path);
         if candidate.is_absolute()
             || path.contains('\\')
-            || path
-                .split('/')
-                .any(|segment| segment.is_empty() || matches!(segment, "." | ".."))
+            || path.split('/').any(|segment| {
+                segment.is_empty()
+                    || matches!(segment, "." | "..")
+                    || segment.eq_ignore_ascii_case(".git")
+            })
             || candidate
                 .components()
                 .any(|part| !matches!(part, Component::Normal(_)))

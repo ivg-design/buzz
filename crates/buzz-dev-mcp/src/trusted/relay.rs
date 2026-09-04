@@ -2,6 +2,7 @@ use base64::Engine;
 use nostr::{Event, EventBuilder, JsonUtil, Kind, Tag};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use tokio_util::sync::CancellationToken;
 
 use buzz_core::job::{build_job_tags, JobEvent};
 use buzz_core::{CommunityContext, COMMUNITY_CONTEXT_SCHEMA_VERSION};
@@ -83,15 +84,16 @@ impl TrustedRelay {
         self.keys.public_key().to_hex()
     }
 
-    pub async fn fresh_context(&self) -> Result<CommunityContext, String> {
+    pub async fn fresh_context(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<CommunityContext, String> {
         let url = format!("{}/api/context", self.base_url);
         let auth = sign_nip98(&self.keys, "GET", &url, None)?;
         let request = self.with_auth(self.http.get(&url).header("Authorization", auth));
-        let response = request
-            .send()
-            .await
-            .map_err(|_| "relay context request failed".to_owned())?;
-        let bytes = bounded_response(response, "relay context").await?;
+        let bytes =
+            send_bounded_cancellable(request, cancellation, "relay context", MAX_HTTP_BODY_BYTES)
+                .await?;
         let context: CommunityContext = serde_json::from_slice(&bytes)
             .map_err(|_| "relay returned an invalid context document".to_owned())?;
         if context.schema_version != COMMUNITY_CONTEXT_SCHEMA_VERSION {
@@ -105,8 +107,12 @@ impl TrustedRelay {
         Ok(context)
     }
 
-    pub(super) async fn publish_job(&self, job: JobEvent) -> Result<PublishedEvent, String> {
-        self.fresh_context().await?;
+    pub(super) async fn publish_job(
+        &self,
+        job: JobEvent,
+        cancellation: &CancellationToken,
+    ) -> Result<PublishedEvent, String> {
+        self.fresh_context(cancellation).await?;
         let kind = job_kind(&job);
         if !model_owned_job(&job) {
             return Err(
@@ -117,11 +123,16 @@ impl TrustedRelay {
         let tags = build_job_tags(&job).map_err(|error| error.to_string())?;
         let event = self.sign(EventBuilder::new(Kind::Custom(kind as u16), content).tags(tags))?;
         JobEvent::parse(&event).map_err(|error| error.to_string())?;
-        self.submit(event, PublishClass::ModelJob).await
+        self.submit(event, PublishClass::ModelJob, cancellation)
+            .await
     }
 
-    pub async fn publish_chat(&self, content: &str) -> Result<PublishedEvent, String> {
-        self.fresh_context().await?;
+    pub async fn publish_chat(
+        &self,
+        content: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<PublishedEvent, String> {
+        self.fresh_context(cancellation).await?;
         let channel = self.session_channel_id.as_deref().ok_or_else(|| {
             "typed chat is unavailable outside a channel-bound session".to_owned()
         })?;
@@ -140,22 +151,27 @@ impl TrustedRelay {
             })
             .transpose()?;
         let event = self.build_chat_event(channel, content, thread.as_ref())?;
-        self.submit(event, PublishClass::Chat).await
+        self.submit(event, PublishClass::Chat, cancellation).await
     }
 
     /// Fetch relay-hosted private media with a narrow Blossom read token.
     /// Third-party URLs return `Ok(None)` and remain on the unauthenticated
     /// generic image path.
-    pub async fn fetch_private_media(&self, source: &str) -> Result<Option<Vec<u8>>, String> {
-        super::media::fetch(self, source).await
+    pub async fn fetch_private_media(
+        &self,
+        source: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<Vec<u8>>, String> {
+        super::media::fetch(self, source, cancellation).await
     }
 
     pub async fn query_job_events(
         &self,
         request_event_id: Option<&str>,
         inbox_limit: u16,
+        cancellation: &CancellationToken,
     ) -> Result<Vec<Event>, String> {
-        self.fresh_context().await?;
+        self.fresh_context(cancellation).await?;
         let signer = self.signer_pubkey();
         let channel = self.bound_a2a_channel()?;
         let filters = if let Some(request) = request_event_id {
@@ -179,18 +195,25 @@ impl TrustedRelay {
                 "limit": inbox_limit.clamp(1, 100),
             })]
         };
-        self.run_job_query(filters).await
+        self.run_job_query(filters, cancellation).await
     }
 
-    pub(super) async fn query_handoff_event(&self, event_id: &str) -> Result<Event, String> {
+    pub(super) async fn query_handoff_event(
+        &self,
+        event_id: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Event, String> {
         validate_hex64("handoff_event_id", event_id)?;
-        self.fresh_context().await?;
+        self.fresh_context(cancellation).await?;
         let mut events = self
-            .run_job_query(vec![serde_json::json!({
-                "ids": [event_id],
-                "kinds": [43005],
-                "limit": 2,
-            })])
+            .run_job_query(
+                vec![serde_json::json!({
+                    "ids": [event_id],
+                    "kinds": [43005],
+                    "limit": 2,
+                })],
+                cancellation,
+            )
             .await?;
         if events.len() != 1 || events[0].id.to_hex() != event_id {
             return Err("exact handoff event was not found in local scope".into());
@@ -198,7 +221,11 @@ impl TrustedRelay {
         Ok(events.remove(0))
     }
 
-    async fn run_job_query(&self, filters: Vec<serde_json::Value>) -> Result<Vec<Event>, String> {
+    async fn run_job_query(
+        &self,
+        filters: Vec<serde_json::Value>,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<Event>, String> {
         let signer = self.signer_pubkey();
         let channel = self.bound_a2a_channel()?;
         let url = format!("{}/query", self.base_url);
@@ -212,14 +239,9 @@ impl TrustedRelay {
                 .header("Content-Type", "application/json")
                 .body(body),
         );
-        let bytes = bounded_response(
-            request
-                .send()
-                .await
-                .map_err(|_| "relay query failed".to_owned())?,
-            "relay query",
-        )
-        .await?;
+        let bytes =
+            send_bounded_cancellable(request, cancellation, "relay query", MAX_HTTP_BODY_BYTES)
+                .await?;
         let events: Vec<Event> = serde_json::from_slice(&bytes)
             .map_err(|_| "relay returned an invalid event list".to_owned())?;
         let mut validated = Vec::with_capacity(events.len());
@@ -274,7 +296,12 @@ impl TrustedRelay {
         self.sign(builder)
     }
 
-    async fn submit(&self, event: Event, class: PublishClass) -> Result<PublishedEvent, String> {
+    async fn submit(
+        &self,
+        event: Event,
+        class: PublishClass,
+        cancellation: &CancellationToken,
+    ) -> Result<PublishedEvent, String> {
         let kind = u32::from(event.kind.as_u16());
         if !class.accepts(kind) {
             return Err("typed publisher rejected an out-of-surface event kind".into());
@@ -291,12 +318,11 @@ impl TrustedRelay {
                 .header("Content-Type", "application/json")
                 .body(body),
         );
-        let bytes = bounded_response(
-            request
-                .send()
-                .await
-                .map_err(|_| "event delivery outcome is unknown".to_owned())?,
+        let bytes = send_bounded_cancellable(
+            request,
+            cancellation,
             "event submission",
+            MAX_HTTP_BODY_BYTES,
         )
         .await?;
         let ack: RelayAck = serde_json::from_slice(&bytes)
@@ -316,6 +342,58 @@ impl TrustedRelay {
             None => request,
         }
     }
+}
+
+pub(super) async fn send_bounded_cancellable(
+    request: reqwest::RequestBuilder,
+    cancellation: &CancellationToken,
+    operation: &str,
+    limit: usize,
+) -> Result<Vec<u8>, String> {
+    if cancellation.is_cancelled() {
+        return Err(format!("{operation} cancelled before relay access"));
+    }
+    let mut response = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => return Err(format!("{operation} cancelled before confirmation")),
+        response = request.send() => response.map_err(|_| format!("{operation} outcome is unknown"))?,
+    };
+    if !response.status().is_success() {
+        return Err(format!(
+            "{operation} rejected with HTTP {}",
+            response.status().as_u16()
+        ));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(format!("{operation} response exceeded the size limit"));
+    }
+    let mut body = Vec::new();
+    loop {
+        let chunk = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                return Err(format!("{operation} cancelled before confirmation"));
+            }
+            chunk = response.chunk() => {
+                chunk.map_err(|_| format!("{operation} response failed"))?
+            }
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
+        let next_len = body
+            .len()
+            .checked_add(chunk.len())
+            .ok_or_else(|| format!("{operation} response exceeded the size limit"))?;
+        if next_len > limit {
+            return Err(format!("{operation} response exceeded the size limit"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 #[derive(Clone, Copy)]
@@ -392,37 +470,6 @@ fn sign_nip98(
         "Nostr {}",
         base64::engine::general_purpose::STANDARD.encode(event.as_json().as_bytes())
     ))
-}
-
-async fn bounded_response(response: reqwest::Response, operation: &str) -> Result<Vec<u8>, String> {
-    bounded_response_with_limit(response, operation, MAX_HTTP_BODY_BYTES).await
-}
-
-pub(super) async fn bounded_response_with_limit(
-    response: reqwest::Response,
-    operation: &str,
-    limit: usize,
-) -> Result<Vec<u8>, String> {
-    if !response.status().is_success() {
-        return Err(format!(
-            "{operation} rejected with HTTP {}",
-            response.status().as_u16()
-        ));
-    }
-    if response
-        .content_length()
-        .is_some_and(|length| length > limit as u64)
-    {
-        return Err(format!("{operation} response exceeded the size limit"));
-    }
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|_| format!("{operation} response failed"))?;
-    if bytes.len() > limit {
-        return Err(format!("{operation} response exceeded the size limit"));
-    }
-    Ok(bytes.to_vec())
 }
 
 fn normalize_relay_url(raw: &str, allow_loopback: bool) -> Result<(String, String), String> {

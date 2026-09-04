@@ -246,7 +246,12 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_RELAY_URL", default_value = "ws://localhost:3000")]
     pub relay_url: String,
 
-    #[arg(long, env = "BUZZ_PRIVATE_KEY", hide_env_values = true)]
+    #[arg(
+        long,
+        env = "BUZZ_PRIVATE_KEY",
+        default_value = "",
+        hide_env_values = true
+    )]
     pub private_key: String,
 
     /// Agent owner pubkey (64-char hex). Used for --respond-to=owner-only gate.
@@ -933,6 +938,14 @@ impl Config {
         // Call `propagate_legacy_env_vars()` before the tokio runtime starts
         // (in the sync `fn main()` wrapper) — see Rust 2024 edition safety.
         let args = CliArgs::parse();
+        Self::from_args(args)
+    }
+
+    /// Parse ordinary CLI/environment configuration while sourcing the signer
+    /// from the desktop's private one-shot stdin channel.
+    pub fn from_cli_with_private_key(private_key: String) -> Result<Self, ConfigError> {
+        let mut args = CliArgs::parse();
+        args.private_key = private_key;
         Self::from_args(args)
     }
 

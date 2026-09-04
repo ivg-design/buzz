@@ -55,6 +55,7 @@ pub struct JobDispatch {
     pub event: Event,
     pub emitter: JobEmitter,
     pub claim: StoredClaim,
+    pub checkout_root: PathBuf,
 }
 
 pub enum HandleOutcome {
@@ -63,6 +64,14 @@ pub enum HandleOutcome {
 }
 
 pub use cancel::CancelOutcome;
+
+#[derive(Clone, Default)]
+pub struct ReceiverSources {
+    pub grants_json: Option<String>,
+    pub grants_file: Option<PathBuf>,
+    pub ledger_root: Option<PathBuf>,
+    pub allow_insecure_loopback: bool,
+}
 
 /// Durable admission boundary for addressed agent-job requests.
 pub struct JobReceiver {
@@ -76,20 +85,29 @@ pub struct JobReceiver {
     grants: GrantSet,
     ledger: JobLedger,
     _lease: ReceiverLease,
-    repository_root: PathBuf,
+    allow_insecure_loopback: bool,
 }
 
 impl JobReceiver {
-    pub fn has_configured_grants(cwd: &Path) -> Result<bool, ReceiverError> {
-        Ok(!GrantSet::load(cwd)?.is_empty())
+    pub fn has_configured_grants(
+        cwd: &Path,
+        sources: &ReceiverSources,
+    ) -> Result<bool, ReceiverError> {
+        Ok(!GrantSet::load_from(
+            cwd,
+            sources.grants_json.clone(),
+            sources.grants_file.clone(),
+        )?
+        .is_empty())
     }
 
-    pub fn from_env(
+    pub fn from_sources(
         tenant: AuthenticatedContext,
         keys: Keys,
         rest: RestClient,
         sponsor: JobSponsor,
         cwd: &Path,
+        sources: ReceiverSources,
     ) -> Result<Self, ReceiverError> {
         let agent_pubkey = keys.public_key().to_hex();
         validate_tenant_identity(&tenant, &agent_pubkey)?;
@@ -103,12 +121,11 @@ impl JobReceiver {
                 "agent sponsor must contain a canonical owner key and login metadata".into(),
             ));
         }
-        let grants = GrantSet::load(cwd)?;
-        let ledger_root = std::env::var_os("BUZZ_ACP_JOB_LEDGER_DIR")
-            .map(PathBuf::from)
+        let grants = GrantSet::load_from(cwd, sources.grants_json, sources.grants_file)?;
+        let ledger_root = sources
+            .ledger_root
             .unwrap_or_else(|| default_ledger_root(cwd, &tenant.community_id, &agent_pubkey));
         let lease = ReceiverLease::acquire(&ledger_root)?;
-        let repository_root = cwd.canonicalize().map_err(LedgerError::Io)?;
         Ok(Self {
             tenant,
             tenant_generation: 0,
@@ -120,7 +137,7 @@ impl JobReceiver {
             grants,
             ledger: JobLedger::new(ledger_root),
             _lease: lease,
-            repository_root,
+            allow_insecure_loopback: sources.allow_insecure_loopback,
         })
     }
 
@@ -134,7 +151,6 @@ impl JobReceiver {
         ledger_root: PathBuf,
     ) -> Self {
         let lease = ReceiverLease::acquire(&ledger_root).expect("exclusive test receiver lease");
-        let repository_root = std::env::current_dir().expect("test repository root");
         Self {
             agent_pubkey: keys.public_key().to_hex(),
             tenant,
@@ -146,7 +162,7 @@ impl JobReceiver {
             grants,
             ledger: JobLedger::new(ledger_root),
             _lease: lease,
-            repository_root,
+            allow_insecure_loopback: true,
         }
     }
 
@@ -305,15 +321,21 @@ impl JobReceiver {
             Some(request) => request,
             None => return Ok(HandleOutcome::Consumed),
         };
-        let grant_capabilities = self.grants.capabilities_for(&request);
-        if !project_authorizes(project, &request)
-            || grant_capabilities.is_none()
-            || !paths::request_paths_are_contained(&self.repository_root, &request)
-        {
+        let grant_match = self.grants.authorize_request(&request);
+        if !project_authorizes(project, &request) || grant_match.is_none() {
             tracing::warn!(
                 channel_id = %channel_id,
                 request_event_id = %event.id,
                 "dropping agent job outside the authoritative local grant"
+            );
+            return Ok(HandleOutcome::Consumed);
+        }
+        let grant_match = grant_match.expect("checked above");
+        if !paths::request_paths_are_contained(&grant_match.checkout_root, &request) {
+            tracing::warn!(
+                channel_id = %channel_id,
+                request_event_id = %event.id,
+                "dropping agent job whose requested paths escape the verified checkout"
             );
             return Ok(HandleOutcome::Consumed);
         }
@@ -352,6 +374,7 @@ impl JobReceiver {
             &event.id.to_hex(),
             &candidate.digest,
             &self.sponsor,
+            self.allow_insecure_loopback,
         )
         .await?;
         let (stored, force_receipt_replay) = match self.ledger.claim(candidate).await? {
@@ -392,7 +415,7 @@ impl JobReceiver {
             self.keys.clone(),
             self.rest.clone(),
             lifecycle,
-            grant_capabilities.unwrap_or_default(),
+            grant_match.capabilities,
             stored.digest.clone(),
             self.sponsor.clone(),
         );
@@ -401,6 +424,7 @@ impl JobReceiver {
             event,
             emitter,
             claim: stored,
+            checkout_root: grant_match.checkout_root,
         })))
     }
 

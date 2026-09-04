@@ -17,8 +17,9 @@ pub async fn authorize(
     request_event_id: &str,
     semantic_digest: &str,
     recipient_sponsor: &JobSponsor,
+    allow_insecure_loopback: bool,
 ) -> Result<(), ReceiverError> {
-    require_secure_transport(&rest.base_url)?;
+    require_secure_transport(&rest.base_url, allow_insecure_loopback)?;
     let authorization = JobAuthorizationRequest {
         schema_version: JOB_AUTHORIZATION_SCHEMA_VERSION.into(),
         nonce: uuid::Uuid::new_v4().to_string(),
@@ -56,14 +57,16 @@ pub async fn authorize(
     Ok(())
 }
 
-fn require_secure_transport(base_url: &str) -> Result<(), ReceiverError> {
+fn require_secure_transport(
+    base_url: &str,
+    allow_insecure_loopback: bool,
+) -> Result<(), ReceiverError> {
     let relay_url = url::Url::parse(base_url)
         .map_err(|_| ReceiverError::Tenant("job authorization relay URL is invalid".into()))?;
     let explicit_loopback_dev = matches!(
         relay_url.host_str(),
         Some("127.0.0.1" | "::1" | "[::1]" | "localhost")
-    ) && (cfg!(test)
-        || std::env::var("BUZZ_ACP_ALLOW_INSECURE_LOOPBACK_JOBS").as_deref() == Ok("1"));
+    ) && allow_insecure_loopback;
     if relay_url.scheme() != "https" && !explicit_loopback_dev {
         return Err(ReceiverError::Tenant(
             "job authorization requires HTTPS (plain HTTP is limited to explicit loopback dev mode)"
@@ -79,10 +82,15 @@ mod tests {
 
     #[test]
     fn arbitrary_plain_http_is_rejected() {
-        assert!(require_secure_transport("http://relay.example").is_err());
-        assert!(require_secure_transport("https://relay.example").is_ok());
-        assert!(require_secure_transport("http://127.0.0.1:3000").is_ok());
-        assert!(require_secure_transport("http://localhost:3000").is_ok());
-        assert!(require_secure_transport("http://[::1]:3000").is_ok());
+        assert!(require_secure_transport("http://relay.example", true).is_err());
+        assert!(require_secure_transport("https://relay.example", false).is_ok());
+        for loopback in [
+            "http://127.0.0.1:3000",
+            "http://localhost:3000",
+            "http://[::1]:3000",
+        ] {
+            assert!(require_secure_transport(loopback, false).is_err());
+            assert!(require_secure_transport(loopback, true).is_ok());
+        }
     }
 }

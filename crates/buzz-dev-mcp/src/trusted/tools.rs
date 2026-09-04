@@ -8,6 +8,7 @@ use chrono::{Duration, SecondsFormat, Utc};
 use rmcp::model::{CallToolResult, Content};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 
 use super::{GrantMatch, PublishedEvent, TrustedRelay};
 
@@ -74,36 +75,65 @@ pub struct ChatSendParams {
     pub content: String,
 }
 
-pub async fn dispatch(relay: &Arc<TrustedRelay>, params: A2aDispatchParams) -> CallToolResult {
+pub async fn dispatch(
+    relay: &Arc<TrustedRelay>,
+    params: A2aDispatchParams,
+    cancellation: CancellationToken,
+) -> CallToolResult {
+    if relay.job_operation_id.is_some() || relay.job_request_event_id.is_some() {
+        return error_result("A2A dispatch is unavailable inside a one-shot job session".into());
+    }
     if !(1..=604_800).contains(&params.ttl_seconds) {
         return error_result("ttl_seconds must be between 1 and 604800".into());
     }
     let result = match params.supersedes_event_id.clone() {
-        Some(event_id) => build_superseding_request(relay, params, &event_id).await,
+        Some(event_id) => build_superseding_request(relay, params, &event_id, &cancellation).await,
         None => build_request(relay, params),
     };
     match result.and_then(|job| ensure_session_channel(relay, &job).map(|_| job)) {
-        Ok(job) => publish_result(relay.publish_job(job).await),
+        Ok(job) => publish_result(relay.publish_job(job, &cancellation).await),
         Err(error) => error_result(error),
     }
 }
 
-pub async fn inbox(relay: &Arc<TrustedRelay>, params: A2aInboxParams) -> CallToolResult {
-    query_result(relay.query_job_events(None, params.limit).await)
-}
-
-pub async fn status(relay: &Arc<TrustedRelay>, params: A2aStatusParams) -> CallToolResult {
+pub async fn inbox(
+    relay: &Arc<TrustedRelay>,
+    params: A2aInboxParams,
+    cancellation: CancellationToken,
+) -> CallToolResult {
+    if relay.job_operation_id.is_some() || relay.job_request_event_id.is_some() {
+        return error_result(
+            "A2A inbox is unavailable inside a one-shot job session; use status for the bound request"
+                .into(),
+        );
+    }
     query_result(
         relay
-            .query_job_events(Some(&params.request_event_id), 100)
+            .query_job_events(None, params.limit, &cancellation)
             .await,
     )
 }
 
-pub async fn cancel(relay: &Arc<TrustedRelay>, params: A2aCancelParams) -> CallToolResult {
+pub async fn status(
+    relay: &Arc<TrustedRelay>,
+    params: A2aStatusParams,
+    cancellation: CancellationToken,
+) -> CallToolResult {
+    query_result(
+        relay
+            .query_job_events(Some(&params.request_event_id), 100, &cancellation)
+            .await,
+    )
+}
+
+pub async fn cancel(
+    relay: &Arc<TrustedRelay>,
+    params: A2aCancelParams,
+    cancellation: CancellationToken,
+) -> CallToolResult {
     let result = async {
         let events = relay
-            .query_job_events(Some(&params.request_event_id), 100)
+            .query_job_events(Some(&params.request_event_id), 100, &cancellation)
             .await?;
         let chain = JobChain::parse(events, &params.request_event_id)?;
         chain.ensure_requester(relay)?;
@@ -119,16 +149,22 @@ pub async fn cancel(relay: &Arc<TrustedRelay>, params: A2aCancelParams) -> CallT
             reason: params.reason,
             handoff_to: None,
         };
-        relay.publish_job(JobEvent::Control(control)).await
+        relay
+            .publish_job(JobEvent::Control(control), &cancellation)
+            .await
     }
     .await;
     publish_result(result)
 }
 
-pub async fn handoff(relay: &Arc<TrustedRelay>, params: A2aHandoffParams) -> CallToolResult {
+pub async fn handoff(
+    relay: &Arc<TrustedRelay>,
+    params: A2aHandoffParams,
+    cancellation: CancellationToken,
+) -> CallToolResult {
     let result = async {
         let events = relay
-            .query_job_events(Some(&params.request_event_id), 100)
+            .query_job_events(Some(&params.request_event_id), 100, &cancellation)
             .await?;
         let chain = JobChain::parse(events, &params.request_event_id)?;
         chain.ensure_recipient(relay)?;
@@ -161,7 +197,9 @@ pub async fn handoff(relay: &Arc<TrustedRelay>, params: A2aHandoffParams) -> Cal
             reason: params.reason,
             handoff_to: Some(params.handoff_to),
         };
-        relay.publish_job(JobEvent::Control(control)).await
+        relay
+            .publish_job(JobEvent::Control(control), &cancellation)
+            .await
     }
     .await;
     match result {
@@ -175,8 +213,18 @@ pub async fn handoff(relay: &Arc<TrustedRelay>, params: A2aHandoffParams) -> Cal
     }
 }
 
-pub async fn send_chat(relay: &Arc<TrustedRelay>, params: ChatSendParams) -> CallToolResult {
-    publish_result(relay.publish_chat(&params.content).await)
+pub async fn send_chat(
+    relay: &Arc<TrustedRelay>,
+    params: ChatSendParams,
+    cancellation: CancellationToken,
+) -> CallToolResult {
+    if relay.job_operation_id.is_some() || relay.job_request_event_id.is_some() {
+        return error_result(
+            "chat send is unavailable inside a one-shot job session; return the required job outcome instead"
+                .into(),
+        );
+    }
+    publish_result(relay.publish_chat(&params.content, &cancellation).await)
 }
 
 fn build_request(relay: &TrustedRelay, params: A2aDispatchParams) -> Result<JobEvent, String> {
@@ -207,8 +255,11 @@ async fn build_superseding_request(
     relay: &TrustedRelay,
     params: A2aDispatchParams,
     handoff_event_id: &str,
+    cancellation: &CancellationToken,
 ) -> Result<JobEvent, String> {
-    let handoff_event = relay.query_handoff_event(handoff_event_id).await?;
+    let handoff_event = relay
+        .query_handoff_event(handoff_event_id, cancellation)
+        .await?;
     let handoff = match JobEvent::parse(&handoff_event).map_err(|error| error.to_string())? {
         JobEvent::Control(control) if control.action == JobControlAction::Handoff => control,
         _ => return Err("supersedes_event_id must reference a handoff control".into()),
@@ -221,7 +272,12 @@ async fn build_superseding_request(
         return Err("dispatch recipient does not match the signed handoff target".into());
     }
     let old_id = handoff.followup.request_event_id.clone();
-    let chain = JobChain::parse(relay.query_job_events(Some(&old_id), 100).await?, &old_id)?;
+    let chain = JobChain::parse(
+        relay
+            .query_job_events(Some(&old_id), 100, cancellation)
+            .await?,
+        &old_id,
+    )?;
     chain.ensure_requester(relay)?;
     if handoff.followup.common.sender_pubkey != chain.request.common.recipient_pubkey
         || handoff.followup.common.recipient_pubkey != chain.request.common.sender_pubkey

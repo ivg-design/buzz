@@ -168,8 +168,10 @@ pub async fn run(
     cmd.arg(shell_arg).arg(&p.command);
     cmd.current_dir(&workdir);
     cmd.env("PATH", &state.shim.path_env);
-    // NOSTR_PRIVATE_KEY is already removed from this process's env (shim.rs).
-    // BUZZ_PRIVATE_KEY is intentionally inherited — the buzz CLI needs it.
+    // The generic model shell never receives harness signing, bearer, grant,
+    // or session-scope inputs, even when this library runs in-process inside
+    // buzz-acp (whose own process legitimately retains those values).
+    crate::trusted::scrub_async_command_environment(&mut cmd);
     for (k, v) in &state.shim.git_env {
         cmd.env(k, v);
     }

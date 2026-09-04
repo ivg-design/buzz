@@ -4,8 +4,6 @@ use std::process::Command;
 
 use serde::Deserialize;
 
-use super::HARNESS_ONLY_ENV;
-
 const MAX_GRANTS: usize = 128;
 
 #[derive(Clone, Deserialize)]
@@ -23,12 +21,11 @@ struct JobGrant {
     repository: String,
     requester_pubkeys: Vec<String>,
     capabilities: Vec<String>,
-    #[serde(default)]
     path_prefixes: Vec<String>,
-    #[serde(default)]
-    branches: Vec<String>,
-    #[serde(default)]
-    worktree_ids: Vec<String>,
+    base_sha: String,
+    branch: String,
+    worktree_id: String,
+    checkout_root: PathBuf,
 }
 
 /// One exact local authorization selected for an outbound request.
@@ -49,7 +46,6 @@ pub struct GrantMatch {
 #[derive(Clone, Default)]
 pub struct GrantSet {
     grants: Vec<JobGrant>,
-    cwd: PathBuf,
 }
 
 impl GrantSet {
@@ -65,27 +61,30 @@ impl GrantSet {
                 std::fs::read_to_string(path)
                     .map_err(|error| format!("reading local A2A grants: {error}"))?,
             ),
+            (None, None) => {
+                match std::fs::read_to_string(cwd.join(".buzz/agent-job-grants.json")) {
+                    Ok(raw) => Some(raw),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => return Err(format!("reading local A2A grants: {error}")),
+                }
+            }
             _ => None,
         };
         let Some(raw) = raw else {
-            return Ok(Self {
-                grants: Vec::new(),
-                cwd: cwd.to_owned(),
-            });
+            return Ok(Self::default());
         };
-        let document: GrantDocument = serde_json::from_str(&raw)
+        let mut document: GrantDocument = serde_json::from_str(&raw)
             .map_err(|error| format!("parsing local A2A grants: {error}"))?;
         if document.version != 1 || document.grants.len() > MAX_GRANTS {
             return Err(format!(
                 "local A2A grants require version 1 and at most {MAX_GRANTS} entries"
             ));
         }
-        for grant in &document.grants {
+        for grant in &mut document.grants {
             validate_grant(grant)?;
         }
         Ok(Self {
             grants: document.grants,
-            cwd: cwd.to_owned(),
         })
     }
 
@@ -105,38 +104,37 @@ impl GrantSet {
         paths: &[String],
         worktree_id: &str,
     ) -> Result<GrantMatch, String> {
-        let checkout = inspect_checkout(&self.cwd)?;
-        let matches: Vec<&JobGrant> = self
+        let matches: Vec<(&JobGrant, Checkout)> = self
             .grants
             .iter()
-            .filter(|grant| {
-                grant.repository == checkout.repository
-                    && grant.requester_pubkeys.iter().any(|peer| peer == recipient)
-                    && grant
-                        .capabilities
-                        .iter()
-                        .any(|allowed| allowed == capability)
-                    && grant
-                        .branches
-                        .iter()
-                        .any(|allowed| allowed == &checkout.branch)
-                    && grant
-                        .worktree_ids
-                        .iter()
-                        .any(|allowed| allowed == worktree_id)
-                    && paths
-                        .iter()
-                        .all(|path| path_allowed(path, &grant.path_prefixes))
+            .filter_map(|grant| {
+                let statically_allowed =
+                    grant.requester_pubkeys.iter().any(|peer| peer == recipient)
+                        && grant
+                            .capabilities
+                            .iter()
+                            .any(|allowed| allowed == capability)
+                        && grant.worktree_id == worktree_id
+                        && paths
+                            .iter()
+                            .all(|path| path_allowed(path, &grant.path_prefixes));
+                if statically_allowed {
+                    inspect_checkout(grant)
+                        .ok()
+                        .map(|checkout| (grant, checkout))
+                } else {
+                    None
+                }
             })
             .collect();
         match matches.as_slice() {
-            [grant] => Ok(GrantMatch {
+            [(grant, checkout)] => Ok(GrantMatch {
                 project_address: grant.project_address.clone(),
                 home_channel: grant.home_channel.clone(),
                 repository: grant.repository.clone(),
-                base_sha: checkout.base_sha,
-                branch: checkout.branch,
-                worktree_id: worktree_id.to_owned(),
+                base_sha: checkout.base_sha.clone(),
+                branch: checkout.branch.clone(),
+                worktree_id: grant.worktree_id.clone(),
             }),
             [] => Err("operation is outside the local A2A grant or checkout scope".into()),
             _ => Err("operation matches multiple local A2A grants; narrow the grant file".into()),
@@ -149,14 +147,9 @@ impl GrantSet {
             grant.project_address == common.project.address
                 && grant.home_channel == common.project.home_channel
                 && grant.repository == common.repository.canonical
-                && grant
-                    .branches
-                    .iter()
-                    .any(|allowed| allowed == &common.repository.branch)
-                && grant
-                    .worktree_ids
-                    .iter()
-                    .any(|allowed| allowed == &common.repository.worktree_id)
+                && grant.base_sha == common.repository.base_sha
+                && grant.branch == common.repository.branch
+                && grant.worktree_id == common.repository.worktree_id
                 && (common.sender_pubkey == signer || common.recipient_pubkey == signer)
                 && [
                     common.sender_pubkey.as_str(),
@@ -200,14 +193,9 @@ impl GrantSet {
                     .capabilities
                     .iter()
                     .any(|allowed| allowed == capability)
-                && grant
-                    .branches
-                    .iter()
-                    .any(|allowed| allowed == &repository.branch)
-                && grant
-                    .worktree_ids
-                    .iter()
-                    .any(|allowed| allowed == &repository.worktree_id)
+                && grant.base_sha == repository.base_sha
+                && grant.branch == repository.branch
+                && grant.worktree_id == repository.worktree_id
                 && repository
                     .paths
                     .iter()
@@ -217,36 +205,45 @@ impl GrantSet {
 }
 
 struct Checkout {
-    repository: String,
     base_sha: String,
     branch: String,
 }
 
-fn inspect_checkout(cwd: &Path) -> Result<Checkout, String> {
-    let base_sha = git(cwd, &["rev-parse", "HEAD"])?;
-    let branch = git(cwd, &["branch", "--show-current"])?;
-    if branch.is_empty() {
-        return Err("outbound A2A requires a named local branch".into());
+fn inspect_checkout(grant: &JobGrant) -> Result<Checkout, String> {
+    let cwd = grant
+        .checkout_root
+        .canonicalize()
+        .map_err(|_| "local A2A checkout is unavailable".to_owned())?;
+    let top = PathBuf::from(git(&cwd, &["rev-parse", "--show-toplevel"])?);
+    if top.canonicalize().ok().as_ref() != Some(&cwd) {
+        return Err("local A2A checkout root no longer matches its grant".into());
     }
-    let remote = git(cwd, &["config", "--get", "remote.origin.url"])?;
+    let base_sha = git(&cwd, &["rev-parse", "HEAD"])?;
+    let branch = git(&cwd, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
+    let remote = git(&cwd, &["remote", "get-url", "origin"])?;
     let repository = canonical_github_remote(&remote)?;
-    Ok(Checkout {
-        repository,
-        base_sha,
-        branch,
-    })
+    if repository != grant.repository || base_sha != grant.base_sha || branch != grant.branch {
+        return Err("local A2A checkout no longer matches its exact grant".into());
+    }
+    Ok(Checkout { base_sha, branch })
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Result<String, String> {
     let mut command = Command::new("git");
-    command.args(args).current_dir(cwd);
-    for name in HARNESS_ONLY_ENV {
-        command.env_remove(name);
-    }
+    command
+        .args(args)
+        .current_dir(cwd)
+        .env_clear()
+        .env(
+            "PATH",
+            std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()),
+        )
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_NOSYSTEM", "1");
     let output = command
         .output()
         .map_err(|error| format!("running git: {error}"))?;
-    if !output.status.success() {
+    if !output.status.success() || !output.stderr.is_empty() {
         return Err("local checkout inspection failed".into());
     }
     String::from_utf8(output.stdout)
@@ -274,7 +271,7 @@ fn path_allowed(path: &str, prefixes: &[String]) -> bool {
             .any(|prefix| path == prefix || path.starts_with(&format!("{prefix}/")))
 }
 
-fn validate_grant(grant: &JobGrant) -> Result<(), String> {
+fn validate_grant(grant: &mut JobGrant) -> Result<(), String> {
     validate_project(&grant.project_address)?;
     validate_uuid("home_channel", &grant.home_channel)?;
     if canonical_github_remote(&grant.repository)? != grant.repository {
@@ -285,9 +282,23 @@ fn validate_grant(grant: &JobGrant) -> Result<(), String> {
     }
     unique_valid(&grant.requester_pubkeys, valid_pubkey, "requester_pubkeys")?;
     unique_valid(&grant.capabilities, valid_token, "capabilities")?;
+    if grant.path_prefixes.is_empty() {
+        return Err("path_prefixes must contain at least one repository-relative path".into());
+    }
     unique_valid(&grant.path_prefixes, valid_relative_path, "path_prefixes")?;
-    unique_valid(&grant.branches, valid_branch, "branches")?;
-    unique_valid(&grant.worktree_ids, valid_token, "worktree_ids")?;
+    if !valid_sha(&grant.base_sha) {
+        return Err("base_sha must be 40 or 64 lowercase hexadecimal characters".into());
+    }
+    if !valid_branch(&grant.branch) || !valid_token(&grant.worktree_id) {
+        return Err("branch and worktree_id must be canonical printable tokens".into());
+    }
+    if !grant.checkout_root.is_absolute() {
+        return Err("checkout_root must be an absolute existing directory".into());
+    }
+    grant.checkout_root = grant
+        .checkout_root
+        .canonicalize()
+        .map_err(|_| "checkout_root must be an absolute existing directory".to_owned())?;
     Ok(())
 }
 
@@ -344,13 +355,25 @@ fn valid_branch(value: &str) -> bool {
             .any(|byte| matches!(byte, b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\'))
 }
 
+fn valid_sha(value: &str) -> bool {
+    matches!(value.len(), 40 | 64)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn valid_relative_path(value: &str) -> bool {
     !value.is_empty()
         && !value.contains('\\')
         && !Path::new(value).is_absolute()
         && Path::new(value)
             .components()
-            .all(|component| matches!(component, Component::Normal(_)))
+            .all(|component| match component {
+                Component::Normal(name) => !name
+                    .to_str()
+                    .is_some_and(|value| value.eq_ignore_ascii_case(".git")),
+                _ => false,
+            })
 }
 
 #[cfg(test)]
@@ -358,14 +381,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn legacy_grant_parses_but_has_no_outbound_checkout_authority() {
+    fn legacy_grant_is_rejected_without_an_exact_checkout() {
         let peer = "a".repeat(64);
         let raw = format!(
             r#"{{"version":1,"grants":[{{"project_address":"30621:{peer}:nemo","home_channel":"3580ca9b-47b4-4af9-b22a-1068778f26c6","repository":"https://github.com/mysteropodes/nemo","requester_pubkeys":["{peer}"],"capabilities":["rust"],"path_prefixes":["crates"]}}]}}"#
         );
-        let parsed: GrantDocument = serde_json::from_str(&raw).expect("grant");
-        assert!(parsed.grants[0].branches.is_empty());
-        assert!(parsed.grants[0].worktree_ids.is_empty());
+        assert!(serde_json::from_str::<GrantDocument>(&raw).is_err());
     }
 
     #[test]
@@ -384,5 +405,63 @@ mod tests {
         assert!(path_allowed("crates/a", &["crates".into()]));
         assert!(!path_allowed("other/a", &["crates".into()]));
         assert!(!path_allowed("crates/../secret", &["crates".into()]));
+        assert!(!path_allowed("crates/.GiT/config", &["crates".into()]));
+    }
+
+    #[test]
+    fn outbound_revalidates_the_exact_local_checkout() {
+        let checkout = tempfile::tempdir().expect("checkout");
+        let run = |args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(checkout.path())
+                .args(args)
+                .output()
+                .expect("git fixture command");
+            assert!(
+                output.status.success(),
+                "git fixture command failed: {args:?}"
+            );
+        };
+        run(&["init"]);
+        run(&["config", "user.name", "Buzz Test"]);
+        run(&["config", "user.email", "buzz-test@example.invalid"]);
+        run(&["checkout", "-b", "codex/a2a"]);
+        std::fs::write(checkout.path().join("fixture.txt"), "fixture\n").expect("fixture");
+        run(&["add", "fixture.txt"]);
+        run(&["commit", "-m", "fixture"]);
+        run(&[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/mysteropodes/nemo.git",
+        ]);
+        let head = git(checkout.path(), &["rev-parse", "HEAD"]).expect("head");
+        let peer = "a".repeat(64);
+        let grant = serde_json::json!({
+            "version": 1,
+            "grants": [{
+                "project_address": format!("30621:{peer}:nemo"),
+                "home_channel": "3580ca9b-47b4-4af9-b22a-1068778f26c6",
+                "repository": "https://github.com/mysteropodes/nemo",
+                "requester_pubkeys": [peer],
+                "capabilities": ["rust"],
+                "path_prefixes": ["crates"],
+                "base_sha": head,
+                "branch": "codex/a2a",
+                "worktree_id": "a2a",
+                "checkout_root": checkout.path(),
+            }]
+        });
+        let grants = GrantSet::load(checkout.path(), Some(grant.to_string()), None)
+            .expect("exact checkout grant");
+        assert!(grants
+            .outbound(&"a".repeat(64), "rust", &["crates/buzz-acp".into()], "a2a")
+            .is_ok());
+
+        run(&["checkout", "-b", "other"]);
+        assert!(grants
+            .outbound(&"a".repeat(64), "rust", &["crates/buzz-acp".into()], "a2a")
+            .is_err());
     }
 }

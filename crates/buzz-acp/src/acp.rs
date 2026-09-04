@@ -23,15 +23,92 @@ use crate::usage::{
 const MAX_LINE_SIZE: usize = 10_000_000; // 10 MB
 
 /// An MCP server configuration passed to `session/new`.
-///
-/// Corresponds to the `McpServerStdio` variant in the ACP schema.
-/// All four fields are **required** by the schema (`args` and `env` may be empty arrays).
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct McpServer {
+#[derive(Clone, serde::Serialize)]
+#[serde(untagged)]
+pub enum McpServer {
+    /// Child-process MCP server using ACP's stdio transport.
+    Stdio(McpServerStdio),
+    /// Loopback MCP server using ACP's Streamable HTTP transport.
+    Http(McpServerHttp),
+}
+
+/// ACP `McpServerStdio`; all fields are required by the schema.
+#[derive(Clone, serde::Serialize)]
+pub struct McpServerStdio {
     pub name: String,
     pub command: String,
     pub args: Vec<String>,
     pub env: Vec<EnvVar>,
+}
+
+/// ACP `McpServerHttp`; the harness supplies one bearer header that is
+/// redacted from every observer and trace path before serialization.
+#[derive(Clone, serde::Serialize)]
+pub struct McpServerHttp {
+    #[serde(rename = "type")]
+    pub server_type: &'static str,
+    pub name: String,
+    pub url: String,
+    pub headers: Vec<HttpHeader>,
+}
+
+/// One HTTP header attached by the ACP adapter to an MCP server request.
+#[derive(Clone, serde::Serialize)]
+pub struct HttpHeader {
+    pub name: String,
+    pub value: String,
+}
+
+impl McpServer {
+    /// Construct a stdio MCP server.
+    pub fn stdio(
+        name: impl Into<String>,
+        command: impl Into<String>,
+        args: Vec<String>,
+        env: Vec<EnvVar>,
+    ) -> Self {
+        Self::Stdio(McpServerStdio {
+            name: name.into(),
+            command: command.into(),
+            args,
+            env,
+        })
+    }
+
+    /// Construct a Streamable HTTP MCP server.
+    pub fn http(name: impl Into<String>, url: impl Into<String>, headers: Vec<HttpHeader>) -> Self {
+        Self::Http(McpServerHttp {
+            server_type: "http",
+            name: name.into(),
+            url: url.into(),
+            headers,
+        })
+    }
+
+    /// Mutably access stdio environment entries. HTTP servers never expose an
+    /// environment block through ACP.
+    pub fn stdio_env_mut(&mut self) -> Option<&mut Vec<EnvVar>> {
+        match self {
+            Self::Stdio(server) => Some(&mut server.env),
+            Self::Http(_) => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn name(&self) -> &str {
+        match self {
+            Self::Stdio(server) => &server.name,
+            Self::Http(server) => &server.name,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stdio_env(&self) -> &[EnvVar] {
+        match self {
+            Self::Stdio(server) => &server.env,
+            Self::Http(_) => &[],
+        }
+    }
 }
 
 /// A single environment variable for an MCP server.
@@ -39,6 +116,53 @@ pub struct McpServer {
 pub struct EnvVar {
     pub name: String,
     pub value: String,
+}
+
+/// Clone an ACP frame for observation while preserving the original frame for
+/// the child process. Credentials and ephemeral MCP capabilities must never
+/// enter logs or the desktop observer stream.
+fn redacted_wire_value(value: &serde_json::Value) -> serde_json::Value {
+    fn sensitive_name(name: &str) -> bool {
+        let upper = name.to_ascii_uppercase();
+        upper == "AUTHORIZATION"
+            || ((upper.starts_with("BUZZ_") || upper.starts_with("NOSTR_"))
+                && ["PRIVATE_KEY", "SECRET", "NSEC", "AUTH", "TOKEN"]
+                    .iter()
+                    .any(|marker| upper.contains(marker)))
+    }
+
+    fn walk(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Array(values) => values.iter_mut().for_each(walk),
+            serde_json::Value::Object(object) => {
+                let named_secret = object
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(sensitive_name);
+                if named_secret {
+                    if let Some(secret) = object.get_mut("value") {
+                        *secret = serde_json::Value::String("[REDACTED]".into());
+                    }
+                }
+                for (key, child) in object.iter_mut() {
+                    if sensitive_name(key) && key != "name" {
+                        *child = serde_json::Value::String("[REDACTED]".into());
+                    } else {
+                        walk(child);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut redacted = value.clone();
+    walk(&mut redacted);
+    redacted
+}
+
+fn redacted_wire_json(value: &serde_json::Value) -> String {
+    serde_json::to_string(&redacted_wire_value(value)).unwrap_or_default()
 }
 
 /// Stop reason returned by `session/prompt` when the agent finishes a turn.
@@ -200,6 +324,9 @@ pub struct AcpClient {
     /// a JSON-RPC *success*, not `-32601` — which the main loop would read as
     /// a delivered steer and drop the user's message from the queue.
     steering_supported: bool,
+    /// Whether the adapter accepts ACP `McpServerHttp` entries. Unsupported or
+    /// missing capability values fail closed to credential-free stdio only.
+    http_mcp_supported: bool,
     /// Per-turn channel for receiving goose-native non-cancelling steer
     /// requests from the main loop. Installed by
     /// [`install_steer_rx`](Self::install_steer_rx) at dispatch and
@@ -248,10 +375,12 @@ const HARNESS_ONLY_ENV: &[&str] = &[
     "BUZZ_ACP_JOB_LEDGER_DIR",
     "BUZZ_ACP_OWNER_GITHUB_LOGIN",
     "BUZZ_ACP_ALLOW_INSECURE_LOOPBACK_JOBS",
+    "BUZZ_ACP_STARTUP_STDIN",
 ];
 
-fn is_harness_only_env(name: &str) -> bool {
-    if HARNESS_ONLY_ENV.contains(&name)
+pub(crate) fn is_harness_only_env(name: &str) -> bool {
+    let name = name.to_ascii_uppercase();
+    if HARNESS_ONLY_ENV.contains(&name.as_str())
         || name.starts_with("BUZZ_MCP_")
         || name.starts_with("BUZZ_ACP_JOB_")
         || name.starts_with("GIT_CONFIG_")
@@ -632,6 +761,7 @@ impl AcpClient {
             observer_context: ObserverContext::default(),
             active_run_id: None,
             steering_supported: false,
+            http_mcp_supported: false,
             steer_rx: None,
             goose_usage: UsageTracker::default(),
             standard_usage: StandardUsageTracker::default(),
@@ -691,6 +821,10 @@ impl AcpClient {
         self.steering_supported = result
             .pointer("/_meta/steering/supported")
             .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        self.http_mcp_supported = result
+            .pointer("/agentCapabilities/mcpCapabilities/http")
+            .and_then(|value| value.as_bool())
             .unwrap_or(false);
         tracing::debug!(target: "acp::init", "initialize response: {result}");
         Ok(result)
@@ -879,7 +1013,7 @@ impl AcpClient {
             "params": params,
         });
 
-        tracing::debug!(target: "acp::wire", "→ {}", &serde_json::to_string(&msg).unwrap_or_default());
+        tracing::debug!(target: "acp::wire", "→ {}", redacted_wire_json(&msg));
         if let Err(e) = self.write_ndjson(&msg).await {
             self.last_prompt_id = None;
             self.current_hard_deadline = None;
@@ -956,6 +1090,11 @@ impl AcpClient {
     /// for the supervisor's post-initialize log line.
     pub fn steering_supported(&self) -> bool {
         self.steering_supported
+    }
+
+    /// Whether the initialized adapter accepts Streamable HTTP MCP servers.
+    pub fn http_mcp_supported(&self) -> bool {
+        self.http_mcp_supported
     }
 
     /// Consume per-turn usage for NIP-AM publishing. Goose/buzz-agent is an
@@ -1161,7 +1300,7 @@ impl AcpClient {
         .await
         .map_err(|_| AcpError::WriteTimeout(WRITE_TIMEOUT))?
         .map_err(AcpError::Io)?;
-        self.observe("acp_write", value.clone());
+        self.observe("acp_write", redacted_wire_value(value));
         Ok(())
     }
 
@@ -1192,7 +1331,7 @@ impl AcpClient {
             "params": params,
         });
 
-        tracing::debug!(target: "acp::wire", "→ {}", &serde_json::to_string(&msg).unwrap_or_default());
+        tracing::debug!(target: "acp::wire", "→ {}", redacted_wire_json(&msg));
 
         // Wrap write + read in a single timeout so a hung agent can't block forever.
         // We cannot use an async block that borrows `self` mutably across two awaits
@@ -1257,7 +1396,7 @@ impl AcpClient {
             "params": params,
         });
 
-        tracing::debug!(target: "acp::wire", "→ (notification) {}", &serde_json::to_string(&msg).unwrap_or_default());
+        tracing::debug!(target: "acp::wire", "→ (notification) {}", redacted_wire_json(&msg));
         self.write_ndjson(&msg).await?;
         Ok(())
     }
@@ -1298,16 +1437,13 @@ impl AcpClient {
                 continue;
             }
 
-            // Only log and reset idle after we have a valid non-empty line.
-            tracing::debug!(target: "acp::wire", "← {trimmed}");
-
             let msg: serde_json::Value = match serde_json::from_str(trimmed) {
                 Ok(v) => v,
                 Err(e) => {
                     self.observe(
                         "acp_parse_error",
                         serde_json::json!({
-                            "line": trimmed,
+                            "line": "[invalid ACP JSON omitted]",
                             "error": e.to_string(),
                         }),
                     );
@@ -1318,7 +1454,8 @@ impl AcpClient {
                     continue;
                 }
             };
-            self.observe("acp_read", msg.clone());
+            tracing::debug!(target: "acp::wire", "← {}", redacted_wire_json(&msg));
+            self.observe("acp_read", redacted_wire_value(&msg));
 
             // Check if this is a response to our expected request (has matching id
             // AND no `method` field — a `method` field means it's an agent-initiated
@@ -1546,7 +1683,7 @@ impl AcpClient {
                             tracing::debug!(
                                 target: "acp::wire",
                                 "→ {}",
-                                serde_json::to_string(&msg).unwrap_or_default()
+                                redacted_wire_json(&msg)
                             );
                             match self.write_ndjson(&msg).await {
                                 Ok(()) => {
@@ -1622,15 +1759,13 @@ impl AcpClient {
                         continue;
                     }
 
-                    tracing::debug!(target: "acp::wire", "← {trimmed}");
-
                     let msg: serde_json::Value = match serde_json::from_str(trimmed) {
                         Ok(v) => v,
                         Err(e) => {
                             self.observe(
                                 "acp_parse_error",
                                 serde_json::json!({
-                                    "line": trimmed,
+                                    "line": "[invalid ACP JSON omitted]",
                                     "error": e.to_string(),
                                 }),
                             );
@@ -1641,7 +1776,8 @@ impl AcpClient {
                             continue;
                         }
                     };
-                    self.observe("acp_read", msg.clone());
+                    tracing::debug!(target: "acp::wire", "← {}", redacted_wire_json(&msg));
+                    self.observe("acp_read", redacted_wire_value(&msg));
 
                     let activity_now = Instant::now();
                     idle_deadline = activity_now + idle_timeout;
@@ -2618,11 +2754,11 @@ mod tests {
     #[test]
     fn session_new_mcp_server_has_required_fields() {
         // Schema requires name, command, args, env — all present, args/env may be empty.
-        let server = McpServer {
-            name: "test-mcp".into(),
-            command: "/usr/local/bin/test-mcp-server".into(),
-            args: vec![],
-            env: vec![
+        let server = McpServer::stdio(
+            "test-mcp",
+            "/usr/local/bin/test-mcp-server",
+            vec![],
+            vec![
                 EnvVar {
                     name: "BUZZ_RELAY_URL".into(),
                     value: "ws://localhost:3000".into(),
@@ -2632,7 +2768,7 @@ mod tests {
                     value: "nsec1abc".into(),
                 },
             ],
-        };
+        );
         let serialized = serde_json::to_value(&server).unwrap();
         assert_eq!(serialized["name"].as_str(), Some("test-mcp"));
         assert_eq!(
@@ -2646,6 +2782,47 @@ mod tests {
         assert_eq!(
             serialized["env"][0]["name"].as_str(),
             Some("BUZZ_RELAY_URL")
+        );
+    }
+
+    #[test]
+    fn http_mcp_server_matches_acp_schema_without_stdio_fields() {
+        let server = McpServer::http(
+            "buzz-trusted-session",
+            "http://127.0.0.1:32123/mcp",
+            vec![HttpHeader {
+                name: "Authorization".into(),
+                value: "Bearer session-secret".into(),
+            }],
+        );
+        let serialized = serde_json::to_value(server).unwrap();
+        assert_eq!(serialized["name"], "buzz-trusted-session");
+        assert_eq!(serialized["type"], "http");
+        assert_eq!(serialized["url"], "http://127.0.0.1:32123/mcp");
+        assert!(serialized.get("command").is_none());
+        assert!(serialized.get("env").is_none());
+    }
+
+    #[test]
+    fn wire_redaction_covers_http_bearer_and_legacy_secret_env() {
+        let raw = serde_json::json!({
+            "params": {"mcpServers": [
+                {"name":"trusted","url":"http://127.0.0.1:1/mcp","headers":[
+                    {"name":"Authorization","value":"Bearer capability-secret"}
+                ]},
+                {"name":"legacy","command":"mcp","args":[],"env":[
+                    {"name":"BUZZ_PRIVATE_KEY","value":"nsec-secret"},
+                    {"name":"BUZZ_RELAY_URL","value":"wss://relay.example"}
+                ]}
+            ]}
+        });
+        let redacted = redacted_wire_json(&raw);
+        assert!(!redacted.contains("capability-secret"));
+        assert!(!redacted.contains("nsec-secret"));
+        assert!(redacted.contains("wss://relay.example"));
+        assert_eq!(
+            redacted_wire_value(&raw)["params"]["mcpServers"][0]["headers"][0]["value"],
+            "[REDACTED]"
         );
     }
 
@@ -4301,6 +4478,36 @@ mod tests {
             .await
             .expect("initialize should succeed");
         client.steering_supported()
+    }
+
+    async fn http_mcp_supported_after_initialize(init_result: &str) -> bool {
+        let script = format!(
+            "read -r _init; printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{result}}}'; \
+             sleep 5",
+            result = init_result,
+        );
+        let mut client = spawn_script(&script).await;
+        client
+            .initialize()
+            .await
+            .expect("initialize should succeed");
+        client.http_mcp_supported()
+    }
+
+    #[tokio::test]
+    async fn initialize_enables_http_mcp_only_on_exact_true_capability() {
+        let supported = http_mcp_supported_after_initialize(
+            r#"{"protocolVersion":2,"agentCapabilities":{"mcpCapabilities":{"http":true}}}"#,
+        )
+        .await;
+        assert!(supported, "Codex/Claude HTTP capability must be retained");
+
+        for unsupported in [
+            r#"{"protocolVersion":2,"agentCapabilities":{"mcpCapabilities":{"http":false}}}"#,
+            r#"{"protocolVersion":2,"agentCapabilities":{}}"#,
+        ] {
+            assert!(!http_mcp_supported_after_initialize(unsupported).await);
+        }
     }
 
     /// Test 1a: an adapter advertising `_meta.steering.supported: true`

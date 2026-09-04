@@ -70,6 +70,14 @@ pub(crate) const RESERVED_ENV_KEYS: &[&str] = &[
     // ambient env var must not be able to forge setup mode (NotReady) on a
     // Ready agent or suppress it (empty/stale payload) on a NotReady one.
     "BUZZ_ACP_SETUP_PAYLOAD",
+    // Private one-shot startup transport. Only Desktop may set the marker;
+    // signing/auth/grant bytes travel through the child's stdin pipe.
+    "BUZZ_ACP_STARTUP_STDIN",
+    "BUZZ_ACP_JOB_GRANTS_JSON",
+    "BUZZ_ACP_JOB_GRANTS_FILE",
+    "BUZZ_ACP_JOB_LEDGER_DIR",
+    "BUZZ_ACP_OWNER_GITHUB_LOGIN",
+    "BUZZ_ACP_ALLOW_INSECURE_LOOPBACK_JOBS",
     // Demo-build identity owns the child agent config root. A user override
     // could silently reconnect a demo harness to production OAuth state.
     "BUZZ_AGENT_CONFIG_DIR",

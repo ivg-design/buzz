@@ -43,6 +43,7 @@ use crate::queue::{
 };
 use crate::relay::{ChannelInfo, RestClient};
 use crate::scope::SessionScope;
+use crate::trusted_mcp::{TrustedMcpFactory, TrustedMcpSession};
 
 /// Window within which agent activity before a hard-cap death qualifies
 /// the turn as "recently active" (eligible for requeue instead of dead-letter).
@@ -141,6 +142,10 @@ pub struct SessionState {
     /// Per-scope successful-delivery state. Created with the ACP session and
     /// cleared atomically with every invalidation path.
     pub deliveries: HashMap<SessionScope, ChannelDeliveryState>,
+    /// Harness-owned trusted MCP capability for each live provider session.
+    /// Removing an entry cancels its loopback listener and invalidates its
+    /// bearer token.
+    trusted_mcp: HashMap<SessionScope, TrustedMcpSession>,
 }
 
 impl SessionState {
@@ -165,6 +170,7 @@ impl SessionState {
         self.core_sections.remove(scope);
         self.canvas_sections.remove(scope);
         self.deliveries.remove(scope);
+        self.trusted_mcp.remove(scope);
         self.sessions.remove(scope).is_some()
     }
 
@@ -179,6 +185,7 @@ impl SessionState {
             .chain(self.core_sections.keys())
             .chain(self.canvas_sections.keys())
             .chain(self.deliveries.keys())
+            .chain(self.trusted_mcp.keys())
             .filter(|s| s.channel_id() == *channel_id)
             .cloned()
             .collect::<HashSet<_>>()
@@ -203,6 +210,13 @@ impl SessionState {
         self.core_sections.clear();
         self.canvas_sections.clear();
         self.deliveries.clear();
+        self.trusted_mcp.clear();
+    }
+
+    fn trusted_mcp_valid_for(&self, scope: &SessionScope, duration: Duration) -> bool {
+        self.trusted_mcp
+            .get(scope)
+            .is_some_and(|session| session.is_valid_for(duration))
     }
 
     pub(crate) fn mark_scope_delivery_success(
@@ -224,6 +238,7 @@ impl SessionState {
             || self.core_sections.keys().any(matches)
             || self.canvas_sections.keys().any(matches)
             || self.deliveries.keys().any(matches)
+            || self.trusted_mcp.keys().any(matches)
     }
 }
 
@@ -757,6 +772,9 @@ impl ChannelInfoResolver {
 
 pub struct PromptContext {
     pub mcp_servers: Vec<McpServer>,
+    /// Creates the typed, signer-bearing MCP service after exact session scope
+    /// is known. Static stdio MCP entries remain credential-free.
+    pub trusted_mcp_factory: Option<TrustedMcpFactory>,
     pub initial_message: Option<String>,
     pub idle_timeout: Duration,
     pub max_turn_duration: Duration,
@@ -1268,6 +1286,16 @@ async fn create_session_and_apply_model(
     agent_core: Option<&str>,
     channel: NewSessionChannelContext<'_>,
 ) -> Result<String, AcpError> {
+    create_session_and_apply_model_at(agent, ctx, &ctx.cwd, agent_core, channel).await
+}
+
+async fn create_session_and_apply_model_at(
+    agent: &mut OwnedAgent,
+    ctx: &PromptContext,
+    working_directory: &str,
+    agent_core: Option<&str>,
+    channel: NewSessionChannelContext<'_>,
+) -> Result<String, AcpError> {
     // Build base_prompt + system_prompt + agent core + canvas metadata into a
     // single prompt. Standard protocol-v2 agents receive it in `session/new`;
     // Goose receives it through the custom request below. Legacy agents receive
@@ -1280,7 +1308,7 @@ async fn create_session_and_apply_model(
             with_core(
                 with_team(
                     framed_system_prompt(
-                        &ctx.cwd,
+                        working_directory,
                         ctx.base_prompt.as_deref(),
                         ctx.system_prompt.as_deref(),
                     ),
@@ -1300,17 +1328,36 @@ async fn create_session_and_apply_model(
             channel.scope.and_then(SessionScope::root_event_id),
         )
     });
-    let mcp_servers = mcp_servers_with_git_origin(
+    let mut mcp_servers = mcp_servers_with_git_origin(
         &ctx.mcp_servers,
         channel.scope,
         channel.channel_type,
         ctx.session_title.as_deref(),
     );
+    let trusted_mcp = match (
+        &ctx.trusted_mcp_factory,
+        channel.scope,
+        agent.acp.http_mcp_supported(),
+    ) {
+        (Some(factory), Some(scope), true) => {
+            let session = factory.start(scope).await.map_err(AcpError::Protocol)?;
+            mcp_servers.push(session.mcp_server());
+            Some((scope.clone(), session))
+        }
+        (Some(_), Some(scope), false) => {
+            return Err(AcpError::Protocol(format!(
+                "adapter '{}' does not support the required HTTP MCP for scoped Buzz collaboration ({}); use a Codex or Claude adapter that advertises mcpCapabilities.http=true",
+                agent.agent_name,
+                scope.telemetry_label()
+            )));
+        }
+        _ => None,
+    };
 
     let resp = agent
         .acp
         .session_new_full(
-            &ctx.cwd,
+            working_directory,
             mcp_servers,
             session_new_system_prompt(
                 is_goose,
@@ -1526,6 +1573,10 @@ async fn create_session_and_apply_model(
         apply_permission_mode(&mut agent.acp, &resp.session_id, &ctx.permission_mode).await?;
     }
 
+    if let Some((scope, session)) = trusted_mcp {
+        agent.state.trusted_mcp.insert(scope, session);
+    }
+
     Ok(resp.session_id)
 }
 
@@ -1552,37 +1603,9 @@ fn mcp_servers_with_git_origin(
     };
     if let Some(origin) = origin {
         for server in &mut servers {
-            server.env.push(origin.clone());
-        }
-    }
-    if let Some(scope) = scope {
-        let mut scoped = vec![EnvVar {
-            name: "BUZZ_MCP_SESSION_CHANNEL_ID".into(),
-            value: scope.channel_id().to_string(),
-        }];
-        if let Some(root_event_id) = scope.root_event_id() {
-            scoped.push(EnvVar {
-                name: "BUZZ_MCP_SESSION_THREAD_ROOT_ID".into(),
-                value: root_event_id.into(),
-            });
-        }
-        if let SessionScope::Job {
-            operation_id,
-            request_event_id,
-            ..
-        } = scope
-        {
-            scoped.push(EnvVar {
-                name: "BUZZ_MCP_JOB_OPERATION_ID".into(),
-                value: operation_id.clone(),
-            });
-            scoped.push(EnvVar {
-                name: "BUZZ_MCP_JOB_REQUEST_EVENT_ID".into(),
-                value: request_event_id.clone(),
-            });
-        }
-        for server in &mut servers {
-            server.env.extend(scoped.iter().cloned());
+            if let Some(env) = server.stdio_env_mut() {
+                env.push(origin.clone());
+            }
         }
     }
     servers
@@ -2062,6 +2085,20 @@ fn send_prompt_result(
 ///
 /// The agent is ALWAYS returned — even on panic the `JoinSet` detects the
 /// abort and the caller uses `task_map` to recover the agent index.
+pub struct PromptExecution {
+    pub job_working_directory: Option<String>,
+    pub turn_id: String,
+}
+
+impl PromptExecution {
+    pub fn new(job_working_directory: Option<String>, turn_id: String) -> Self {
+        Self {
+            job_working_directory,
+            turn_id,
+        }
+    }
+}
+
 pub async fn run_prompt_task(
     mut agent: OwnedAgent,
     batch: Option<FlushBatch>,
@@ -2069,13 +2106,38 @@ pub async fn run_prompt_task(
     ctx: Arc<PromptContext>,
     result_tx: mpsc::UnboundedSender<PromptResult>,
     control_rx: Option<tokio::sync::oneshot::Receiver<ControlSignal>>,
-    turn_id: String,
+    execution: PromptExecution,
 ) {
+    let PromptExecution {
+        job_working_directory,
+        turn_id,
+    } = execution;
     // Is this a channel prompt or a heartbeat?
     let source = match &batch {
         Some(b) => PromptSource::Channel(b.scope.clone()),
         None => PromptSource::Heartbeat,
     };
+    let session_working_directory = match (&source, job_working_directory.as_deref()) {
+        (PromptSource::Channel(scope), Some(path)) if scope.is_job() => path,
+        _ => &ctx.cwd,
+    };
+    if ctx.trusted_mcp_factory.is_some() && agent.acp.http_mcp_supported() {
+        if let PromptSource::Channel(scope) = &source {
+            let required = ctx
+                .max_turn_duration
+                .saturating_add(Duration::from_secs(30));
+            if agent.state.sessions.contains_key(scope)
+                && !agent.state.trusted_mcp_valid_for(scope, required)
+            {
+                tracing::info!(
+                    target: "pool::session",
+                    scope = %scope.telemetry_label(),
+                    "rotating provider session before trusted MCP capability expiry"
+                );
+                agent.state.invalidate_scope(scope);
+            }
+        }
+    }
     let observer_channel_id = source.channel_id();
     let turn_started_at = chrono::Utc::now().to_rfc3339();
     agent.acp.set_observer_context(observer::context_for_turn(
@@ -2312,9 +2374,10 @@ pub async fn run_prompt_task(
                 // The title includes channel and, for thread sessions, the
                 // canonical root prefix so sibling sessions are distinguishable.
                 // DMs, unresolved, and unnamed channels omit the channel name.
-                match create_session_and_apply_model(
+                match create_session_and_apply_model_at(
                     &mut agent,
                     &ctx,
+                    session_working_directory,
                     agent_core.as_deref(),
                     NewSessionChannelContext {
                         huddle_instructions: huddle_instructions.as_deref(),
@@ -5179,12 +5242,7 @@ mod tests {
     }
 
     fn test_mcp_server() -> McpServer {
-        McpServer {
-            name: "dev".into(),
-            command: "buzz-dev-mcp".into(),
-            args: vec![],
-            env: vec![],
-        }
+        McpServer::stdio("dev", "buzz-dev-mcp", vec![], vec![])
     }
 
     #[test]
@@ -5238,11 +5296,11 @@ mod tests {
         let scope = SessionScope::Conversation { channel_id };
         let servers =
             mcp_servers_with_git_origin(&[test_mcp_server()], Some(&scope), Some("stream"), None);
-        assert!(servers[0].env.iter().any(|entry| {
+        assert!(servers[0].stdio_env().iter().any(|entry| {
             entry.name == "BUZZ_GIT_ORIGIN_CHANNEL_ID" && entry.value == channel_id.to_string()
         }));
         assert!(!servers[0]
-            .env
+            .stdio_env()
             .iter()
             .any(|entry| entry.name == "BUZZ_GIT_ORIGIN_AGENT_NAME"));
     }
@@ -5258,17 +5316,17 @@ mod tests {
             Some("dm"),
             Some("Builder"),
         );
-        assert!(servers[0].env.iter().any(|entry| {
+        assert!(servers[0].stdio_env().iter().any(|entry| {
             entry.name == "BUZZ_GIT_ORIGIN_AGENT_NAME" && entry.value == "Builder"
         }));
         assert!(!servers[0]
-            .env
+            .stdio_env()
             .iter()
             .any(|entry| entry.name == "BUZZ_GIT_ORIGIN_CHANNEL_ID"));
     }
 
     #[test]
-    fn job_session_mcp_scope_is_exact_and_does_not_use_chat_thread() {
+    fn job_scope_is_not_exposed_to_generic_stdio_mcp() {
         let scope = SessionScope::Job {
             channel_id: Uuid::new_v4(),
             operation_id: Uuid::new_v4().to_string(),
@@ -5276,25 +5334,11 @@ mod tests {
         };
         let servers =
             mcp_servers_with_git_origin(&[test_mcp_server()], Some(&scope), Some("stream"), None);
-        let env = &servers[0].env;
-        assert!(env.iter().any(|entry| {
-            entry.name == "BUZZ_MCP_SESSION_CHANNEL_ID"
-                && entry.value == scope.channel_id().to_string()
-        }));
-        assert!(env.iter().any(|entry| {
-            entry.name == "BUZZ_MCP_JOB_OPERATION_ID"
-                && entry.value
-                    == *match &scope {
-                        SessionScope::Job { operation_id, .. } => operation_id,
-                        _ => unreachable!(),
-                    }
-        }));
-        assert!(env.iter().any(|entry| {
-            entry.name == "BUZZ_MCP_JOB_REQUEST_EVENT_ID" && entry.value == "a".repeat(64)
-        }));
-        assert!(!env
+        let env = servers[0].stdio_env();
+        assert!(env
             .iter()
-            .any(|entry| entry.name == "BUZZ_MCP_SESSION_THREAD_ROOT_ID"));
+            .any(|entry| entry.name == "BUZZ_GIT_ORIGIN_CHANNEL_ID"));
+        assert!(!env.iter().any(|entry| entry.name.starts_with("BUZZ_MCP_")));
     }
 
     // These pin the initial_message dispatch path (run_prompt_task, ~line 855):
@@ -6568,7 +6612,7 @@ done"#
                 Arc::clone(&ctx),
                 result_tx.clone(),
                 None,
-                format!("turn-{turn}"),
+                PromptExecution::new(None, format!("turn-{turn}")),
             )
             .await;
             let result = result_rx.recv().await.expect("prompt result");
@@ -6690,7 +6734,7 @@ done"#
                 Arc::clone(&ctx),
                 result_tx.clone(),
                 None,
-                format!("turn-{turn}"),
+                PromptExecution::new(None, format!("turn-{turn}")),
             )
             .await;
             let result = result_rx.recv().await.expect("prompt result");
@@ -6870,7 +6914,7 @@ done"#
                 Arc::clone(&ctx),
                 result_tx.clone(),
                 None,
-                turn_id.into(),
+                PromptExecution::new(None, turn_id.into()),
             )
             .await;
             let result = result_rx.recv().await.expect("prompt result");
@@ -7033,7 +7077,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             Arc::new(ctx),
             result_tx,
             None,
-            "next-turn".into(),
+            PromptExecution::new(None, "next-turn".into()),
         )
         .await;
         let mut result = result_rx.recv().await.expect("next prompt result");
@@ -8723,6 +8767,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         use crate::relay::RestClient;
         PromptContext {
             mcp_servers: vec![],
+            trusted_mcp_factory: None,
             initial_message: None,
             idle_timeout: Duration::from_secs(60),
             max_turn_duration: Duration::from_secs(120),
@@ -9441,7 +9486,7 @@ done"#
             Arc::new(ctx),
             result_tx,
             None,
-            "indeterminate-project-turn".into(),
+            PromptExecution::new(None, "indeterminate-project-turn".into()),
         )
         .await;
 
@@ -9756,6 +9801,268 @@ done"#
             "one fetch_channel_info sequence (initial attempt + single retry)"
         );
         server.abort();
+    }
+}
+
+#[cfg(test)]
+mod trusted_mcp_session_tests {
+    use super::*;
+    use crate::acp::AcpClient;
+    use crate::trusted_mcp::TrustedMcpFactory;
+    use buzz_dev_mcp::HarnessTrustedIdentity;
+
+    async fn scripted_agent(http_capability: Option<bool>) -> (AcpClient, std::path::PathBuf) {
+        let capture =
+            std::env::temp_dir().join(format!("buzz-acp-session-new-{}.json", Uuid::new_v4()));
+        let capability = match http_capability {
+            Some(value) => format!(r#""mcpCapabilities":{{"http":{value}}}"#),
+            None => String::new(),
+        };
+        let agent_capabilities = if capability.is_empty() {
+            r#""agentCapabilities":{}"#.to_owned()
+        } else {
+            format!(r#""agentCapabilities":{{{capability}}}"#)
+        };
+        let script = format!(
+            r#"count=0
+while IFS= read -r line; do
+  count=$((count + 1))
+  if [ "$count" -eq 1 ]; then
+    printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{{agent_capabilities},"agentInfo":{{"name":"adapter-test","version":"1"}}}}}}'
+  else
+    printf '%s' "$line" > "$CAPTURE_FILE"
+    printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"sessionId":"sess-1"}}}}'
+  fi
+done"#
+        );
+        let mut acp = AcpClient::spawn(
+            "bash",
+            &["-c".into(), script],
+            &[(
+                "CAPTURE_FILE".into(),
+                capture.to_string_lossy().into_owned(),
+            )],
+            false,
+        )
+        .await
+        .expect("spawn scripted ACP");
+        acp.initialize().await.expect("initialize scripted ACP");
+        (acp, capture)
+    }
+
+    fn owned(acp: AcpClient) -> OwnedAgent {
+        OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            desired_model_request_id: None,
+            desired_model_pending_ack: false,
+            startup_effort: None,
+            agent_name: "adapter-test".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        }
+    }
+
+    fn factory(keys: &nostr::Keys) -> TrustedMcpFactory {
+        let identity = HarnessTrustedIdentity::new(
+            std::path::Path::new("."),
+            "http://127.0.0.1:9".into(),
+            keys.clone(),
+            None,
+            None,
+            None,
+            None,
+            true,
+        )
+        .expect("trusted identity");
+        TrustedMcpFactory::new(identity, Duration::from_secs(60)).expect("factory")
+    }
+
+    async fn create_captured_session(
+        http_capability: Option<bool>,
+    ) -> (
+        serde_json::Value,
+        OwnedAgent,
+        observer::ObserverHandle,
+        String,
+    ) {
+        let keys = nostr::Keys::generate();
+        let raw_key = keys.secret_key().to_secret_hex();
+        let (acp, capture) = scripted_agent(http_capability).await;
+        let mut agent = owned(acp);
+        let observer = observer::ObserverHandle::in_process();
+        agent.acp.set_observer(Some(observer.clone()), 0);
+        let mut ctx = tests::make_prompt_context_no_owner();
+        ctx.trusted_mcp_factory = Some(factory(&keys));
+        ctx.mcp_servers = vec![McpServer::stdio(
+            "generic-dev",
+            "buzz-dev-mcp",
+            vec![],
+            vec![EnvVar {
+                name: "BUZZ_ACP_DISPLAY_NAME".into(),
+                value: "Test Agent".into(),
+            }],
+        )];
+        let scope = SessionScope::Conversation {
+            channel_id: Uuid::new_v4(),
+        };
+        create_session_and_apply_model(
+            &mut agent,
+            &ctx,
+            None,
+            NewSessionChannelContext {
+                huddle_instructions: None,
+                canvas: None,
+                name: None,
+                scope: Some(&scope),
+                channel_type: Some("channel"),
+            },
+        )
+        .await
+        .expect("session creation");
+        let wire: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&capture).expect("captured session/new"))
+                .expect("session/new JSON");
+        let _ = std::fs::remove_file(capture);
+        (wire, agent, observer, raw_key)
+    }
+
+    #[tokio::test]
+    async fn production_session_new_gates_scoped_http_mcp_on_adapter_capability() {
+        let (supported, mut agent, observer, raw_key) = create_captured_session(Some(true)).await;
+        let servers = supported["params"]["mcpServers"].as_array().unwrap();
+        assert_eq!(servers.len(), 2);
+        let trusted = servers
+            .iter()
+            .find(|server| server["name"] == "buzz-trusted-session")
+            .expect("trusted HTTP server");
+        assert_eq!(trusted["type"], "http");
+        assert!(trusted["url"]
+            .as_str()
+            .is_some_and(|url| url.starts_with("http://127.0.0.1:")));
+        let bearer = trusted["headers"][0]["value"].as_str().unwrap();
+        assert!(bearer.starts_with("Bearer "));
+        let wire_text = supported.to_string();
+        assert!(!wire_text.contains(&raw_key));
+        let observed = serde_json::to_string(&observer.snapshot()).unwrap();
+        assert!(!observed.contains(bearer));
+        assert!(!observed.contains(&raw_key));
+        assert!(observed.contains("[REDACTED]"));
+        agent.state.invalidate_all();
+        agent.acp.shutdown().await;
+
+        for unsupported in [Some(false), None] {
+            let keys = nostr::Keys::generate();
+            let (acp, capture) = scripted_agent(unsupported).await;
+            let mut agent = owned(acp);
+            let mut ctx = tests::make_prompt_context_no_owner();
+            ctx.trusted_mcp_factory = Some(factory(&keys));
+            ctx.mcp_servers = vec![McpServer::stdio(
+                "generic-dev",
+                "buzz-dev-mcp",
+                vec![],
+                vec![],
+            )];
+            let scope = SessionScope::Conversation {
+                channel_id: Uuid::new_v4(),
+            };
+            let err = create_session_and_apply_model(
+                &mut agent,
+                &ctx,
+                None,
+                NewSessionChannelContext {
+                    huddle_instructions: None,
+                    canvas: None,
+                    name: None,
+                    scope: Some(&scope),
+                    channel_type: Some("channel"),
+                },
+            )
+            .await
+            .expect_err("HTTP-unsupported adapter must fail before session/new");
+            let message = err.to_string();
+            assert!(message.contains("does not support the required HTTP MCP"));
+            assert!(message.contains("Codex or Claude"));
+            assert!(!capture.exists(), "session/new must not be sent");
+            assert!(agent.state.trusted_mcp.is_empty());
+            agent.acp.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn job_session_new_uses_receiver_verified_working_directory() {
+        let (acp, capture) = scripted_agent(Some(true)).await;
+        let mut agent = owned(acp);
+        let ctx = tests::make_prompt_context_no_owner();
+        let scope = SessionScope::Job {
+            channel_id: Uuid::new_v4(),
+            operation_id: Uuid::new_v4().to_string(),
+            request_event_id: "a".repeat(64),
+        };
+        let verified = "/tmp/buzz-receiver-verified-checkout";
+        create_session_and_apply_model_at(
+            &mut agent,
+            &ctx,
+            verified,
+            None,
+            NewSessionChannelContext {
+                huddle_instructions: None,
+                canvas: None,
+                name: None,
+                scope: Some(&scope),
+                channel_type: Some("stream"),
+            },
+        )
+        .await
+        .expect("job session creation");
+        let wire: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&capture).expect("captured session/new"))
+                .expect("session/new JSON");
+        assert_eq!(wire["params"]["cwd"], verified);
+        let _ = std::fs::remove_file(capture);
+        agent.acp.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn invalidating_many_job_scopes_returns_session_state_to_baseline() {
+        let keys = nostr::Keys::generate();
+        let factory = factory(&keys);
+        let (acp, _) = scripted_agent(Some(true)).await;
+        let mut agent = owned(acp);
+        let mut scopes = Vec::new();
+        let mut urls = Vec::new();
+        for index in 0..12 {
+            let scope = SessionScope::Job {
+                channel_id: Uuid::new_v4(),
+                operation_id: Uuid::new_v4().to_string(),
+                request_event_id: format!("{index:064x}"),
+            };
+            let session = factory.start(&scope).await.expect("trusted session");
+            urls.push(session.url());
+            agent
+                .state
+                .sessions
+                .insert(scope.clone(), format!("sess-{index}"));
+            agent.state.trusted_mcp.insert(scope.clone(), session);
+            scopes.push(scope);
+        }
+        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+        for scope in &scopes {
+            pool.record_scope_owner(scope.clone(), 0);
+            assert_eq!(pool.invalidate_scope_session(scope), 1);
+        }
+        let agent = pool.agents_mut()[0].as_ref().unwrap();
+        assert!(agent.state.sessions.is_empty());
+        assert!(agent.state.trusted_mcp.is_empty());
+        assert!(pool.session_owners.is_empty());
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        for url in urls {
+            assert!(reqwest::Client::new().post(url).send().await.is_err());
+        }
     }
 }
 

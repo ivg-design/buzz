@@ -15,6 +15,7 @@
 
 use nostr::{Event, ToBech32};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -230,6 +231,9 @@ pub struct EventQueue {
     /// by `flush_next` / `has_flushable_work` (recover, not log-and-drop —
     /// the events were never delivered to the agent).
     withheld_native_steer: HashMap<SessionScope, Vec<QueuedEvent>>,
+    /// Receiver-verified local checkout for each durable one-shot job. This is
+    /// host-local execution metadata and never enters the signed scope/event.
+    job_working_directories: HashMap<SessionScope, PathBuf>,
     /// Duration after which an in-flight channel is auto-expired as orphaned.
     /// Must be strictly greater than `max_turn_duration` so a turn running to
     /// the hard cap returns via `mark_complete` before the backstop fires.
@@ -254,6 +258,7 @@ impl EventQueue {
             cancelled_batches: HashMap::new(),
             cancel_reasons: HashMap::new(),
             withheld_native_steer: HashMap::new(),
+            job_working_directories: HashMap::new(),
             in_flight_deadline: Duration::from_secs(DEFAULT_IN_FLIGHT_DEADLINE_SECS),
         }
     }
@@ -335,7 +340,16 @@ impl EventQueue {
     ///
     /// The on-disk job ledger bounds this input before it reaches the queue.
     /// Once accepted here, ordinary chat pressure cannot evict it.
+    #[cfg(test)]
     pub fn push_job(&mut self, event: QueuedEvent) -> bool {
+        self.push_job_inner(event, None)
+    }
+
+    pub fn push_job_at(&mut self, event: QueuedEvent, working_directory: PathBuf) -> bool {
+        self.push_job_inner(event, Some(working_directory))
+    }
+
+    fn push_job_inner(&mut self, event: QueuedEvent, working_directory: Option<PathBuf>) -> bool {
         debug_assert!(event.scope.is_job(), "push_job requires a Job scope");
         debug_assert_eq!(event.scope.channel_id(), event.channel_id);
         if !event.scope.is_job()
@@ -344,11 +358,34 @@ impl EventQueue {
         {
             return false;
         }
+        if let (Some(existing), Some(candidate)) = (
+            self.job_working_directories.get(&event.scope),
+            working_directory.as_ref(),
+        ) {
+            if existing != candidate {
+                return false;
+            }
+        }
+        let scope = event.scope.clone();
         self.queues
-            .entry(event.scope.clone())
+            .entry(scope.clone())
             .or_default()
             .push_back(event);
+        if let Some(working_directory) = working_directory {
+            self.job_working_directories
+                .insert(scope, working_directory);
+        }
         true
+    }
+
+    pub fn job_working_directory(&self, scope: &SessionScope) -> Option<&Path> {
+        self.job_working_directories
+            .get(scope)
+            .map(PathBuf::as_path)
+    }
+
+    pub fn clear_job_working_directory(&mut self, scope: &SessionScope) {
+        self.job_working_directories.remove(scope);
     }
 
     /// Total queued events across every scope belonging to `channel_id`.
@@ -858,6 +895,8 @@ impl EventQueue {
         self.cancel_reasons
             .retain(|s, _| s.channel_id() != channel_id);
         self.withheld_native_steer
+            .retain(|s, _| s.channel_id() != channel_id);
+        self.job_working_directories
             .retain(|s, _| s.channel_id() != channel_id);
         // Preserve in_flight_scopes AND in_flight_deadlines: the in-flight
         // task will eventually complete (calling mark_complete) or the deadline
@@ -2421,6 +2460,31 @@ mod tests {
         // The other channel's thread survives.
         let batch = q.flush_next().expect("other channel still has work");
         assert_eq!(batch.channel_id, other);
+    }
+
+    #[test]
+    fn drain_channel_clears_job_working_directories() {
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let channel = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let removed_scope = job(channel, "a");
+        let retained_scope = job(other, "b");
+        assert!(queue.push_job_at(
+            make_scoped(removed_scope.clone(), "removed"),
+            PathBuf::from("/tmp/removed"),
+        ));
+        assert!(queue.push_job_at(
+            make_scoped(retained_scope.clone(), "retained"),
+            PathBuf::from("/tmp/retained"),
+        ));
+
+        queue.drain_channel(channel);
+
+        assert!(queue.job_working_directory(&removed_scope).is_none());
+        assert_eq!(
+            queue.job_working_directory(&retained_scope),
+            Some(Path::new("/tmp/retained")),
+        );
     }
 
     #[test]

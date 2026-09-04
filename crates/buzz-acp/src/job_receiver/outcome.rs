@@ -215,7 +215,9 @@ fn valid_references(values: &[String]) -> bool {
             || value.starts_with(['/', '~'])
             || value.contains('\\')
             || value.split('/').any(|segment| segment == "..")
-            || value.split('/').any(|segment| segment == ".git")
+            || value
+                .split('/')
+                .any(|segment| segment.eq_ignore_ascii_case(".git"))
             || value.to_ascii_lowercase().starts_with("file:")
             || contains_secret(value)
         {

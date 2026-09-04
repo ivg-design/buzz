@@ -2,7 +2,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(target_os = "macos")]
 use std::ffi::OsStr;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::ffi::OsString;
 #[cfg(target_os = "macos")]
 use std::fs::{File, OpenOptions};
@@ -11,20 +11,20 @@ use std::io::Write as _;
 #[cfg(target_os = "macos")]
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::Path;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::path::PathBuf;
 use std::process::ExitStatus;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::process::Stdio;
 use std::sync::Arc;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::time::Duration;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use nostr::ToBech32;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
@@ -32,23 +32,23 @@ use zeroize::Zeroizing;
 use super::super::scope::TrustedGitCheckout;
 use super::super::{PrivilegedGitDisposition, TrustedRelay};
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const GIT_TIMEOUT: Duration = Duration::from_secs(300);
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const RECONCILIATION_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(target_os = "macos")]
 const CREDENTIAL_CAPTURE_TIMEOUT: Duration = Duration::from_secs(20);
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const IO_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const PROCESS_GROUP_POLL_INTERVAL: Duration = Duration::from_millis(10);
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const PROCESS_GROUP_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const CHECKOUT_INSPECTION_TIMEOUT: Duration = Duration::from_secs(5);
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const MAX_CHECKOUT_INSPECTION_BYTES: usize = 64 * 1024;
 #[cfg(target_os = "macos")]
 const MAX_CREDENTIAL_OUTPUT_BYTES: usize = 64 * 1024;
@@ -85,15 +85,12 @@ pub(in crate::trusted) async fn inspect_checkout_git(
     cwd: &Path,
     args: &[&str],
 ) -> Result<CheckoutInspectionOutput, String> {
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (cwd, args);
-        Err(
-            "local A2A checkout inspection is unavailable on this platform: descendant-safe Git inspection is implemented only on Unix"
-                .into(),
-        )
+        Err("local A2A checkout inspection is unavailable on this platform".into())
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         let git =
             resolve_system_git().ok_or_else(|| "trusted system git was not found".to_owned())?;
@@ -101,7 +98,7 @@ pub(in crate::trusted) async fn inspect_checkout_git(
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 async fn inspect_checkout_git_with(
     git: &Path,
     cwd: &Path,
@@ -119,9 +116,9 @@ async fn inspect_checkout_git_with(
     apply_config_environment(
         &mut command,
         &[
-            ("core.hooksPath".into(), "/dev/null".into()),
+            ("core.hooksPath".into(), null_device().into()),
             ("core.fsmonitor".into(), "false".into()),
-            ("core.attributesFile".into(), "/dev/null".into()),
+            ("core.attributesFile".into(), null_device().into()),
             ("credential.helper".into(), String::new()),
             ("protocol.allow".into(), "never".into()),
         ],
@@ -357,18 +354,18 @@ async fn local_git_output(
     input: Option<Zeroizing<Vec<u8>>>,
     cancellation: &CancellationToken,
 ) -> Result<GitOutput, String> {
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (relay, checkout, args, input, cancellation);
-        return Err("trusted Project Git is currently available only on Unix".into());
+        return Err("trusted Project Git is unavailable on this platform".into());
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         local_git_output_with_timeout(relay, checkout, args, input, GIT_TIMEOUT, cancellation).await
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 async fn local_git_output_with_timeout(
     relay: &TrustedRelay,
     checkout: &TrustedGitCheckout,
@@ -408,12 +405,12 @@ pub(super) async fn local_ref(
     full_ref: &str,
     cancellation: &CancellationToken,
 ) -> Result<Option<String>, String> {
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (relay, checkout, full_ref, cancellation);
-        return Err("trusted Project Git is currently available only on Unix".into());
+        return Err("trusted Project Git is unavailable on this platform".into());
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         let output = local_git_output_with_timeout(
             relay,
@@ -931,7 +928,7 @@ fn reconciled_ref_outcome(
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn parse_exact_ref_records(bytes: &[u8], expected_ref: &str) -> Result<Option<String>, String> {
     let mut object = None;
     for record in bytes
@@ -1043,14 +1040,14 @@ async fn import_private_packs(
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 struct ManagedOutput {
     status: ExitStatus,
     stdout: Zeroizing<Vec<u8>>,
     stderr: Zeroizing<Vec<u8>>,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 async fn run_managed(
     mut command: Command,
     input: Option<Zeroizing<Vec<u8>>>,
@@ -1064,18 +1061,25 @@ async fn run_managed(
     let pid = child.id();
     // The explicit paths below perform orderly bounded cleanup. This guard is
     // the last-resort group kill if the async future itself is dropped.
-    let mut process_group = ProcessGroupGuard::new(pid);
+    let mut process_group = match ProcessGroupGuard::new(&child, pid) {
+        Ok(group) => group,
+        Err(error) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(error);
+        }
+    };
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
         None => {
-            terminate_process_group(pid, &mut child).await?;
+            terminate_process_group(&process_group, &mut child).await?;
             return Err("trusted Git stdout unavailable".into());
         }
     };
     let stderr = match child.stderr.take() {
         Some(stderr) => stderr,
         None => {
-            terminate_process_group(pid, &mut child).await?;
+            terminate_process_group(&process_group, &mut child).await?;
             return Err("trusted Git stderr unavailable".into());
         }
     };
@@ -1119,13 +1123,13 @@ async fn run_managed(
         },
     };
     if !matches!(outcome, WaitOutcome::Status(_)) {
-        terminate_process_group(pid, &mut child).await?;
+        terminate_process_group(&process_group, &mut child).await?;
     } else {
         // Git has reaped its direct children before exiting. Kill any process
         // that nevertheless retained the dedicated group (and our pipe fds)
         // before joining the bounded I/O tasks.
-        kill_process_group(pid);
-        wait_for_process_group_exit(pid).await?;
+        process_group.terminate();
+        wait_for_process_group_exit(&process_group).await?;
     }
     // The guard is disarmed only after both the direct child and every member
     // of its dedicated process group have been proven gone.
@@ -1165,7 +1169,7 @@ async fn run_managed(
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 async fn read_bounded<R: tokio::io::AsyncRead + Unpin>(
     mut reader: R,
     limit: usize,
@@ -1196,27 +1200,27 @@ async fn read_bounded<R: tokio::io::AsyncRead + Unpin>(
     Ok(retained)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 async fn terminate_process_group(
-    pid: Option<u32>,
+    process_group: &ProcessGroupGuard,
     child: &mut tokio::process::Child,
 ) -> Result<(), String> {
-    kill_process_group(pid);
+    process_group.terminate();
     let _ = child.start_kill();
     match tokio::time::timeout(PROCESS_GROUP_CLEANUP_TIMEOUT, child.wait()).await {
         Ok(Ok(_)) => {}
         Ok(Err(_)) | Err(_) => abort_process_containment_failure(),
     }
-    wait_for_process_group_exit(pid).await
+    wait_for_process_group_exit(process_group).await
 }
 
 #[cfg(unix)]
-async fn wait_for_process_group_exit(pid: Option<u32>) -> Result<(), String> {
+async fn wait_for_process_group_exit(process_group: &ProcessGroupGuard) -> Result<(), String> {
     use nix::errno::Errno;
     use nix::sys::signal::killpg;
     use nix::unistd::Pid;
 
-    let Some(pid) = pid.and_then(|pid| i32::try_from(pid).ok()) else {
+    let Some(pid) = process_group.pid.and_then(|pid| i32::try_from(pid).ok()) else {
         abort_process_containment_failure();
     };
     let group = Pid::from_raw(pid);
@@ -1258,7 +1262,32 @@ fn apply_isolated_environment(command: &mut Command) {
         .env("GIT_NO_REPLACE_OBJECTS", "1");
 }
 
-#[cfg(unix)]
+#[cfg(windows)]
+fn apply_isolated_environment(command: &mut Command) {
+    command
+        .env_clear()
+        .env("PATH", isolated_path())
+        .env("LC_ALL", "C")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "")
+        .env("SSH_ASKPASS", "")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "NUL")
+        .env("GIT_PROTOCOL_FROM_USER", "0")
+        .env("GIT_ATTR_NOSYSTEM", "1")
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_NO_REPLACE_OBJECTS", "1");
+    if let Some(system_root) = windows_system_root() {
+        command.env("SystemRoot", system_root);
+    }
+    let temporary = std::env::temp_dir();
+    if temporary.is_absolute() && temporary.is_dir() {
+        command.env("TEMP", &temporary).env("TMP", temporary);
+    }
+}
+
+#[cfg(any(unix, windows))]
 fn local_git_config(relay: &TrustedRelay) -> Vec<(String, String)> {
     let signer = relay.signer_pubkey();
     let npub = relay
@@ -1267,10 +1296,10 @@ fn local_git_config(relay: &TrustedRelay) -> Vec<(String, String)> {
         .to_bech32()
         .unwrap_or_else(|_| signer.clone());
     vec![
-        ("core.hooksPath".into(), "/dev/null".into()),
+        ("core.hooksPath".into(), null_device().into()),
         ("core.fsmonitor".into(), "false".into()),
         ("core.askPass".into(), String::new()),
-        ("core.attributesFile".into(), "/dev/null".into()),
+        ("core.attributesFile".into(), null_device().into()),
         ("credential.helper".into(), String::new()),
         ("credential.https://github.com.helper".into(), String::new()),
         ("protocol.allow".into(), "never".into()),
@@ -1290,7 +1319,7 @@ fn local_git_config(relay: &TrustedRelay) -> Vec<(String, String)> {
     ]
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn apply_config_environment(command: &mut Command, config: &[(String, String)]) {
     command.env("GIT_CONFIG_COUNT", config.len().to_string());
     for (index, (key, value)) in config.iter().enumerate() {
@@ -1428,9 +1457,167 @@ fn resolve_system_git() -> Option<PathBuf> {
         .and_then(|candidate| candidate.canonicalize().ok())
 }
 
+#[cfg(windows)]
+fn resolve_system_git() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    for base in [
+        std::env::var_os("ProgramFiles"),
+        std::env::var_os("ProgramFiles(x86)"),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        candidates.push(PathBuf::from(&base).join("Git").join("cmd").join("git.exe"));
+        candidates.push(PathBuf::from(base).join("Git").join("bin").join("git.exe"));
+    }
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        candidates.push(
+            PathBuf::from(local)
+                .join("Programs")
+                .join("Git")
+                .join("cmd")
+                .join("git.exe"),
+        );
+    }
+    if let Some(registry) = windows_git_from_registry() {
+        candidates.insert(0, registry.join("cmd").join("git.exe"));
+        candidates.insert(1, registry.join("bin").join("git.exe"));
+    }
+    candidates.into_iter().find_map(windows_git_candidate)
+}
+
+#[cfg(windows)]
+fn windows_git_candidate(candidate: PathBuf) -> Option<PathBuf> {
+    if !candidate.is_absolute()
+        || is_windows_apps_alias(&candidate)
+        || !candidate
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("git.exe"))
+        || !candidate.is_file()
+    {
+        return None;
+    }
+    let canonical = candidate.canonicalize().ok()?;
+    (!is_windows_apps_alias(&canonical)).then_some(canonical)
+}
+
+#[cfg(windows)]
+fn is_windows_apps_alias(path: &Path) -> bool {
+    let mut components = path.components().peekable();
+    while components.peek().is_some() {
+        let mut remaining = components.clone();
+        if remaining.next().is_some_and(|component| {
+            component
+                .as_os_str()
+                .to_string_lossy()
+                .eq_ignore_ascii_case("Microsoft")
+        }) && remaining.next().is_some_and(|component| {
+            component
+                .as_os_str()
+                .to_string_lossy()
+                .eq_ignore_ascii_case("WindowsApps")
+        }) {
+            return true;
+        }
+        components.next();
+    }
+    false
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn windows_git_from_registry() -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt as _;
+    use windows_sys::Win32::Foundation::{ERROR_MORE_DATA, ERROR_SUCCESS};
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE,
+        KEY_READ,
+    };
+
+    let key: Vec<u16> = "SOFTWARE\\GitForWindows"
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    let value: Vec<u16> = "InstallPath".encode_utf16().chain(Some(0)).collect();
+    // SAFETY: key/value buffers remain null terminated for each call and every
+    // successfully opened registry handle is closed before returning.
+    unsafe {
+        for hive in [HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER] {
+            let mut handle = std::ptr::null_mut();
+            if RegOpenKeyExW(hive, key.as_ptr(), 0, KEY_READ, &mut handle) != ERROR_SUCCESS {
+                continue;
+            }
+            let mut byte_len = 0;
+            let status = RegQueryValueExW(
+                handle,
+                value.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut byte_len,
+            );
+            if (status != ERROR_SUCCESS && status != ERROR_MORE_DATA) || byte_len == 0 {
+                RegCloseKey(handle);
+                continue;
+            }
+            let mut data = vec![0_u16; (byte_len as usize).div_ceil(2)];
+            let status = RegQueryValueExW(
+                handle,
+                value.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                data.as_mut_ptr().cast(),
+                &mut byte_len,
+            );
+            RegCloseKey(handle);
+            if status != ERROR_SUCCESS {
+                continue;
+            }
+            while data.last() == Some(&0) {
+                data.pop();
+            }
+            let root = PathBuf::from(OsString::from_wide(&data));
+            if root.is_absolute() && root.is_dir() {
+                return Some(root);
+            }
+        }
+    }
+    None
+}
+
 #[cfg(unix)]
 fn isolated_path() -> OsString {
     "/usr/bin:/bin:/usr/sbin:/sbin".into()
+}
+
+#[cfg(windows)]
+fn isolated_path() -> OsString {
+    let mut directories = Vec::new();
+    if let Some(git) = resolve_system_git() {
+        if let Some(parent) = git.parent() {
+            directories.push(parent.to_path_buf());
+        }
+    }
+    if let Some(root) = windows_system_root() {
+        directories.push(root.join("System32"));
+    }
+    std::env::join_paths(directories).unwrap_or_default()
+}
+
+#[cfg(windows)]
+fn windows_system_root() -> Option<PathBuf> {
+    let root = PathBuf::from(std::env::var_os("SystemRoot")?);
+    (root.is_absolute() && root.is_dir()).then_some(root)
+}
+
+#[cfg(unix)]
+fn null_device() -> &'static str {
+    "/dev/null"
+}
+
+#[cfg(windows)]
+fn null_device() -> &'static str {
+    "NUL"
 }
 
 #[cfg(target_os = "macos")]
@@ -1443,6 +1630,12 @@ fn set_process_group(command: &mut Command) {
     command.process_group(0).kill_on_drop(true);
 }
 
+#[cfg(windows)]
+fn set_process_group(command: &mut Command) {
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NO_WINDOW).kill_on_drop(true);
+}
+
 #[cfg(unix)]
 struct ProcessGroupGuard {
     pid: Option<u32>,
@@ -1450,8 +1643,15 @@ struct ProcessGroupGuard {
 
 #[cfg(unix)]
 impl ProcessGroupGuard {
-    fn new(pid: Option<u32>) -> Self {
-        Self { pid }
+    fn new(_child: &tokio::process::Child, pid: Option<u32>) -> Result<Self, String> {
+        if pid.is_none() {
+            return Err("trusted Git process identity is unavailable".into());
+        }
+        Ok(Self { pid })
+    }
+
+    fn terminate(&self) {
+        kill_process_group(self.pid);
     }
 
     fn disarm(&mut self) {
@@ -1523,7 +1723,148 @@ fn reap_process_group_blocking(pid: Option<u32>) {
     }
 }
 
-#[cfg(unix)]
+#[cfg(windows)]
+struct ProcessGroupGuard {
+    job: windows_sys::Win32::Foundation::HANDLE,
+    armed: bool,
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+unsafe impl Send for ProcessGroupGuard {}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+unsafe impl Sync for ProcessGroupGuard {}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+impl ProcessGroupGuard {
+    fn new(child: &tokio::process::Child, _pid: Option<u32>) -> Result<Self, String> {
+        use std::mem::{size_of, zeroed};
+        use windows_sys::Win32::Foundation::{CloseHandle, FALSE, HANDLE};
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+
+        let process = child
+            .raw_handle()
+            .ok_or_else(|| "trusted Git process handle is unavailable".to_owned())?
+            as HANDLE;
+        // SAFETY: the anonymous job has no caller-owned security attributes or
+        // name. `info` is the exact documented Win32 layout and `process` is
+        // borrowed from the live Tokio child until assignment completes.
+        unsafe {
+            let job: HANDLE = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job.is_null() {
+                return Err("failed to create trusted Git process container".into());
+            }
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                std::ptr::addr_of!(info).cast(),
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            ) == FALSE
+                || AssignProcessToJobObject(job, process) == FALSE
+            {
+                CloseHandle(job);
+                return Err("failed to contain trusted Git process tree".into());
+            }
+            Ok(Self { job, armed: true })
+        }
+    }
+
+    fn terminate(&self) {
+        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+        if self.armed && !self.job.is_null() {
+            // SAFETY: `job` is live until this guard's Drop closes it.
+            unsafe {
+                TerminateJobObject(self.job, 137);
+            }
+        }
+    }
+
+    fn active_processes(&self) -> Result<u32, String> {
+        use std::mem::{size_of, zeroed};
+        use windows_sys::Win32::Foundation::FALSE;
+        use windows_sys::Win32::System::JobObjects::{
+            JobObjectBasicAccountingInformation, QueryInformationJobObject,
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+        };
+        // SAFETY: `info` has the exact queried layout and the output size
+        // matches it. The job handle remains owned by this guard.
+        unsafe {
+            let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = zeroed();
+            if QueryInformationJobObject(
+                self.job,
+                JobObjectBasicAccountingInformation,
+                std::ptr::addr_of_mut!(info).cast(),
+                size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                std::ptr::null_mut(),
+            ) == FALSE
+            {
+                return Err("failed to inspect trusted Git process container".into());
+            }
+            Ok(info.ActiveProcesses)
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(windows)]
+async fn wait_for_process_group_exit(process_group: &ProcessGroupGuard) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + PROCESS_GROUP_CLEANUP_TIMEOUT;
+    loop {
+        if process_group.active_processes()? == 0 {
+            return Ok(());
+        }
+        process_group.terminate();
+        if tokio::time::Instant::now() >= deadline {
+            abort_process_containment_failure();
+        }
+        tokio::time::sleep(PROCESS_GROUP_POLL_INTERVAL).await;
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        if self.job.is_null() {
+            return;
+        }
+        if self.armed {
+            self.terminate();
+            let deadline = std::time::Instant::now() + PROCESS_GROUP_CLEANUP_TIMEOUT;
+            loop {
+                match self.active_processes() {
+                    Ok(0) => break,
+                    Ok(_) => self.terminate(),
+                    Err(_) => abort_process_containment_failure(),
+                }
+                if std::time::Instant::now() >= deadline {
+                    abort_process_containment_failure();
+                }
+                std::thread::sleep(PROCESS_GROUP_POLL_INTERVAL);
+            }
+        }
+        // SAFETY: the handle is owned by this guard and closed exactly once.
+        unsafe {
+            CloseHandle(self.job);
+        }
+        self.job = std::ptr::null_mut();
+    }
+}
+
+#[cfg(any(unix, windows))]
 fn abort_process_containment_failure() -> ! {
     // This path means an active trusted child may still hold the operation's
     // privilege lease. Continuing would be a boundary violation; abort is the
@@ -1532,7 +1873,7 @@ fn abort_process_containment_failure() -> ! {
     std::process::abort()
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn local_error(bytes: &[u8]) -> String {
     let message = String::from_utf8_lossy(bytes).trim().to_owned();
     if message.is_empty() {
@@ -1558,6 +1899,155 @@ pub(super) fn text(bytes: &[u8]) -> Result<&str, String> {
     std::str::from_utf8(bytes)
         .map(str::trim)
         .map_err(|_| "trusted Git output was not UTF-8".into())
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use crate::trusted::{GrantSet, TrustedConfig};
+
+    fn run_test_git(cwd: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new(resolve_system_git().expect("Git for Windows"))
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "NUL")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .expect("run test Git");
+        assert!(
+            output.status.success(),
+            "test Git failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .expect("UTF-8 test Git output")
+            .trim()
+            .to_owned()
+    }
+
+    fn test_relay() -> TrustedRelay {
+        let keys = nostr::Keys::generate();
+        TrustedRelay::new(TrustedConfig {
+            relay_url: "http://127.0.0.1:1".to_owned(),
+            owner_pubkey: keys.public_key().to_hex(),
+            keys,
+            auth_tag: None,
+            auth_tag_json: None,
+            owner_github_login: None,
+            grants: GrantSet::default(),
+            a2a_channel_id: None,
+            session_channel_id: None,
+            session_thread_root_id: None,
+            job_operation_id: None,
+            job_request_event_id: None,
+            session_working_directory: None,
+            github_credentials: Default::default(),
+            allow_insecure_loopback: true,
+        })
+        .expect("test relay")
+    }
+
+    #[tokio::test]
+    async fn checkout_inspection_and_local_commit_run_in_a_windows_job() {
+        let repository = tempfile::tempdir().expect("repository");
+        run_test_git(
+            repository.path(),
+            &["init", "--quiet", "--initial-branch=main"],
+        );
+        std::fs::write(repository.path().join("tracked.txt"), b"windows\n").expect("write fixture");
+        run_test_git(repository.path(), &["add", "--", "tracked.txt"]);
+        run_test_git(
+            repository.path(),
+            &[
+                "-c",
+                "user.name=Windows Test",
+                "-c",
+                "user.email=windows@example.invalid",
+                "-c",
+                "commit.gpgSign=false",
+                "commit",
+                "--quiet",
+                "--no-gpg-sign",
+                "-m",
+                "fixture",
+            ],
+        );
+        let head = run_test_git(repository.path(), &["rev-parse", "HEAD"]);
+        let root = repository
+            .path()
+            .canonicalize()
+            .expect("canonical checkout");
+        let checkout = TrustedGitCheckout {
+            root: root.clone(),
+            git_common_dir: root.join(".git").canonicalize().expect("Git directory"),
+            repository: "https://github.com/mysteropodes/nemo".to_owned(),
+            base_sha: head.clone(),
+            head_sha: head.clone(),
+            branch: "main".to_owned(),
+            path_prefixes: vec!["tracked.txt".to_owned()],
+            repository_wide: true,
+        };
+        let inspected = inspect_checkout_git(
+            &root,
+            &["rev-parse", "--verify", &format!("{head}^{{commit}}")],
+        )
+        .await
+        .expect("bounded checkout inspection");
+        assert!(inspected.status.success());
+        assert_eq!(text(&inspected.stdout).expect("inspection text"), head);
+        let relay = test_relay();
+        let output = git_output(
+            &relay,
+            &checkout,
+            &["rev-parse", "HEAD"],
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("trusted local Git");
+        assert_eq!(text(&output.stdout).expect("Git text"), head);
+
+        std::fs::write(root.join("tracked.txt"), b"windows changed\n").expect("update fixture");
+        run_test_git(&root, &["add", "--", "tracked.txt"]);
+        let tree = git_output(
+            &relay,
+            &checkout,
+            &["write-tree"],
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("write tree");
+        let tree = text(&tree.stdout).expect("tree id").to_owned();
+        let commit = git_output(
+            &relay,
+            &checkout,
+            &[
+                "commit-tree",
+                &tree,
+                "-p",
+                &head,
+                "--no-gpg-sign",
+                "-m",
+                "trusted Windows commit",
+            ],
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("create commit");
+        let commit = text(&commit.stdout).expect("commit id").to_owned();
+        let outcome = update_local_ref_reconciled(
+            &relay,
+            &checkout,
+            "refs/heads/main",
+            Some(head),
+            commit.clone(),
+            "test: trusted Windows ref update",
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(outcome.disposition, PrivilegedGitDisposition::Applied);
+        assert_eq!(outcome.observed_object.as_deref(), Some(commit.as_str()));
+    }
 }
 
 #[cfg(all(test, target_os = "macos"))]

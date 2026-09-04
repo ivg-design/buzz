@@ -1480,6 +1480,57 @@ fn resolve_reply_anchor(
     )
 }
 
+/// Resolve the harness-owned chat destination for the current turn.
+///
+/// This is shared by prompt framing and the trusted `buzz_chat_send` binding so
+/// the model-visible instruction cannot disagree with the destination enforced
+/// by the signer. Human-facing thread replies retain their canonical root;
+/// the top-level placement policy and agent-only nesting rules decide when no
+/// root is enforced.
+fn resolve_turn_reply_anchor(
+    last_event: &BatchEvent,
+    thread_tags: &ThreadTags,
+    is_dm: bool,
+    reply_placement: ReplyPlacement,
+    profile_lookup: Option<&PromptProfileLookup>,
+) -> Option<String> {
+    if is_dm {
+        return thread_tags.root_event_id.clone().or_else(|| {
+            (reply_placement == ReplyPlacement::Thread).then(|| last_event.event.id.to_hex())
+        });
+    }
+    if reply_placement == ReplyPlacement::Timeline && thread_tags.root_event_id.is_none() {
+        return None;
+    }
+
+    resolve_reply_anchor(
+        &last_event.event.pubkey.to_hex(),
+        thread_tags,
+        &last_event.event.id.to_hex(),
+        profile_lookup,
+    )
+}
+
+/// Return the exact thread root the trusted chat tool must enforce for this
+/// batch. `None` means the current channel or DM timeline.
+pub(crate) fn trusted_chat_thread_root(
+    batch: &FlushBatch,
+    args: &FormatPromptArgs<'_>,
+) -> Option<String> {
+    let last_event = batch.events.last()?;
+    let thread_tags = parse_thread_tags(&last_event.event);
+    let is_dm = args
+        .channel_info
+        .is_some_and(|channel| channel.channel_type == "dm");
+    resolve_turn_reply_anchor(
+        last_event,
+        &thread_tags,
+        is_dm,
+        args.reply_placement,
+        args.profile_lookup,
+    )
+}
+
 /// Maximum length (in characters) of a channel description rendered into `<context>`.
 ///
 /// Limits prompt bloat from unusually long descriptions. Multi-line
@@ -2084,23 +2135,13 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
     // Agent↔agent turns get no forced anchor — deep nesting is intentional
     // there. DMs follow the configured top-level placement, while explicit DM
     // threads stay anchored to their canonical root.
-    let sender_pubkey = last_event.event.pubkey.to_hex();
-    let reply_anchor = if is_dm {
-        thread_tags.root_event_id.clone().or_else(|| {
-            (args.reply_placement == ReplyPlacement::Thread).then(|| last_event.event.id.to_hex())
-        })
-    } else if args.reply_placement == ReplyPlacement::Timeline
-        && thread_tags.root_event_id.is_none()
-    {
-        None
-    } else {
-        resolve_reply_anchor(
-            &sender_pubkey,
-            &thread_tags,
-            &last_event.event.id.to_hex(),
-            args.profile_lookup,
-        )
-    };
+    let reply_anchor = resolve_turn_reply_anchor(
+        last_event,
+        &thread_tags,
+        is_dm,
+        args.reply_placement,
+        args.profile_lookup,
+    );
     sections.push(format_context_hints(
         &batch.scope,
         args.channel_info,

@@ -794,6 +794,7 @@ impl QueuedNormalListenerEvent {
     fn steer_or_interrupt(
         self,
         handling: MultipleEventHandling,
+        reply_placement: reply_placement::ReplyPlacement,
         owner: Option<&str>,
         pool: &mut AgentPool,
         queue: &mut EventQueue,
@@ -805,7 +806,20 @@ impl QueuedNormalListenerEvent {
         let Some(signal) = mode_gate_signal(handling, &self.effective_author, owner) else {
             return;
         };
+        let route_is_stable = !matches!(signal, ControlSignal::Steer)
+            || pool.native_steer_preserves_chat_destination(
+                &self.scope,
+                &self.event_for_steer,
+                reply_placement,
+            );
+        if matches!(signal, ControlSignal::Steer) && !route_is_stable {
+            tracing::info!(
+                scope = %self.scope.telemetry_label(),
+                "incoming message changes the trusted chat destination; using cancel+merge"
+            );
+        }
         let native_attempted = matches!(signal, ControlSignal::Steer)
+            && route_is_stable
             && try_native_steer(
                 pool,
                 queue,
@@ -4278,6 +4292,7 @@ async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
                             // decision.
                             queued.steer_or_interrupt(
                                 config.multiple_event_handling,
+                                config.reply_placement,
                                 owner_cache.get(),
                                 &mut pool,
                                 &mut queue,

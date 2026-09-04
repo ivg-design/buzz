@@ -1129,6 +1129,37 @@ impl AgentPool {
             .map_err(|e| SteerError::Transport(e.to_string()))
     }
 
+    /// Whether a non-cancelling steer can keep using the trusted chat route
+    /// already bound to the in-flight turn.
+    ///
+    /// A channel-scoped provider session can receive both top-level messages
+    /// and explicit thread follow-ups. If those destinations differ, the
+    /// current turn must take the cancel+merge path so `run_prompt_task` can
+    /// bind the verified destination before the agent can call
+    /// `buzz_chat_send` again.
+    ///
+    /// When the old turn is still active, the fallback waits for
+    /// `cancel_with_cleanup_grace`, then invalidates and drops its trusted MCP
+    /// capability before returning the agent to the pool. A timed-out drain
+    /// also invalidates that capability, so an old tool call cannot observe
+    /// the next turn's mutable route.
+    pub fn native_steer_preserves_chat_destination(
+        &self,
+        scope: &SessionScope,
+        incoming_event: &nostr::Event,
+        reply_placement: crate::reply_placement::ReplyPlacement,
+    ) -> bool {
+        let Some(active_batch) = self
+            .task_map
+            .values()
+            .find(|meta| meta.scope.as_ref() == Some(scope))
+            .and_then(|meta| meta.recoverable_batch.as_ref())
+        else {
+            return false;
+        };
+        native_steer_preserves_chat_destination(active_batch, incoming_event, reply_placement)
+    }
+
     /// Durably associate a successful steer with the exact ACP session that
     /// accepted it. Acks may arrive before or after the prompt result: while
     /// the task is in flight we stage the delivery in `TaskMeta`; after return
@@ -1327,6 +1358,37 @@ impl AgentPool {
         agent.state.invalidate_scope(&scope);
         self.session_owners.remove(&scope);
         IdleSwitchResult::Switched
+    }
+}
+
+fn native_steer_preserves_chat_destination(
+    active_batch: &FlushBatch,
+    incoming_event: &nostr::Event,
+    reply_placement: crate::reply_placement::ReplyPlacement,
+) -> bool {
+    if active_batch.scope.is_job() {
+        return false;
+    }
+
+    let Some(active_event) = active_batch.events.last() else {
+        return false;
+    };
+    let active_root = crate::queue::parse_thread_tags(&active_event.event).root_event_id;
+    let incoming_root = crate::queue::parse_thread_tags(incoming_event).root_event_id;
+
+    match reply_placement {
+        // Top-level timeline turns always share the unthreaded destination.
+        // Any explicit thread may resolve either to its root (human-facing) or
+        // the timeline (agent-only), based on the async profile lookup that is
+        // deliberately unavailable at ingress. Cancel+merge is therefore the
+        // only route-safe choice for a threaded delta.
+        crate::reply_placement::ReplyPlacement::Timeline => {
+            active_root.is_none() && incoming_root.is_none()
+        }
+        // Under thread placement even top-level human turns use their own
+        // event ID, while agent-only turns may use the timeline. The ingress
+        // path cannot prove equality without the prompt's profile lookup.
+        crate::reply_placement::ReplyPlacement::Thread => false,
     }
 }
 
@@ -3394,25 +3456,46 @@ pub async fn run_prompt_task(
             );
         }
 
-        crate::queue::format_prompt(
-            b,
-            &crate::queue::FormatPromptArgs {
-                leading_project_instructions: standing.leading_project_instructions,
-                agent_core: standing.agent_core,
-                huddle_instructions: standing.huddle_instructions,
-                channel_info: channel_info.as_ref(),
-                conversation_context: conversation_context.as_ref(),
-                conversation_context_had_delivered_events,
-                profile_lookup: profile_lookup.as_ref(),
-                reply_placement: ctx.reply_placement,
-                has_system_prompt_support: agent.has_system_prompt_support(),
-                base_prompt: standing.base_prompt,
-                system_prompt: standing.system_prompt,
-                team_instructions: standing.team_instructions,
-                agent_canvas: standing.agent_canvas,
-                standing_context_sent,
-            },
-        )
+        let format_args = crate::queue::FormatPromptArgs {
+            leading_project_instructions: standing.leading_project_instructions,
+            agent_core: standing.agent_core,
+            huddle_instructions: standing.huddle_instructions,
+            channel_info: channel_info.as_ref(),
+            conversation_context: conversation_context.as_ref(),
+            conversation_context_had_delivered_events,
+            profile_lookup: profile_lookup.as_ref(),
+            reply_placement: ctx.reply_placement,
+            has_system_prompt_support: agent.has_system_prompt_support(),
+            base_prompt: standing.base_prompt,
+            system_prompt: standing.system_prompt,
+            team_instructions: standing.team_instructions,
+            agent_canvas: standing.agent_canvas,
+            standing_context_sent,
+        };
+        let chat_thread_root = crate::queue::trusted_chat_thread_root(b, &format_args);
+        if !b.scope.is_job() {
+            if let Some(session) = agent.state.trusted_mcp.get(&b.scope) {
+                if let Err(error) = session.set_chat_thread_root_id(chat_thread_root.as_deref()) {
+                    tracing::error!(
+                        target: "pool::session",
+                        scope = %b.scope.telemetry_label(),
+                        "failed to bind trusted chat destination: {error}"
+                    );
+                    send_prompt_result(
+                        &result_tx,
+                        &turn_id,
+                        agent,
+                        source,
+                        PromptOutcome::Error(AcpError::Protocol(format!(
+                            "failed to bind trusted chat destination: {error}"
+                        ))),
+                        requeue_batch_if_queue(&ctx, batch.clone()),
+                    );
+                    return;
+                }
+            }
+        }
+        crate::queue::format_prompt(b, &format_args)
     } else {
         // Should not happen — batch is None only for heartbeats which have prompt_text.
         // Return the agent to the pool to prevent a permanent slot leak.
@@ -8145,6 +8228,56 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             .tags(tags)
             .sign_with_keys(&keys)
             .unwrap()
+    }
+
+    fn thread_reply(root: &str) -> nostr::Event {
+        signed_event_with_tags(vec![
+            vec!["e".into(), root.into(), String::new(), "root".into()],
+            vec!["e".into(), root.into(), String::new(), "reply".into()],
+        ])
+    }
+
+    #[test]
+    fn native_steer_only_reuses_a_provably_stable_trusted_chat_destination() {
+        let channel_id = Uuid::new_v4();
+        let scope = conv(channel_id);
+        let root_a = "a".repeat(64);
+        let root_b = "b".repeat(64);
+        let top_level = signed_event_with_tags(vec![]);
+        let active_top_level = batch_with_scope(scope.clone(), top_level.clone());
+
+        assert!(native_steer_preserves_chat_destination(
+            &active_top_level,
+            &signed_event_with_tags(vec![]),
+            crate::reply_placement::ReplyPlacement::Timeline,
+        ));
+        assert!(!native_steer_preserves_chat_destination(
+            &active_top_level,
+            &thread_reply(&root_a),
+            crate::reply_placement::ReplyPlacement::Timeline,
+        ));
+        assert!(!native_steer_preserves_chat_destination(
+            &active_top_level,
+            &signed_event_with_tags(vec![]),
+            crate::reply_placement::ReplyPlacement::Thread,
+        ));
+
+        let active_thread = batch_with_scope(scope, thread_reply(&root_a));
+        assert!(!native_steer_preserves_chat_destination(
+            &active_thread,
+            &thread_reply(&root_a),
+            crate::reply_placement::ReplyPlacement::Timeline,
+        ));
+        assert!(!native_steer_preserves_chat_destination(
+            &active_thread,
+            &thread_reply(&root_b),
+            crate::reply_placement::ReplyPlacement::Timeline,
+        ));
+        assert!(!native_steer_preserves_chat_destination(
+            &active_thread,
+            &top_level,
+            crate::reply_placement::ReplyPlacement::Timeline,
+        ));
     }
 
     #[test]

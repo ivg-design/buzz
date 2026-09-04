@@ -89,6 +89,7 @@ impl TrustedMcpFactory {
         let privilege_gate = self.job_privileges.for_session(scope, working_directory)?;
         let handler =
             TrustedSessionMcp::new_with_privilege_gate(relay, cancellation.clone(), privilege_gate);
+        let routing = handler.clone();
         let expires_at = tokio::time::Instant::now() + self.lifetime;
         let token = Arc::new(SessionSecret::generate()?);
         let auth = AuthState {
@@ -128,6 +129,7 @@ impl TrustedMcpFactory {
             token,
             expires_at,
             cancellation,
+            routing,
         })
     }
 }
@@ -139,6 +141,7 @@ pub struct TrustedMcpSession {
     token: Arc<SessionSecret>,
     expires_at: tokio::time::Instant,
     cancellation: CancellationToken,
+    routing: TrustedSessionMcp,
 }
 
 impl TrustedMcpSession {
@@ -162,6 +165,13 @@ impl TrustedMcpSession {
                 .expires_at
                 .checked_duration_since(tokio::time::Instant::now())
                 .is_some_and(|remaining| remaining >= duration)
+    }
+
+    /// Update only the harness-owned chat destination for the next turn.
+    /// The channel, signer, repository, A2A grants, and job scope remain fixed
+    /// for the lifetime of this capability.
+    pub fn set_chat_thread_root_id(&self, thread_root_id: Option<&str>) -> Result<(), String> {
+        self.routing.set_chat_thread_root_id(thread_root_id)
     }
 
     #[cfg(test)]

@@ -14,15 +14,18 @@ name = "buzz-dev-mcp"
 path = "src/main.rs"
 
 [dependencies]
-buzz-cli = { path = "../buzz-cli" }
-git-credential-nostr = { path = "../git-credential-nostr" }
-git-sign-nostr = { path = "../git-sign-nostr" }
 nostr = { workspace = true }
-zeroize = { workspace = true }
+buzz-sdk = { workspace = true }
+buzz-core = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+zeroize = { workspace = true }
 rmcp = { workspace = true }
 schemars = { workspace = true }
 similar = "3"
@@ -38,7 +41,6 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 reqwest = { workspace = true }
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
-buzz-core = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", default-features = false, features = ["signal", "process"] }

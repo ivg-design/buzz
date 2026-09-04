@@ -331,11 +331,31 @@ impl EventQueue {
         true
     }
 
+    /// Admit one durable job without chat dedup or eviction semantics.
+    ///
+    /// The on-disk job ledger bounds this input before it reaches the queue.
+    /// Once accepted here, ordinary chat pressure cannot evict it.
+    pub fn push_job(&mut self, event: QueuedEvent) -> bool {
+        debug_assert!(event.scope.is_job(), "push_job requires a Job scope");
+        debug_assert_eq!(event.scope.channel_id(), event.channel_id);
+        if !event.scope.is_job()
+            || self.in_flight_scopes.contains(&event.scope)
+            || self.queues.contains_key(&event.scope)
+        {
+            return false;
+        }
+        self.queues
+            .entry(event.scope.clone())
+            .or_default()
+            .push_back(event);
+        true
+    }
+
     /// Total queued events across every scope belonging to `channel_id`.
     fn channel_event_total(&self, channel_id: Uuid) -> usize {
         self.queues
             .iter()
-            .filter(|(s, _)| s.channel_id() == channel_id)
+            .filter(|(s, _)| s.channel_id() == channel_id && !s.is_job())
             .map(|(_, q)| q.len())
             .sum()
     }
@@ -349,7 +369,7 @@ impl EventQueue {
             let victim = self
                 .queues
                 .iter()
-                .filter(|(s, q)| s.channel_id() == channel_id && !q.is_empty())
+                .filter(|(s, q)| s.channel_id() == channel_id && !s.is_job() && !q.is_empty())
                 .min_by_key(|(_, q)| q.front().unwrap().received_at)
                 .map(|(s, _)| s.clone());
             let Some(scope) = victim else { break };
@@ -607,7 +627,7 @@ impl EventQueue {
         // Enforce per-scope cap: trim oldest (back) events if requeue pushed
         // the partition over the limit. Without this, repeated requeue+push
         // cycles can grow the queue unboundedly.
-        while queue.len() > MAX_PENDING_PER_SCOPE {
+        while !scope.is_job() && queue.len() > MAX_PENDING_PER_SCOPE {
             queue.pop_back();
             tracing::warn!(
                 channel_id = %channel_id,
@@ -669,7 +689,7 @@ impl EventQueue {
             });
         }
         // Enforce per-scope cap: trim newest (back) events if over limit.
-        while queue.len() > MAX_PENDING_PER_SCOPE {
+        while !scope.is_job() && queue.len() > MAX_PENDING_PER_SCOPE {
             queue.pop_back();
             tracing::warn!(
                 channel_id = %channel_id,
@@ -1308,6 +1328,12 @@ pub(crate) fn format_event_block(
 
     let kind = be.event.kind.as_u16() as u32;
     let event_id = be.event.id.to_hex();
+
+    if kind == buzz_core::kind::KIND_JOB_REQUEST {
+        return crate::job_receiver::format_job_prompt(&be.event).unwrap_or_else(|| {
+            "Invalid signed agent-job request. Do not execute or interpret its content.".into()
+        });
+    }
 
     let channel_display = match channel_info {
         Some(ci) => format!("{} (#{channel_id})", ci.name),
@@ -2262,6 +2288,31 @@ mod tests {
             channel_id,
             root_event_id: root.to_string(),
         }
+    }
+
+    fn job(channel_id: Uuid, suffix: &str) -> SessionScope {
+        SessionScope::Job {
+            channel_id,
+            operation_id: format!("operation-{suffix}"),
+            request_event_id: format!("{suffix:0>64}"),
+        }
+    }
+
+    #[test]
+    fn durable_job_bypasses_chat_drop_mode_and_is_not_evicted_by_chat_cap() {
+        let channel_id = Uuid::new_v4();
+        let mut queue = EventQueue::new(DedupMode::Drop);
+        queue.in_flight_scopes.insert(conv(channel_id));
+        let job_scope = job(channel_id, "a");
+        assert!(queue.push_job(make_scoped(job_scope.clone(), "job")));
+        assert!(!queue.push_job(make_scoped(job_scope.clone(), "duplicate")));
+
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        assert!(queue.push_job(make_scoped(job_scope.clone(), "job")));
+        for index in 0..=MAX_PENDING_PER_CHANNEL {
+            queue.push(make_queued(channel_id, &format!("chat-{index}")));
+        }
+        assert_eq!(queue.queued_event_count(&job_scope), 1);
     }
 
     /// Build a QueuedEvent for an explicit scope.

@@ -53,6 +53,7 @@ url = { workspace = true }
 sha2 = { workspace = true }
 base64 = "0.22"
 hex = { workspace = true }
+fs2 = "0.4"
 
 # Logging
 tracing = { workspace = true }

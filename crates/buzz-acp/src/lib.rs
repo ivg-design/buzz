@@ -4,6 +4,8 @@ mod acp;
 mod config;
 mod engram_fetch;
 mod filter;
+mod job_receiver;
+mod job_runtime;
 mod observer;
 mod pool;
 mod pool_lifecycle;
@@ -25,8 +27,9 @@ use std::time::Duration;
 use acp::{AcpClient, EnvVar, McpServer};
 use anyhow::{ensure, Context, Result};
 use buzz_core::kind::{
-    KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION, KIND_STREAM_MESSAGE,
-    KIND_STREAM_REMINDER, KIND_WORKFLOW_APPROVAL_REQUESTED,
+    is_job_kind, KIND_JOB_CANCEL, KIND_JOB_REQUEST, KIND_MEMBER_ADDED_NOTIFICATION,
+    KIND_MEMBER_REMOVED_NOTIFICATION, KIND_STREAM_MESSAGE, KIND_STREAM_REMINDER,
+    KIND_WORKFLOW_APPROVAL_REQUESTED,
 };
 use buzz_core::observer::{
     decrypt_observer_payload, encrypt_observer_payload, OBSERVER_FRAME_TELEMETRY,
@@ -34,8 +37,8 @@ use buzz_core::observer::{
 };
 use clap::Parser;
 use config::{
-    AuthAgentArgs, AuthMethodsArgs, AuthenticateArgs, Config, DedupMode, ModelsArgs,
-    MultipleEventHandling, RespondTo, SubscribeMode,
+    AuthAgentArgs, AuthMethodsArgs, AuthenticateArgs, Config, ModelsArgs, MultipleEventHandling,
+    RespondTo, SubscribeMode,
 };
 use filter::SubscriptionRule;
 use futures_util::FutureExt;
@@ -233,6 +236,61 @@ async fn is_owner_or_sibling(
     let is_sibling = check_sibling_via_profile(author, my_owner, rest_client).await;
     owner_cache.cache_sibling(author.to_string(), is_sibling);
     is_sibling
+}
+
+async fn admit_job_to_queue(
+    receiver: &job_receiver::JobReceiver,
+    queue: &mut EventQueue,
+    channel_id: Uuid,
+    event: nostr::Event,
+    project: Option<&prompt_project::PromptProjectInfo>,
+) -> Result<Option<(scope::SessionScope, job_receiver::JobEmitter)>, job_receiver::ReceiverError> {
+    let job_receiver::HandleOutcome::Dispatch(dispatch) =
+        receiver.handle_request(channel_id, event, project).await?
+    else {
+        return Ok(None);
+    };
+    let scope = dispatch.scope.clone();
+    let event_id = dispatch.event.id.to_hex();
+    if !queue.push_job(QueuedEvent {
+        channel_id,
+        scope: scope.clone(),
+        event: dispatch.event,
+        received_at: std::time::Instant::now(),
+        prompt_tag: "agent-job".into(),
+    }) {
+        return Ok(None);
+    }
+    match receiver.mark_prompt_started(&dispatch.claim).await {
+        Ok(true) => {
+            if let Err(error) = dispatch
+                .emitter
+                .progress(
+                    buzz_core::job::JobProgressStatus::Progress,
+                    "Worker prompt admitted".into(),
+                    Vec::new(),
+                )
+                .await
+            {
+                // The transition was frozen before REST submission. Keep the
+                // admitted job moving; the live outbox worker and any later
+                // terminal publish replay this exact progress event first.
+                tracing::warn!(
+                    scope = %scope.telemetry_label(),
+                    "agent-job start progress remains pending: {error}"
+                );
+            }
+            Ok(Some((scope, dispatch.emitter)))
+        }
+        Ok(false) => {
+            queue.remove_event(&scope, &event_id);
+            Ok(None)
+        }
+        Err(error) => {
+            queue.remove_event(&scope, &event_id);
+            Err(error)
+        }
+    }
 }
 
 /// Return the workflow owner attributed by a relay-signed workflow message.
@@ -2817,6 +2875,101 @@ async fn tokio_main() -> Result<()> {
         harness_name: crate::config::normalize_agent_command_identity(&config.agent_command),
         relay_url: config.relay_url.clone(),
     });
+    let mut job_receiver =
+        if job_receiver::JobReceiver::has_configured_grants(std::path::Path::new(&ctx.cwd))
+            .map_err(|error| anyhow::anyhow!("agent job receiver configuration error: {error}"))?
+        {
+            let authenticated_context = ctx
+                .rest_client
+                .authenticated_context()
+                .await
+                .map_err(|error| anyhow::anyhow!("agent job tenant context error: {error}"))?;
+            let sponsor_pubkey = startup_owner.clone().ok_or_else(|| {
+                anyhow::anyhow!("agent jobs require a current configured agent owner")
+            })?;
+            let sponsor = buzz_core::job::JobSponsor {
+                pubkey: sponsor_pubkey,
+                github_login: std::env::var("BUZZ_ACP_OWNER_GITHUB_LOGIN")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| "buzz-owner".into()),
+            };
+            Some(
+                job_receiver::JobReceiver::from_env(
+                    authenticated_context,
+                    config.keys.clone(),
+                    ctx.rest_client.clone(),
+                    sponsor,
+                    std::path::Path::new(&ctx.cwd),
+                )
+                .map_err(|error| {
+                    anyhow::anyhow!("agent job receiver configuration error: {error}")
+                })?,
+            )
+        } else {
+            None
+        };
+    if job_receiver
+        .as_ref()
+        .is_some_and(|receiver| receiver.enabled())
+    {
+        tracing::info!("signed agent-job receiver enabled");
+    } else {
+        tracing::info!(
+            "signed agent-job receiver has no local grants; job requests will fail closed"
+        );
+    }
+    let mut job_emitters: HashMap<scope::SessionScope, job_receiver::JobEmitter> = HashMap::new();
+    let mut job_cancellations: HashSet<scope::SessionScope> = HashSet::new();
+    if let Some(receiver) = job_receiver.as_ref() {
+        relay
+            .subscribe_agent_jobs(&receiver.subscription_channels())
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!("subscribing to locally granted agent jobs failed: {error}")
+            })?;
+        receiver.recover_lifecycle().await.map_err(|error| {
+            anyhow::anyhow!("recovering durable agent-job lifecycle failed: {error}")
+        })?;
+    }
+    let pending_job_events = match job_receiver.as_ref() {
+        Some(receiver) => receiver.pending_events().await.map_err(|error| {
+            anyhow::anyhow!("recovering durable agent-job queue failed: {error}")
+        })?,
+        None => Vec::new(),
+    };
+    for event in pending_job_events {
+        let Ok(buzz_core::job::JobEvent::Request(request)) =
+            buzz_core::job::JobEvent::parse(&event)
+        else {
+            continue;
+        };
+        let Ok(channel_id) = Uuid::parse_str(&request.common.project.home_channel) else {
+            continue;
+        };
+        let project_context = match ctx.channel_info.resolve(channel_id).await {
+            Ok(info) => info,
+            Err(error) => {
+                tracing::warn!(channel_id = %channel_id, error = ?error, "pending job Project authorization is indeterminate");
+                continue;
+            }
+        };
+        let project = project_context
+            .as_ref()
+            .and_then(|info| info.project.as_ref());
+        let Some(receiver) = job_receiver.as_ref() else {
+            break;
+        };
+        match admit_job_to_queue(receiver, &mut queue, channel_id, event, project).await {
+            Ok(Some((scope, emitter))) => {
+                job_emitters.insert(scope, emitter);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(channel_id = %channel_id, "pending agent job recovery failed closed: {error}");
+            }
+        }
+    }
 
     if !config.memory_enabled {
         tracing::info!(
@@ -2845,6 +2998,10 @@ async fn tokio_main() -> Result<()> {
     } else {
         None
     };
+    let mut job_retry_interval = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(5),
+        Duration::from_secs(5),
+    );
 
     let mut typing_refresh = if config.typing_enabled {
         let interval = Duration::from_secs(3);
@@ -2994,6 +3151,7 @@ async fn tokio_main() -> Result<()> {
         Panic(tokio::task::JoinError),
         SteerAck(SteerAckEvent),
         Wake(u32, Result<AgentPool, String>),
+        RetryAgentJobs,
     }
 
     loop {
@@ -3157,6 +3315,9 @@ async fn tokio_main() -> Result<()> {
                 Some((attempt, result)) = wake_rx.recv(), if config.lazy_pool && !pool_ready => {
                     Some(PoolEvent::Wake(attempt, result))
                 }
+                _ = job_retry_interval.tick(), if job_receiver.is_some() => {
+                    Some(PoolEvent::RetryAgentJobs)
+                }
                 // Gated on pending work: with an empty queue there is nothing
                 // for the retry to dispatch, and a past `retry_at` would
                 // otherwise complete instantly on every iteration (busy spin).
@@ -3224,6 +3385,25 @@ async fn tokio_main() -> Result<()> {
                     match buzz_event {
                         Some(buzz_event) => {
                             let kind_u32 = buzz_event.event.kind.as_u16() as u32;
+                            let job_tenant_ready = match job_receiver.as_mut() {
+                                Some(receiver) => match receiver
+                                    .observe_connection_generation(
+                                        buzz_event.connection_generation,
+                                        &ctx.rest_client,
+                                    )
+                                    .await
+                                {
+                                    Ok(()) => true,
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            generation = buzz_event.connection_generation,
+                                            "agent job tenant refresh failed closed: {error}"
+                                        );
+                                        false
+                                    }
+                                },
+                                None => false,
+                            };
 
                             if kind_u32 == KIND_MEMBER_ADDED_NOTIFICATION
                                 || kind_u32 == KIND_MEMBER_REMOVED_NOTIFICATION
@@ -3282,6 +3462,15 @@ async fn tokio_main() -> Result<()> {
                                     // stripped for a legitimately re-added channel.
                                     removed_channels.remove(&ch);
 
+                                    if job_receiver
+                                        .as_ref()
+                                        .is_some_and(|receiver| receiver.subscribes_to_channel(ch))
+                                    {
+                                        if let Err(error) = relay.subscribe_agent_jobs(&[ch]).await {
+                                            tracing::warn!(channel_id = %ch, "failed to subscribe to granted agent jobs: {error}");
+                                        }
+                                    }
+
                                     if subscribed_channel_ids.contains(&ch) {
                                         tracing::debug!(channel_id = %ch, "membership notification: channel already subscribed");
                                     } else {
@@ -3314,13 +3503,19 @@ async fn tokio_main() -> Result<()> {
                                 } else {
                                     subscribed_channel_ids.remove(&ch);
                                     tracing::info!(channel_id = %ch, "membership notification: unsubscribing from channel");
+                                    if job_receiver
+                                        .as_ref()
+                                        .is_some_and(|receiver| receiver.subscribes_to_channel(ch))
+                                    {
+                                        if let Err(error) = relay.unsubscribe_agent_jobs(ch).await {
+                                            tracing::warn!(channel_id = %ch, "failed to unsubscribe from agent jobs: {error}");
+                                        }
+                                    }
                                     if let Err(e) = relay.unsubscribe_channel(ch).await {
                                         tracing::warn!("failed to unsubscribe from channel {ch}: {e}");
                                     }
                                     // Drain queued events and invalidate sessions for the
-                                    // removed channel. Events already in-flight will
-                                    // complete normally (the relay may reject actions if
-                                    // the agent lost access).
+                                    // removed channel.
                                     let drained_ids = queue.drain_channel(ch);
                                     let invalidated = if pool_ready {
                                         pool.invalidate_channel_sessions(ch)
@@ -3333,6 +3528,28 @@ async fn tokio_main() -> Result<()> {
                                     // Drop every thread scope's typing entry for
                                     // the removed channel.
                                     typing_channels.retain(|scope, _| scope.channel_id() != ch);
+                                    let revoked_job_scopes = job_emitters
+                                        .keys()
+                                        .filter(|scope| scope.channel_id() == ch)
+                                        .cloned()
+                                        .collect::<Vec<_>>();
+                                    if let Some(receiver) = job_receiver.as_ref() {
+                                        if let Err(error) = receiver.terminate_channel(ch).await {
+                                            tracing::warn!(
+                                                channel_id = %ch,
+                                                "membership-revoked job terminals are frozen for retry: {error}"
+                                            );
+                                        }
+                                    }
+                                    for scope in revoked_job_scopes {
+                                        let _ = signal_in_flight_task_for_scope(
+                                            &mut pool,
+                                            &scope,
+                                            ControlSignal::Cancel,
+                                        );
+                                        job_cancellations.remove(&scope);
+                                        job_emitters.remove(&scope);
+                                    }
                                     // Best-effort: clean up 👀 on drained events.
                                     // Note: the relay revokes membership before
                                     // emitting the notification, so this DELETE may
@@ -3354,6 +3571,118 @@ async fn tokio_main() -> Result<()> {
                                             drained = drained_ids.len(),
                                             invalidated,
                                             "cleaned up after membership removal"
+                                        );
+                                    }
+                                }
+                                continue;
+                            }
+
+                            // Signed agent jobs have their own exact-recipient,
+                            // Project, repository, capability, expiry, and
+                            // durable-idempotency boundary. Route every job kind
+                            // before chat author/respond-to filtering; only an
+                            // authorized kind-43001 request may become a prompt.
+                            if is_job_kind(kind_u32) {
+                                if !job_tenant_ready {
+                                    continue;
+                                }
+                                let Some(receiver) = job_receiver.as_ref() else {
+                                    continue;
+                                };
+                                if kind_u32 == KIND_JOB_CANCEL {
+                                    match receiver
+                                        .handle_cancel(
+                                            buzz_event.channel_id,
+                                            buzz_event.event,
+                                        )
+                                        .await
+                                    {
+                                        Ok(job_receiver::CancelOutcome::Cancel(cancel)) => {
+                                            let scope = cancel.scope;
+                                            let running = job_runtime::quiesce_for_cancel(
+                                                &mut pool,
+                                                &mut queue,
+                                                &scope,
+                                                &cancel.request_event_id,
+                                            );
+                                            if running {
+                                                job_emitters.insert(scope.clone(), cancel.emitter);
+                                                job_cancellations.insert(scope.clone());
+                                            } else {
+                                                job_emitters.remove(&scope);
+                                                if let Err(error) = cancel
+                                                    .emitter
+                                                    .control(
+                                                        buzz_core::job::JobControlAction::Cancelled,
+                                                        "requester_cancelled".into(),
+                                                        None,
+                                                    )
+                                                    .await
+                                                {
+                                                    tracing::warn!(
+                                                        scope = %scope.telemetry_label(),
+                                                        "publishing queued agent-job cancellation failed: {error}"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        Ok(job_receiver::CancelOutcome::Consumed) => {}
+                                        Err(error) => tracing::warn!(
+                                            channel_id = %buzz_event.channel_id,
+                                            "agent-job cancellation failed closed: {error}"
+                                        ),
+                                    }
+                                    continue;
+                                }
+                                if kind_u32 != KIND_JOB_REQUEST {
+                                    tracing::debug!(kind = kind_u32, "consuming job lifecycle event");
+                                    continue;
+                                }
+                                let project_context = match ctx
+                                    .channel_info
+                                    .resolve(buzz_event.channel_id)
+                                    .await
+                                {
+                                    Ok(info) => info,
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            channel_id = %buzz_event.channel_id,
+                                            error = ?error,
+                                            "job Project authorization is indeterminate"
+                                        );
+                                        continue;
+                                    }
+                                };
+                                let project = project_context
+                                    .as_ref()
+                                    .and_then(|info| info.project.as_ref());
+                                match admit_job_to_queue(
+                                    receiver,
+                                    &mut queue,
+                                    buzz_event.channel_id,
+                                    buzz_event.event,
+                                    project,
+                                )
+                                .await
+                                {
+                                    Ok(Some((scope, emitter))) => {
+                                        job_emitters.insert(scope, emitter);
+                                        if pool_ready {
+                                            for (scope, thread_tags) in dispatch_pending(
+                                                &mut pool,
+                                                &mut queue,
+                                                &ctx,
+                                                &mut last_activity,
+                                            ) {
+                                                typing_channels.insert(scope, thread_tags);
+                                            }
+                                        }
+                                    }
+                                    Ok(None) => {}
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            channel_id = %buzz_event.channel_id,
+                                            "agent job receiver failed closed: {error}"
                                         );
                                     }
                                 }
@@ -3739,14 +4068,58 @@ async fn tokio_main() -> Result<()> {
         };
 
         match pool_event {
-            Some(PoolEvent::Result(result)) => {
+            Some(PoolEvent::Result(mut result)) => {
+                let job_scope = result
+                    .source
+                    .scope()
+                    .filter(|scope| scope.is_job())
+                    .cloned();
+                let job_was_cancelled = job_scope
+                    .as_ref()
+                    .is_some_and(|scope| job_cancellations.remove(scope));
+                let captured_job_text = job_scope
+                    .as_ref()
+                    .map(|_| result.agent.acp.take_turn_text());
+                let job_terminal = job_scope.as_ref().and_then(|scope| {
+                    let (operation_id, request_event_id) = match scope {
+                        scope::SessionScope::Job {
+                            operation_id,
+                            request_event_id,
+                            ..
+                        } => (operation_id.as_str(), request_event_id.as_str()),
+                        _ => return None,
+                    };
+                    let emitter = job_emitters.remove(scope)?;
+                    let disposition = if job_was_cancelled {
+                        None
+                    } else {
+                        Some(match &result.outcome {
+                            PromptOutcome::Ok(_) => job_receiver::parse_terminal_outcome(
+                                captured_job_text.flatten(),
+                                operation_id,
+                                request_event_id,
+                                emitter.scope_digest(),
+                            ),
+                            _ => job_receiver::TerminalDisposition::Indeterminate {
+                                code: "worker_turn_interrupted".into(),
+                                message: "Worker turn ended without a proven terminal outcome"
+                                    .into(),
+                            },
+                        })
+                    };
+                    Some((emitter, disposition))
+                });
+                // Once a durable job prompt starts, never re-run its side effects.
+                if job_scope.is_some() {
+                    result.batch = None;
+                }
                 // Stop the typing indicator for the completed turn's exact scope,
                 // not the whole channel — a sibling thread still running in the
                 // same channel must keep its indicator.
                 if let Some(scope) = result.source.scope() {
                     typing_channels.remove(scope);
                 }
-                if handle_prompt_result(
+                let loop_action = handle_prompt_result(
                     &mut pool,
                     &mut queue,
                     &config,
@@ -3758,8 +4131,25 @@ async fn tokio_main() -> Result<()> {
                     &mut respawn_tasks,
                     observer.clone(),
                     Some(&ctx.rest_client),
-                ) == LoopAction::Exit
-                {
+                );
+                if let Some((emitter, disposition)) = job_terminal {
+                    let publish = match disposition {
+                        Some(disposition) => emitter.terminal(disposition).await,
+                        None => {
+                            emitter
+                                .control(
+                                    buzz_core::job::JobControlAction::Cancelled,
+                                    "requester_cancelled".into(),
+                                    None,
+                                )
+                                .await
+                        }
+                    };
+                    if let Err(error) = publish {
+                        tracing::warn!("publishing agent-job terminal event failed: {error}");
+                    }
+                }
+                if loop_action == LoopAction::Exit {
                     break;
                 }
                 if drain_ready_join_results(
@@ -3783,8 +4173,74 @@ async fn tokio_main() -> Result<()> {
                     typing_channels.insert(scope, thread_tags);
                 }
             }
+            Some(PoolEvent::RetryAgentJobs) => {
+                let Some(receiver) = job_receiver.as_ref() else {
+                    continue;
+                };
+                if let Err(error) = receiver.retry_outboxes().await {
+                    tracing::warn!("retrying durable agent-job outbox failed: {error}");
+                }
+                let pending = match receiver.pending_events().await {
+                    Ok(events) => events,
+                    Err(error) => {
+                        tracing::warn!("scanning pending agent-job claims failed: {error}");
+                        continue;
+                    }
+                };
+                for event in pending {
+                    let Ok(buzz_core::job::JobEvent::Request(request)) =
+                        buzz_core::job::JobEvent::parse(&event)
+                    else {
+                        continue;
+                    };
+                    let Ok(channel_id) = Uuid::parse_str(&request.common.project.home_channel)
+                    else {
+                        continue;
+                    };
+                    let project_context = match ctx.channel_info.resolve(channel_id).await {
+                        Ok(info) => info,
+                        Err(error) => {
+                            tracing::warn!(channel_id = %channel_id, error = ?error, "retry Project authorization is indeterminate");
+                            continue;
+                        }
+                    };
+                    let project = project_context
+                        .as_ref()
+                        .and_then(|info| info.project.as_ref());
+                    match admit_job_to_queue(receiver, &mut queue, channel_id, event, project).await
+                    {
+                        Ok(Some((scope, emitter))) => {
+                            job_emitters.insert(scope, emitter);
+                        }
+                        Ok(None) => {}
+                        Err(error) => tracing::warn!(
+                            channel_id = %channel_id,
+                            "retrying pending agent job failed closed: {error}"
+                        ),
+                    }
+                }
+                if pool_ready {
+                    for (scope, thread_tags) in
+                        dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
+                    {
+                        typing_channels.insert(scope, thread_tags);
+                    }
+                }
+            }
             Some(PoolEvent::Panic(join_error)) => {
                 tracing::error!("agent task panicked: {join_error}");
+                let panic_scope = pool
+                    .task_map()
+                    .get(&join_error.id())
+                    .and_then(|meta| meta.scope.as_ref())
+                    .filter(|scope| scope.is_job())
+                    .cloned();
+                let panic_terminal = panic_scope.as_ref().and_then(|scope| {
+                    let cancelled = job_cancellations.remove(scope);
+                    job_emitters
+                        .remove(scope)
+                        .map(|emitter| (emitter, cancelled))
+                });
                 recover_panicked_agent(
                     &mut pool,
                     &mut queue,
@@ -3798,6 +4254,27 @@ async fn tokio_main() -> Result<()> {
                     &mut respawn_tasks,
                     observer.clone(),
                 );
+                if let Some((emitter, cancelled)) = panic_terminal {
+                    let publish = if cancelled {
+                        emitter
+                            .control(
+                                buzz_core::job::JobControlAction::Cancelled,
+                                "requester_cancelled".into(),
+                                None,
+                            )
+                            .await
+                    } else {
+                        emitter
+                            .indeterminate(
+                                "worker_panicked".into(),
+                                "Worker process stopped before recording a terminal outcome".into(),
+                            )
+                            .await
+                    };
+                    if let Err(error) = publish {
+                        tracing::warn!("publishing panicked agent-job terminal failed: {error}");
+                    }
+                }
                 if pool.live_count() == 0 && !any_respawn_in_flight(&crash_history) {
                     tracing::error!("all agents dead — exiting");
                     break;
@@ -4426,10 +4903,7 @@ fn dispatch_pending(
         };
         tracing::debug!(agent = agent.index, channel = %channel_id, scope = %scope.telemetry_label(), affinity_hit, "agent_claimed");
 
-        let recoverable_batch = match ctx.dedup_mode {
-            DedupMode::Queue => Some(batch.clone()),
-            DedupMode::Drop => None,
-        };
+        let recoverable_batch = job_runtime::recoverable_batch_for(ctx.dedup_mode, &scope, &batch);
 
         let result_tx = pool.result_tx();
         let ctx_clone = Arc::clone(ctx);
@@ -5801,6 +6275,23 @@ fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
                         value: auth_tag,
                     });
                 }
+            }
+            let grants_json = std::env::var("BUZZ_ACP_JOB_GRANTS_JSON")
+                .ok()
+                .filter(|value| !value.trim().is_empty());
+            let grants_file = std::env::var("BUZZ_ACP_JOB_GRANTS_FILE")
+                .ok()
+                .filter(|value| !value.trim().is_empty());
+            if let Some(value) = grants_json {
+                env.push(EnvVar {
+                    name: "BUZZ_ACP_JOB_GRANTS_JSON".into(),
+                    value,
+                });
+            } else if let Some(value) = grants_file {
+                env.push(EnvVar {
+                    name: "BUZZ_ACP_JOB_GRANTS_FILE".into(),
+                    value,
+                });
             }
             // Forward the agent's display name so dev-mcp can use it as the git
             // author name instead of the raw npub. Read from the process env
@@ -9076,6 +9567,42 @@ mod build_mcp_servers_tests {
                 .iter()
                 .any(|e| e.name == "BUZZ_ACP_DISPLAY_NAME"),
             "empty display name should not be forwarded"
+        );
+    }
+
+    #[test]
+    fn inline_job_grants_are_forwarded_to_trusted_mcp_with_file_fallback() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("BUZZ_ACP_JOB_GRANTS_JSON", r#"{"version":1,"grants":[]}"#);
+        std::env::set_var("BUZZ_ACP_JOB_GRANTS_FILE", "/tmp/ignored-grants.json");
+        let config = test_config();
+        let servers = build_mcp_servers(&config);
+        std::env::remove_var("BUZZ_ACP_JOB_GRANTS_JSON");
+        std::env::remove_var("BUZZ_ACP_JOB_GRANTS_FILE");
+
+        let env = &servers[0].env;
+        assert_eq!(
+            env.iter()
+                .find(|entry| entry.name == "BUZZ_ACP_JOB_GRANTS_JSON")
+                .map(|entry| entry.value.as_str()),
+            Some(r#"{"version":1,"grants":[]}"#)
+        );
+        assert!(
+            !env.iter()
+                .any(|entry| entry.name == "BUZZ_ACP_JOB_GRANTS_FILE"),
+            "inline grants must be the single authoritative source"
+        );
+
+        std::env::set_var("BUZZ_ACP_JOB_GRANTS_FILE", "/tmp/grants.json");
+        let servers = build_mcp_servers(&config);
+        std::env::remove_var("BUZZ_ACP_JOB_GRANTS_FILE");
+        assert_eq!(
+            servers[0]
+                .env
+                .iter()
+                .find(|entry| entry.name == "BUZZ_ACP_JOB_GRANTS_FILE")
+                .map(|entry| entry.value.as_str()),
+            Some("/tmp/grants.json")
         );
     }
 

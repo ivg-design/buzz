@@ -78,6 +78,12 @@ pub enum SessionScope {
         channel_id: Uuid,
         root_event_id: String,
     },
+    /// One durable agent-job operation, isolated from chat and sibling jobs.
+    Job {
+        channel_id: Uuid,
+        operation_id: String,
+        request_event_id: String,
+    },
 }
 
 impl SessionScope {
@@ -87,6 +93,7 @@ impl SessionScope {
         match self {
             Self::Conversation { channel_id } => *channel_id,
             Self::Thread { channel_id, .. } => *channel_id,
+            Self::Job { channel_id, .. } => *channel_id,
         }
     }
 
@@ -96,12 +103,18 @@ impl SessionScope {
         match self {
             Self::Conversation { .. } => None,
             Self::Thread { root_event_id, .. } => Some(root_event_id),
+            Self::Job { .. } => None,
         }
     }
 
     /// True when this scope is thread-scoped (not conversation-scoped).
     pub fn is_thread(&self) -> bool {
         matches!(self, Self::Thread { .. })
+    }
+
+    /// True for a durable addressed agent-job execution scope.
+    pub fn is_job(&self) -> bool {
+        matches!(self, Self::Job { .. })
     }
 
     /// Derive the scope for an admitted event.
@@ -152,6 +165,15 @@ impl SessionScope {
                 let short: String = root_event_id.chars().take(8).collect();
                 format!("thread:{short}")
             }
+            Self::Job {
+                operation_id,
+                request_event_id,
+                ..
+            } => format!(
+                "job:{}:{}",
+                operation_id.chars().take(8).collect::<String>(),
+                request_event_id.chars().take(8).collect::<String>()
+            ),
         }
     }
 }

@@ -1,0 +1,459 @@
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+use nostr::Event;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use uuid::Uuid;
+
+const LIFECYCLE_VERSION: u32 = 3;
+
+#[derive(Debug, Error)]
+pub enum LifecycleError {
+    #[error("job lifecycle state I/O failed: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("job lifecycle state JSON failed: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("job lifecycle state is invalid: {0}")]
+    Invalid(String),
+    #[error("job lifecycle blocking task failed: {0}")]
+    Join(#[from] tokio::task::JoinError),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LifecycleState {
+    version: u32,
+    accepted_event_id: String,
+    head_event_id: String,
+    outbox: Option<Event>,
+    outbox_terminal: bool,
+    cancel_event_id: Option<String>,
+    terminal: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelDecision {
+    Observed,
+    Replay,
+    AlreadyTerminal,
+}
+
+#[derive(Debug, Clone)]
+pub struct LifecycleStore {
+    path: PathBuf,
+    lock_path: PathBuf,
+}
+
+impl LifecycleStore {
+    pub fn new(root: &Path, key: &str) -> Self {
+        Self {
+            path: root.join(format!("{key}.lifecycle.json")),
+            lock_path: root.join(format!("{key}.lifecycle.lock")),
+        }
+    }
+
+    pub async fn initialize(&self, accepted_event_id: String) -> Result<(), LifecycleError> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || store.initialize_blocking(accepted_event_id)).await?
+    }
+
+    pub fn exists(&self) -> bool {
+        self.path.exists()
+    }
+
+    pub async fn snapshot(&self) -> Result<(String, Option<Event>, bool), LifecycleError> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let state = store.read()?;
+            Ok((state.head_event_id, state.outbox, state.terminal))
+        })
+        .await?
+    }
+
+    pub async fn pending_cancel(&self) -> Result<Option<String>, LifecycleError> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let state = store.read()?;
+            Ok((!state.terminal).then_some(state.cancel_event_id).flatten())
+        })
+        .await?
+    }
+
+    pub async fn stage(
+        &self,
+        event: Event,
+        terminal: bool,
+        expected_head: String,
+    ) -> Result<(), LifecycleError> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || store.stage_blocking(event, terminal, &expected_head))
+            .await?
+    }
+
+    pub async fn confirm(&self, event_id: String) -> Result<(), LifecycleError> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || store.confirm_blocking(&event_id)).await?
+    }
+
+    pub async fn observe_cancel(
+        &self,
+        event_id: String,
+        expected_head: String,
+    ) -> Result<CancelDecision, LifecycleError> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            store.observe_cancel_blocking(&event_id, &expected_head)
+        })
+        .await?
+    }
+
+    fn initialize_blocking(&self, accepted_event_id: String) -> Result<(), LifecycleError> {
+        self.with_lock(|| {
+            if self.path.exists() {
+                let state = self.read()?;
+                if state.accepted_event_id != accepted_event_id {
+                    return Err(LifecycleError::Invalid(
+                        "lifecycle root does not match accepted receipt".into(),
+                    ));
+                }
+                return Ok(());
+            }
+            let state = LifecycleState {
+                version: LIFECYCLE_VERSION,
+                accepted_event_id: accepted_event_id.clone(),
+                head_event_id: accepted_event_id,
+                outbox: None,
+                outbox_terminal: false,
+                cancel_event_id: None,
+                terminal: false,
+            };
+            write_new_or_validate(&self.path, &state)
+        })
+    }
+
+    fn stage_blocking(
+        &self,
+        event: Event,
+        terminal: bool,
+        expected_head: &str,
+    ) -> Result<(), LifecycleError> {
+        self.with_lock(|| {
+            let mut state = self.read()?;
+            if state.terminal {
+                return Err(LifecycleError::Invalid("job is already terminal".into()));
+            }
+            if state.outbox.is_some() {
+                return Err(LifecycleError::Invalid(
+                    "a frozen lifecycle event is awaiting acknowledgement".into(),
+                ));
+            }
+            if state.head_event_id != expected_head {
+                return Err(LifecycleError::Invalid(
+                    "lifecycle head changed before transition claim".into(),
+                ));
+            }
+            state.outbox = Some(event);
+            state.outbox_terminal = terminal;
+            replace_private(&self.path, &state)
+        })
+    }
+
+    fn confirm_blocking(&self, event_id: &str) -> Result<(), LifecycleError> {
+        self.with_lock(|| {
+            let mut state = self.read()?;
+            let Some(event) = state.outbox.as_ref() else {
+                return Err(LifecycleError::Invalid("lifecycle outbox is empty".into()));
+            };
+            if event.id.to_hex() != event_id {
+                return Err(LifecycleError::Invalid(
+                    "acknowledgement does not match the frozen lifecycle event".into(),
+                ));
+            }
+            state.head_event_id = event_id.into();
+            state.outbox = None;
+            state.terminal = state.outbox_terminal;
+            state.outbox_terminal = false;
+            replace_private(&self.path, &state)
+        })
+    }
+
+    fn observe_cancel_blocking(
+        &self,
+        event_id: &str,
+        expected_head: &str,
+    ) -> Result<CancelDecision, LifecycleError> {
+        self.with_lock(|| {
+            let mut state = self.read()?;
+            if state.terminal {
+                return Ok(CancelDecision::AlreadyTerminal);
+            }
+            if state.cancel_event_id.as_deref() == Some(event_id) {
+                return Ok(CancelDecision::Replay);
+            }
+            if state.cancel_event_id.is_some() {
+                return Err(LifecycleError::Invalid(
+                    "a different cancellation is already recorded".into(),
+                ));
+            }
+            if state.outbox.is_some() {
+                return Err(LifecycleError::Invalid(
+                    "cannot record cancellation while a lifecycle event awaits acknowledgement"
+                        .into(),
+                ));
+            }
+            if state.head_event_id != expected_head {
+                return Err(LifecycleError::Invalid(
+                    "cancellation predecessor does not match the current lifecycle head".into(),
+                ));
+            }
+            state.head_event_id = event_id.into();
+            state.cancel_event_id = Some(event_id.into());
+            replace_private(&self.path, &state)?;
+            Ok(CancelDecision::Observed)
+        })
+    }
+
+    fn with_lock<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, LifecycleError>,
+    ) -> Result<T, LifecycleError> {
+        let parent = self
+            .lock_path
+            .parent()
+            .ok_or_else(|| LifecycleError::Invalid("lock path has no parent".into()))?;
+        std::fs::create_dir_all(parent)?;
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&self.lock_path)?;
+        fs2::FileExt::lock_exclusive(&lock)?;
+        let result = operation();
+        fs2::FileExt::unlock(&lock)?;
+        result
+    }
+
+    fn read(&self) -> Result<LifecycleState, LifecycleError> {
+        let state: LifecycleState = serde_json::from_slice(&std::fs::read(&self.path)?)?;
+        if state.version != LIFECYCLE_VERSION {
+            return Err(LifecycleError::Invalid("unsupported state version".into()));
+        }
+        Ok(state)
+    }
+}
+
+fn write_new_or_validate(path: &Path, state: &LifecycleState) -> Result<(), LifecycleError> {
+    let bytes = serde_json::to_vec(state)?;
+    match private_new(path) {
+        Ok(mut file) => {
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            sync_directory(
+                path.parent()
+                    .ok_or_else(|| LifecycleError::Invalid("state path has no parent".into()))?,
+            )?;
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let existing: LifecycleState = serde_json::from_slice(&std::fs::read(path)?)?;
+            if existing.version == LIFECYCLE_VERSION
+                && existing.accepted_event_id == state.accepted_event_id
+            {
+                Ok(())
+            } else {
+                Err(LifecycleError::Invalid(
+                    "existing lifecycle root does not match accepted receipt".into(),
+                ))
+            }
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn sync_directory(path: &Path) -> Result<(), std::io::Error> {
+    #[cfg(unix)]
+    {
+        File::open(path)?.sync_all()?;
+    }
+    // std does not expose a portable Windows directory fsync. File contents
+    // are flushed there; full directory-entry crash durability is guaranteed
+    // on the Unix targets used by Buzz desktop and relay deployments.
+    Ok(())
+}
+
+fn replace_private(path: &Path, state: &LifecycleState) -> Result<(), LifecycleError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| LifecycleError::Invalid("state path has no parent".into()))?;
+    let temporary = parent.join(format!(".lifecycle-{}.tmp", Uuid::new_v4()));
+    let result = (|| {
+        let mut file = private_new(&temporary)?;
+        file.write_all(&serde_json::to_vec(state)?)?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, path)?;
+        sync_directory(parent)?;
+        Ok::<_, LifecycleError>(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(temporary);
+    }
+    result
+}
+
+fn private_new(path: &Path) -> Result<File, std::io::Error> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nostr::{EventBuilder, Keys, Kind};
+
+    fn event(content: &str) -> Event {
+        EventBuilder::new(Kind::TextNote, content)
+            .sign_with_keys(&Keys::generate())
+            .expect("sign")
+    }
+
+    #[tokio::test]
+    async fn initialize_rejects_a_different_accepted_root() {
+        let root = std::env::temp_dir().join(format!("buzz-lifecycle-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create root");
+        let store = LifecycleStore::new(&root, "job");
+        store.initialize("a".repeat(64)).await.expect("initialize");
+        store
+            .initialize("a".repeat(64))
+            .await
+            .expect("same accepted root is idempotent");
+        assert!(store.initialize("b".repeat(64)).await.is_err());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn frozen_outbox_survives_restart_until_exact_confirmation() {
+        let root = std::env::temp_dir().join(format!("buzz-lifecycle-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create root");
+        let store = LifecycleStore::new(&root, "job");
+        store.initialize("a".repeat(64)).await.expect("initialize");
+        let progress = event("progress");
+        store
+            .stage(progress.clone(), false, "a".repeat(64))
+            .await
+            .expect("stage");
+
+        let reopened = LifecycleStore::new(&root, "job");
+        let (head, pending, terminal) = reopened.snapshot().await.expect("reopen");
+        assert_eq!(head, "a".repeat(64));
+        assert_eq!(pending.expect("frozen event").id, progress.id);
+        assert!(!terminal);
+        assert!(reopened.confirm("b".repeat(64)).await.is_err());
+        reopened
+            .confirm(progress.id.to_hex())
+            .await
+            .expect("confirm exact event");
+        let (head, pending, terminal) = reopened.snapshot().await.expect("confirmed");
+        assert_eq!(head, progress.id.to_hex());
+        assert!(pending.is_none());
+        assert!(!terminal);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn terminal_outbox_blocks_sibling_transition() {
+        let root = std::env::temp_dir().join(format!("buzz-lifecycle-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create root");
+        let store = LifecycleStore::new(&root, "job");
+        store.initialize("a".repeat(64)).await.expect("initialize");
+        let result = event("result");
+        store
+            .stage(result.clone(), true, "a".repeat(64))
+            .await
+            .expect("stage");
+        assert!(store
+            .stage(event("fork"), true, "a".repeat(64))
+            .await
+            .is_err());
+        store.confirm(result.id.to_hex()).await.expect("confirm");
+        assert!(store
+            .stage(event("late"), false, result.id.to_hex())
+            .await
+            .is_err());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn concurrent_stores_have_one_transition_winner_and_no_orphan() {
+        let root = std::env::temp_dir().join(format!("buzz-lifecycle-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create root");
+        let first = LifecycleStore::new(&root, "job");
+        let second = LifecycleStore::new(&root, "job");
+        let accepted = "a".repeat(64);
+        first
+            .initialize(accepted.clone())
+            .await
+            .expect("initialize");
+        let left = event("left");
+        let right = event("right");
+        let (left_result, right_result) = tokio::join!(
+            first.stage(left.clone(), true, accepted.clone()),
+            second.stage(right.clone(), true, accepted)
+        );
+        assert_ne!(left_result.is_ok(), right_result.is_ok());
+        let (_, pending, terminal) = first.snapshot().await.expect("snapshot");
+        let winner = pending.expect("one frozen winner");
+        assert!(winner.id == left.id || winner.id == right.id);
+        assert!(!terminal);
+        first
+            .confirm(winner.id.to_hex())
+            .await
+            .expect("confirm winner");
+        let (head, pending, terminal) = first.snapshot().await.expect("confirmed");
+        assert_eq!(head, winner.id.to_hex());
+        assert!(pending.is_none());
+        assert!(terminal);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn cancellation_is_one_durable_head_transition() {
+        let root = std::env::temp_dir().join(format!("buzz-lifecycle-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create root");
+        let store = LifecycleStore::new(&root, "job");
+        let accepted = "a".repeat(64);
+        let cancel = "b".repeat(64);
+        store
+            .initialize(accepted.clone())
+            .await
+            .expect("initialize");
+        assert_eq!(
+            store
+                .observe_cancel(cancel.clone(), accepted)
+                .await
+                .expect("observe"),
+            CancelDecision::Observed
+        );
+        let reopened = LifecycleStore::new(&root, "job");
+        assert_eq!(
+            reopened
+                .observe_cancel(cancel.clone(), "a".repeat(64))
+                .await
+                .expect("replay"),
+            CancelDecision::Replay
+        );
+        let (head, pending, terminal) = reopened.snapshot().await.expect("snapshot");
+        assert_eq!(head, cancel);
+        assert!(pending.is_none());
+        assert!(!terminal);
+        std::fs::remove_dir_all(root).ok();
+    }
+}

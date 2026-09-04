@@ -1302,7 +1302,7 @@ async fn create_session_and_apply_model(
     });
     let mcp_servers = mcp_servers_with_git_origin(
         &ctx.mcp_servers,
-        channel.scope.map(SessionScope::channel_id),
+        channel.scope,
         channel.channel_type,
         ctx.session_title.as_deref(),
     );
@@ -1531,11 +1531,12 @@ async fn create_session_and_apply_model(
 
 fn mcp_servers_with_git_origin(
     servers: &[McpServer],
-    channel_id: Option<Uuid>,
+    scope: Option<&SessionScope>,
     channel_type: Option<&str>,
     agent_name: Option<&str>,
 ) -> Vec<McpServer> {
     let mut servers = servers.to_vec();
+    let channel_id = scope.map(SessionScope::channel_id);
     let origin = match (channel_id, channel_type) {
         (Some(channel_id), Some("stream")) => Some(EnvVar {
             name: "BUZZ_GIT_ORIGIN_CHANNEL_ID".into(),
@@ -1552,6 +1553,36 @@ fn mcp_servers_with_git_origin(
     if let Some(origin) = origin {
         for server in &mut servers {
             server.env.push(origin.clone());
+        }
+    }
+    if let Some(scope) = scope {
+        let mut scoped = vec![EnvVar {
+            name: "BUZZ_MCP_SESSION_CHANNEL_ID".into(),
+            value: scope.channel_id().to_string(),
+        }];
+        if let Some(root_event_id) = scope.root_event_id() {
+            scoped.push(EnvVar {
+                name: "BUZZ_MCP_SESSION_THREAD_ROOT_ID".into(),
+                value: root_event_id.into(),
+            });
+        }
+        if let SessionScope::Job {
+            operation_id,
+            request_event_id,
+            ..
+        } = scope
+        {
+            scoped.push(EnvVar {
+                name: "BUZZ_MCP_JOB_OPERATION_ID".into(),
+                value: operation_id.clone(),
+            });
+            scoped.push(EnvVar {
+                name: "BUZZ_MCP_JOB_REQUEST_EVENT_ID".into(),
+                value: request_event_id.clone(),
+            });
+        }
+        for server in &mut servers {
+            server.env.extend(scoped.iter().cloned());
         }
     }
     servers
@@ -5204,12 +5235,9 @@ mod tests {
     #[test]
     fn public_session_forwards_channel_origin_to_mcp() {
         let channel_id = Uuid::new_v4();
-        let servers = mcp_servers_with_git_origin(
-            &[test_mcp_server()],
-            Some(channel_id),
-            Some("stream"),
-            None,
-        );
+        let scope = SessionScope::Conversation { channel_id };
+        let servers =
+            mcp_servers_with_git_origin(&[test_mcp_server()], Some(&scope), Some("stream"), None);
         assert!(servers[0].env.iter().any(|entry| {
             entry.name == "BUZZ_GIT_ORIGIN_CHANNEL_ID" && entry.value == channel_id.to_string()
         }));
@@ -5221,9 +5249,12 @@ mod tests {
 
     #[test]
     fn private_session_forwards_agent_name_without_channel_id() {
+        let scope = SessionScope::Conversation {
+            channel_id: Uuid::new_v4(),
+        };
         let servers = mcp_servers_with_git_origin(
             &[test_mcp_server()],
-            Some(Uuid::new_v4()),
+            Some(&scope),
             Some("dm"),
             Some("Builder"),
         );
@@ -5234,6 +5265,36 @@ mod tests {
             .env
             .iter()
             .any(|entry| entry.name == "BUZZ_GIT_ORIGIN_CHANNEL_ID"));
+    }
+
+    #[test]
+    fn job_session_mcp_scope_is_exact_and_does_not_use_chat_thread() {
+        let scope = SessionScope::Job {
+            channel_id: Uuid::new_v4(),
+            operation_id: Uuid::new_v4().to_string(),
+            request_event_id: "a".repeat(64),
+        };
+        let servers =
+            mcp_servers_with_git_origin(&[test_mcp_server()], Some(&scope), Some("stream"), None);
+        let env = &servers[0].env;
+        assert!(env.iter().any(|entry| {
+            entry.name == "BUZZ_MCP_SESSION_CHANNEL_ID"
+                && entry.value == scope.channel_id().to_string()
+        }));
+        assert!(env.iter().any(|entry| {
+            entry.name == "BUZZ_MCP_JOB_OPERATION_ID"
+                && entry.value
+                    == *match &scope {
+                        SessionScope::Job { operation_id, .. } => operation_id,
+                        _ => unreachable!(),
+                    }
+        }));
+        assert!(env.iter().any(|entry| {
+            entry.name == "BUZZ_MCP_JOB_REQUEST_EVENT_ID" && entry.value == "a".repeat(64)
+        }));
+        assert!(!env
+            .iter()
+            .any(|entry| entry.name == "BUZZ_MCP_SESSION_THREAD_ROOT_ID"));
     }
 
     // These pin the initial_message dispatch path (run_prompt_task, ~line 855):

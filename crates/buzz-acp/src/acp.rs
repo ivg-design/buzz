@@ -214,6 +214,67 @@ pub struct AcpClient {
     standard_usage: StandardUsageTracker,
     /// Known adapter identity for prompt-response usage mapping.
     standard_adapter: Option<StandardAdapterKind>,
+    /// Bounded visible assistant text emitted during the current prompt.
+    turn_text: String,
+    /// Set when assistant output exceeded the capture bound.
+    turn_text_overflowed: bool,
+}
+
+const MAX_CAPTURED_TURN_TEXT_BYTES: usize = 128 * 1024;
+const HARNESS_ONLY_ENV: &[&str] = &[
+    "BUZZ_PRIVATE_KEY",
+    "BUZZ_ACP_PRIVATE_KEY",
+    "BUZZ_RELAY_PRIVATE_KEY",
+    "BUZZ_MEMBER_PRIVATE_KEY",
+    "BUZZ_PRIVATE_KEY_FILE",
+    "BUZZ_ACP_PRIVATE_KEY_FILE",
+    "BUZZ_NSEC",
+    "BUZZ_AGENT_NSEC",
+    "NOSTR_PRIVATE_KEY",
+    "NOSTR_PRIVATE_KEY_FILE",
+    "NOSTR_SECRET_KEY",
+    "NOSTR_NSEC",
+    "BUZZ_AUTH_TAG",
+    "BUZZ_AGENT_AUTH_TAG",
+    "BUZZ_AUTH_TAG_FILE",
+    "BUZZ_AUTHORIZATION",
+    "BUZZ_AUTHZ",
+    "BUZZ_API_TOKEN",
+    "BUZZ_ACP_API_TOKEN",
+    "BUZZ_AUTH_TOKEN",
+    "BUZZ_ACCESS_TOKEN",
+    "BUZZ_ACP_JOB_GRANTS_JSON",
+    "BUZZ_ACP_JOB_GRANTS_FILE",
+    "BUZZ_ACP_JOB_LEDGER_DIR",
+    "BUZZ_ACP_OWNER_GITHUB_LOGIN",
+    "BUZZ_ACP_ALLOW_INSECURE_LOOPBACK_JOBS",
+];
+
+fn is_harness_only_env(name: &str) -> bool {
+    if HARNESS_ONLY_ENV.contains(&name)
+        || name.starts_with("BUZZ_MCP_")
+        || name.starts_with("BUZZ_ACP_JOB_")
+        || name.starts_with("GIT_CONFIG_")
+    {
+        return true;
+    }
+    let namespaced_secret = name.starts_with("BUZZ_") || name.starts_with("NOSTR_");
+    namespaced_secret
+        && [
+            "PRIVATE_KEY",
+            "SECRET_KEY",
+            "NSEC",
+            "AUTH_TAG",
+            "AUTHORIZATION",
+            "AUTHZ",
+            "API_TOKEN",
+            "AUTH_TOKEN",
+            "ACCESS_TOKEN",
+            "KEY_FILE",
+            "KEYFILE",
+        ]
+        .iter()
+        .any(|marker| name.contains(marker))
 }
 
 /// Recursively merge `overlay` into `base`, with `overlay` winning on scalar/shape
@@ -468,6 +529,14 @@ impl AcpClient {
             // Ensure the child is killed when the AcpClient is dropped (best-effort).
             // Callers MUST still call shutdown().await for guaranteed cleanup.
             .kill_on_drop(true);
+        for name in HARNESS_ONLY_ENV {
+            cmd.env_remove(name);
+        }
+        for name in std::env::vars_os().filter_map(|(name, _)| name.into_string().ok()) {
+            if is_harness_only_env(&name) {
+                cmd.env_remove(name);
+            }
+        }
 
         // Per-persona env vars (e.g., GOOSE_PROVIDER, BUZZ_AGENT_PROVIDER).
         // For most keys, operator precedence wins: skip injection if already set
@@ -504,6 +573,10 @@ impl AcpClient {
         }
 
         for (key, value) in extra_env {
+            if is_harness_only_env(key) {
+                tracing::warn!(env = %key, "ignoring harness-only credential in child agent environment");
+                continue;
+            }
             if key == "CODEX_CONFIG" && codex_merge_active {
                 // Handled by build_codex_config_env; skip here to avoid double-setting.
                 continue;
@@ -563,6 +636,8 @@ impl AcpClient {
             goose_usage: UsageTracker::default(),
             standard_usage: StandardUsageTracker::default(),
             standard_adapter,
+            turn_text: String::new(),
+            turn_text_overflowed: false,
         })
     }
 
@@ -781,6 +856,8 @@ impl AcpClient {
         idle_timeout: std::time::Duration,
         max_duration: std::time::Duration,
     ) -> Result<StopReason, AcpError> {
+        self.turn_text.clear();
+        self.turn_text_overflowed = false;
         let params = build_prompt_params(session_id, prompt_blocks);
         let hard_deadline = tokio::time::Instant::now() + max_duration;
         self.current_hard_deadline = Some(hard_deadline);
@@ -888,6 +965,13 @@ impl AcpClient {
         let goose_usage = self.goose_usage.take();
         let standard_usage = self.standard_usage.take();
         goose_usage.or(standard_usage)
+    }
+
+    /// Consume the bounded assistant text captured for the completed turn.
+    pub(crate) fn take_turn_text(&mut self) -> Option<String> {
+        let text = std::mem::take(&mut self.turn_text);
+        let overflowed = std::mem::replace(&mut self.turn_text_overflowed, false);
+        (!overflowed).then_some(text)
     }
 
     /// Notify the usage tracker that buzz-acp just spawned a new session.
@@ -1755,6 +1839,16 @@ impl AcpClient {
         match update_type {
             "agent_message_chunk" => {
                 if let Some(text) = update["content"]["text"].as_str() {
+                    if self.last_prompt_id.is_some() && !self.turn_text_overflowed {
+                        if self.turn_text.len().saturating_add(text.len())
+                            <= MAX_CAPTURED_TURN_TEXT_BYTES
+                        {
+                            self.turn_text.push_str(text);
+                        } else {
+                            self.turn_text.clear();
+                            self.turn_text_overflowed = true;
+                        }
+                    }
                     tracing::info!(target: "acp::stream", "{text}");
                 }
                 false
@@ -2553,6 +2647,95 @@ mod tests {
             serialized["env"][0]["name"].as_str(),
             Some("BUZZ_RELAY_URL")
         );
+    }
+
+    #[tokio::test]
+    async fn agent_child_cannot_inherit_or_reinject_harness_credentials() {
+        let sentinel = "must-not-reach-agent";
+        let probe_names = HARNESS_ONLY_ENV
+            .iter()
+            .copied()
+            .chain([
+                "BUZZ_MCP_SESSION_CHANNEL_ID",
+                "BUZZ_ACP_JOB_FUTURE_SECRET",
+                "NOSTR_AUTHORIZATION_LEGACY",
+                "GIT_CONFIG_VALUE_0",
+            ])
+            .collect::<Vec<_>>();
+        let inherited_probe_names = [
+            "BUZZ_PRIVATE_KEY",
+            "BUZZ_MCP_SESSION_CHANNEL_ID",
+            "BUZZ_ACP_JOB_FUTURE_SECRET",
+            "NOSTR_AUTHORIZATION_LEGACY",
+            "GIT_CONFIG_VALUE_0",
+        ];
+        let prior_values = inherited_probe_names
+            .iter()
+            .map(std::env::var_os)
+            .collect::<Vec<_>>();
+        for name in inherited_probe_names {
+            std::env::set_var(name, sentinel);
+        }
+        #[cfg(unix)]
+        let (command, args) = (
+            "/bin/sh",
+            vec![
+                "-c".into(),
+                probe_names
+                    .iter()
+                    .map(|name| format!("test -z \"${{{name}:-}}\" || exit 97"))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ],
+        );
+        #[cfg(windows)]
+        let (command, args) = (
+            "cmd",
+            vec![
+                "/C".into(),
+                probe_names
+                    .iter()
+                    .map(|name| format!("if defined {name} exit /b 97"))
+                    .collect::<Vec<_>>()
+                    .join(" & "),
+            ],
+        );
+        let injected = probe_names
+            .iter()
+            .map(|name| ((*name).to_owned(), sentinel.to_owned()))
+            .collect::<Vec<_>>();
+        let mut client = AcpClient::spawn(command, &args, &injected, false)
+            .await
+            .expect("spawn credential probe");
+        for (name, prior) in inherited_probe_names.into_iter().zip(prior_values) {
+            match prior {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+        let status = client.child.wait().await.expect("wait for probe");
+        assert!(
+            status.success(),
+            "agent child observed a harness credential"
+        );
+    }
+
+    #[test]
+    fn harness_only_env_classifier_covers_current_and_future_secret_aliases() {
+        for name in HARNESS_ONLY_ENV {
+            assert!(is_harness_only_env(name), "missing exact secret {name}");
+        }
+        for name in [
+            "BUZZ_MCP_SESSION_CHANNEL_ID",
+            "BUZZ_ACP_JOB_FUTURE_SECRET",
+            "BUZZ_FUTURE_PRIVATE_KEY_FILE",
+            "NOSTR_LEGACY_AUTHZ",
+            "GIT_CONFIG_VALUE_99",
+        ] {
+            assert!(is_harness_only_env(name), "missing secret family {name}");
+        }
+        assert!(!is_harness_only_env("BUZZ_AGENT_PROVIDER"));
+        assert!(!is_harness_only_env("CODEX_CONFIG"));
     }
 
     #[test]

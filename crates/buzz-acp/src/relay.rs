@@ -21,6 +21,8 @@
 //! `HarnessRelay` communicates with the background task via a `RelayCommand`
 //! channel. `next_event()` reads from the event receiver.
 
+mod agent_jobs;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
@@ -256,6 +258,9 @@ pub struct RestClient {
     pub auth_tag_json: Option<String>,
 }
 
+/// Server-resolved tenant and authenticated signer for this HTTP session.
+pub type AuthenticatedContext = buzz_core::CommunityContext;
+
 /// Whether an HTTP status code is retriable (transient server/rate-limit errors).
 fn is_retriable_status(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 429 | 502 | 503 | 504)
@@ -268,6 +273,7 @@ const REST_RETRY_BASE_DELAYS: [Duration; 3] = [
     Duration::from_millis(1000),
     Duration::from_millis(2000),
 ];
+const DURABLE_EVENT_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn unix_now_secs() -> u64 {
     std::time::SystemTime::now()
@@ -277,6 +283,45 @@ fn unix_now_secs() -> u64 {
 }
 
 impl RestClient {
+    /// POST one authenticated JSON document and return the untouched response
+    /// bytes so security-sensitive callers can reject duplicate JSON keys.
+    pub(crate) async fn post_authenticated_json_raw<T: serde::Serialize>(
+        &self,
+        path: &str,
+        body: &T,
+    ) -> Result<String, RelayError> {
+        let body_bytes = serde_json::to_vec(body)
+            .map_err(|error| RelayError::Http(format!("request serialize error: {error}")))?;
+        let response = self.bridge_post(path, &body_bytes).await?;
+        response
+            .text()
+            .await
+            .map_err(|error| RelayError::Http(format!("invalid {path} response: {error}")))
+    }
+
+    /// Fetch the relay-authenticated tenant boundary for durable local state.
+    pub async fn authenticated_context(&self) -> Result<AuthenticatedContext, RelayError> {
+        let path = "/api/context";
+        let url = format!("{}{}", self.base_url, path);
+        let auth_tag_header = self.auth_tag_json.clone();
+        let response = self
+            .request_with_retry("GET", path, || {
+                let auth = self.nip98_header("GET", &url, None).unwrap_or_default();
+                let mut request = self.http.get(&url).header("Authorization", auth);
+                if let Some(ref tag) = auth_tag_header {
+                    request = request.header("x-auth-tag", tag);
+                }
+                request.send()
+            })
+            .await?;
+        let context: AuthenticatedContext = response
+            .json()
+            .await
+            .map_err(|error| RelayError::Http(format!("invalid /api/context response: {error}")))?;
+        validate_authenticated_context(&context, &self.base_url)?;
+        Ok(context)
+    }
+
     /// Fetch the relay's stable signing identity from its NIP-11 document.
     ///
     /// Relay-authored workflow attribution is trusted only when the event signer
@@ -579,6 +624,172 @@ impl RestClient {
         }
         serde_json::from_str(&text).map_err(|e| RelayError::Http(e.to_string()))
     }
+
+    /// Submit durable state and require a positive acknowledgement for this exact event.
+    pub async fn submit_event_confirmed(&self, event: &Event) -> Result<(), RelayError> {
+        self.submit_event_confirmed_with_timeout(event, DURABLE_EVENT_TIMEOUT)
+            .await
+    }
+
+    async fn submit_event_confirmed_with_timeout(
+        &self,
+        event: &Event,
+        timeout_duration: Duration,
+    ) -> Result<(), RelayError> {
+        let expected_id = event.id.to_hex();
+        let response = tokio::time::timeout(timeout_duration, self.submit_event(event))
+            .await
+            .map_err(|_| RelayError::Timeout)??;
+        let accepted = response.get("accepted").and_then(Value::as_bool) == Some(true);
+        let exact_id =
+            response.get("event_id").and_then(Value::as_str) == Some(expected_id.as_str());
+        if !accepted || !exact_id {
+            return Err(RelayError::Http(format!(
+                "relay did not acknowledge exact event {expected_id}"
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn accepting_test_pair(
+        keys: Keys,
+    ) -> (Self, mpsc::Receiver<Event>, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind durable event test server");
+        let base_url = format!("http://{}", listener.local_addr().expect("test address"));
+        let (event_tx, event_rx) = mpsc::channel(64);
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = Vec::with_capacity(4096);
+                let mut chunk = [0_u8; 4096];
+                let header_end = loop {
+                    let read = socket.read(&mut chunk).await.unwrap_or_default();
+                    if read == 0 {
+                        break None;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                    if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                        break Some(end + 4);
+                    }
+                };
+                let Some(header_end) = header_end else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let is_job_authorize = headers
+                    .lines()
+                    .next()
+                    .is_some_and(|line| line.contains(" /api/jobs/authorize "));
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                while request.len() < header_end + content_length {
+                    let read = socket.read(&mut chunk).await.unwrap_or_default();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                }
+                if is_job_authorize {
+                    let Ok(authorization) = serde_json::from_slice::<
+                        buzz_core::job_authorization::JobAuthorizationRequest,
+                    >(
+                        &request[header_end..header_end.saturating_add(content_length)],
+                    ) else {
+                        continue;
+                    };
+                    let now = chrono::Utc::now();
+                    let response_body = buzz_core::job_authorization::JobAuthorizationResponse {
+                        schema_version:
+                            buzz_core::job_authorization::JOB_AUTHORIZATION_SCHEMA_VERSION.into(),
+                        authorized: true,
+                        authorization_id: Uuid::new_v4().to_string(),
+                        issued_at: now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                        expires_at: (now + chrono::Duration::seconds(5))
+                            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                        binding: buzz_core::job_authorization::JobAuthorizationBinding::from(
+                            &authorization,
+                        ),
+                        project_head_event_id: "a".repeat(64),
+                        repository_coordinate: format!(
+                            "30617:{}:nemo",
+                            authorization.requester_pubkey
+                        ),
+                        repository_announcement_event_id: "b".repeat(64),
+                        requester_owner_pubkey: authorization.requester_pubkey.clone(),
+                        recipient_owner_pubkey: authorization.recipient_pubkey.clone(),
+                    };
+                    let body = serde_json::to_string(&response_body).expect("authorization JSON");
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    continue;
+                }
+                let Ok(event) = serde_json::from_slice::<Event>(
+                    &request[header_end..header_end.saturating_add(content_length)],
+                ) else {
+                    continue;
+                };
+                let body = serde_json::json!({
+                    "event_id": event.id.to_hex(),
+                    "accepted": true,
+                    "message": ""
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = event_tx.send(event).await;
+            }
+        });
+        (
+            Self {
+                http: reqwest::Client::new(),
+                base_url,
+                keys,
+                auth_tag_json: None,
+            },
+            event_rx,
+            server,
+        )
+    }
+}
+
+fn validate_authenticated_context(
+    context: &AuthenticatedContext,
+    base_url: &str,
+) -> Result<(), RelayError> {
+    context.validate().map_err(RelayError::Http)?;
+    let community = Uuid::parse_str(&context.community_id)
+        .map_err(|_| RelayError::Http("relay context community_id is invalid".into()))?;
+    if community.is_nil() {
+        return Err(RelayError::Http(
+            "relay context community_id must not be nil".into(),
+        ));
+    }
+    let expected_host = buzz_core::tenant::relay_url_authority(base_url);
+    if expected_host.is_empty() || context.host != expected_host {
+        return Err(RelayError::Http(
+            "relay context host does not match the configured relay authority".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Events the harness cares about.
@@ -668,6 +879,10 @@ enum RelayCommand {
         filter: ChannelFilter,
         replay_since: Option<u64>,
     },
+    /// Subscribe to addressed job requests for one locally granted Project.
+    SubscribeAgentJobs { channel_id: Uuid },
+    /// Stop receiving jobs after Project channel membership is removed.
+    UnsubscribeAgentJobs { channel_id: Uuid },
     /// Unsubscribe from a channel (sends a NIP-01 CLOSE).
     Unsubscribe { channel_id: Uuid },
     /// Reconnect to the relay (re-authenticate and resubscribe).
@@ -926,6 +1141,35 @@ impl HarnessRelay {
         Ok(())
     }
 
+    /// Subscribe to still-live job requests for exactly the locally granted
+    /// Project home channels.
+    ///
+    /// Each channel gets an independent `agent-job-<uuid>` REQ and replay
+    /// cursor. The caller must pass only canonical channels from the local grant
+    /// document; an empty slice sends no command and leaves chat-only startup
+    /// unchanged.
+    pub async fn subscribe_agent_jobs(&mut self, channel_ids: &[Uuid]) -> Result<(), RelayError> {
+        let mut unique = HashSet::with_capacity(channel_ids.len());
+        for &channel_id in channel_ids {
+            if !unique.insert(channel_id) {
+                continue;
+            }
+            self.cmd_tx
+                .send(RelayCommand::SubscribeAgentJobs { channel_id })
+                .await
+                .map_err(|_| RelayError::ConnectionClosed)?;
+            debug!(channel_id = %channel_id, "queued grant-derived agent-job subscription");
+        }
+        Ok(())
+    }
+
+    pub async fn unsubscribe_agent_jobs(&mut self, channel_id: Uuid) -> Result<(), RelayError> {
+        self.cmd_tx
+            .send(RelayCommand::UnsubscribeAgentJobs { channel_id })
+            .await
+            .map_err(|_| RelayError::ConnectionClosed)
+    }
+
     /// Subscribe to membership notifications for this agent.
     pub async fn subscribe_membership_notifications(&mut self) -> Result<(), RelayError> {
         self.cmd_tx
@@ -1144,6 +1388,8 @@ struct BgState {
     seen_ids: TwoGenDedup,
     /// Per-channel filter used on subscribe (for resubscribe after reconnect).
     active_filters: HashMap<Uuid, ChannelFilter>,
+    /// Grant-derived job subscriptions, isolated from ordinary chat state.
+    agent_jobs: agent_jobs::JobSubscriptions,
     /// Oldest timestamp of a membership notification that was dropped due to
     /// backpressure. If set, reconnect replay must start from this timestamp
     /// (minus skew) to re-deliver the lost event. Reset on successful reconnect.
@@ -1232,6 +1478,7 @@ impl BgState {
             last_seen: HashMap::new(),
             seen_ids: TwoGenDedup::new(SEEN_ID_LIMIT),
             active_filters: HashMap::new(),
+            agent_jobs: agent_jobs::JobSubscriptions::default(),
             membership_dropped_since: None,
             membership_last_seen: None,
             membership_sub_active: false,
@@ -1462,6 +1709,12 @@ fn apply_command_to_state(state: &mut BgState, cmd: RelayCommand) {
                     .unwrap_or_else(unix_now_secs)
             });
         }
+        RelayCommand::SubscribeAgentJobs { channel_id } => {
+            state.agent_jobs.subscribe(channel_id);
+        }
+        RelayCommand::UnsubscribeAgentJobs { channel_id } => {
+            state.agent_jobs.unsubscribe(&channel_id);
+        }
         RelayCommand::Unsubscribe { channel_id } => {
             state.active_subscriptions.remove(&channel_id);
             state.clear_channel_state(&channel_id);
@@ -1612,6 +1865,36 @@ async fn execute_connected_command(
                 );
                 false
             }
+        }
+        RelayCommand::SubscribeAgentJobs { channel_id } => {
+            state.agent_jobs.subscribe(channel_id);
+            if let Some(retry_after) = state.check_rate_gate() {
+                debug!(channel_id = %channel_id, "rate-gated: deferring agent-job REQ");
+                state.agent_jobs.park_rate_limited(channel_id, retry_after);
+                return true;
+            }
+            if state
+                .agent_jobs
+                .send(ws, channel_id, agent_pubkey_hex)
+                .await
+            {
+                state.agent_jobs.remove_rate_limited(&channel_id);
+                state.agent_jobs.remove_retry(&channel_id);
+                true
+            } else {
+                warn!(channel_id = %channel_id, "agent-job REQ failed — recording intent for reconnect");
+                state.agent_jobs.mark_retry(channel_id);
+                false
+            }
+        }
+        RelayCommand::UnsubscribeAgentJobs { channel_id } => {
+            state.agent_jobs.unsubscribe(&channel_id);
+            let msg = json!(["CLOSE", agent_jobs::subscription_id(channel_id)]);
+            if let Ok(text) = serde_json::to_string(&msg) {
+                let _ = ws_send_timeout(ws, Message::Text(text.into()), WS_SEND_TIMEOUT_SECS).await;
+            }
+            debug!(channel_id = %channel_id, "unsubscribed from agent jobs");
+            true
         }
         RelayCommand::Unsubscribe { channel_id } => {
             if let Some(sub_id) = state.active_subscriptions.remove(&channel_id) {
@@ -1957,6 +2240,30 @@ async fn run_background_task(
             if budget > 0 && !state.resubscribe_retry.is_empty() {
                 let sent =
                     drain_resubscribe_retry(&mut ws, &mut state, &agent_pubkey_hex, budget).await;
+                budget = budget.saturating_sub(sent);
+                if sent > 0 {
+                    any_sent = true;
+                }
+            }
+
+            if budget > 0 && state.agent_jobs.has_rate_limited_pending() {
+                let gate = state.check_rate_gate();
+                let sent = state
+                    .agent_jobs
+                    .drain_rate_limited(&mut ws, &agent_pubkey_hex, gate, budget)
+                    .await;
+                budget = budget.saturating_sub(sent);
+                if sent > 0 {
+                    any_sent = true;
+                }
+            }
+
+            if budget > 0 && state.agent_jobs.has_retries() {
+                let gate = state.check_rate_gate();
+                let sent = state
+                    .agent_jobs
+                    .drain_retries(&mut ws, &agent_pubkey_hex, gate, budget)
+                    .await;
                 budget = budget.saturating_sub(sent);
                 if sent > 0 {
                     any_sent = true;
@@ -2338,6 +2645,44 @@ async fn handle_ws_message(
                             }
                             Err(mpsc::error::TrySendError::Closed(_)) => return false,
                         }
+                    } else if let Some(channel_id) =
+                        agent_jobs::channel_from_subscription_id(&subscription_id)
+                    {
+                        if !state.agent_jobs.contains(&channel_id) {
+                            warn!(channel_id = %channel_id, "received EVENT for inactive agent-job subscription");
+                            return true;
+                        }
+                        if !agent_jobs::is_inbound_kind(event.kind.as_u16() as u32) {
+                            warn!(channel_id = %channel_id, kind = event.kind.as_u16(), "agent-job subscription delivered an unexpected kind — dropping");
+                            return true;
+                        }
+                        let tagged_channel = extract_h_tag_uuid(&event);
+                        if tagged_channel != Some(channel_id) {
+                            warn!(channel_id = %channel_id, "agent-job event has a mismatched or missing h tag — dropping");
+                            return true;
+                        }
+                        let ts = event.created_at.as_secs();
+                        let event_id_hex = event.id.to_hex();
+                        state.agent_jobs.record_seen(&channel_id, ts);
+                        if state.seen_ids.insert(event_id_hex.clone()) {
+                            let buzz_event = BuzzEvent {
+                                connection_generation: state.connection_generation,
+                                channel_id,
+                                event: *event,
+                            };
+                            match event_tx.try_send(Some(buzz_event)) {
+                                Ok(()) => {}
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    state.seen_ids.remove(&event_id_hex);
+                                    state.agent_jobs.record_dropped(&channel_id, ts);
+                                    state.proactive_resubscribe_needed = true;
+                                    warn!(channel_id = %channel_id, ts, "agent-job event dropped by backpressure — isolated replay queued");
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_)) => return false,
+                            }
+                        } else {
+                            debug!(channel_id = %channel_id, "dropping duplicate agent-job event");
+                        }
                     } else if let Some(channel_id) = channel_id_from_sub_id(&subscription_id) {
                         let ts = event.created_at.as_secs();
                         let event_id_hex = event.id.to_hex();
@@ -2441,6 +2786,10 @@ async fn handle_ws_message(
                         );
                         if let Some(channel_id) = channel_id_from_sub_id(&subscription_id) {
                             state.rate_limited_pending.insert(channel_id, deadline);
+                        } else if let Some(channel_id) =
+                            agent_jobs::channel_from_subscription_id(&subscription_id)
+                        {
+                            state.agent_jobs.park_rate_limited(channel_id, deadline);
                         } else if subscription_id == MEMBERSHIP_NOTIF_SUB_ID {
                             // Mark membership sub for drain recovery. The relay rejected
                             // this REQ before registering it, so the sub does not exist
@@ -2501,6 +2850,24 @@ async fn handle_ws_message(
                                 "membership resubscribe failed after CLOSED — triggering reconnect"
                             );
                             return false;
+                        }
+                    } else if let Some(channel_id) =
+                        agent_jobs::channel_from_subscription_id(&subscription_id)
+                    {
+                        if !state.agent_jobs.contains(&channel_id) {
+                            debug!(channel_id = %channel_id, "ignoring CLOSED for inactive agent-job subscription");
+                        } else {
+                            if state
+                                .agent_jobs
+                                .send(ws, channel_id, agent_pubkey_hex)
+                                .await
+                            {
+                                state.agent_jobs.clear_dropped(&channel_id);
+                            } else {
+                                state.agent_jobs.mark_retry(channel_id);
+                                warn!(channel_id = %channel_id, "agent-job resubscribe failed after CLOSED — triggering reconnect");
+                                return false;
+                            }
                         }
                     } else if let Some(channel_id) = channel_id_from_sub_id(&subscription_id) {
                         // Guard: only resubscribe if the channel is still active.
@@ -2724,6 +3091,7 @@ async fn resubscribe_after_reconnect(
         // shared admission counter survives socket replacement.
         state.rate_limited_pending.clear();
         state.resubscribe_retry.clear();
+        state.agent_jobs.clear_derived_queues();
     }
 
     let mut deferred_commands = VecDeque::new();
@@ -2774,6 +3142,32 @@ async fn resubscribe_after_reconnect(
         }
     }
 
+    let job_channels = state.agent_jobs.channels();
+    if !job_channels.is_empty() {
+        info!(
+            "resubscribing to {} grant-derived agent-job channel(s)",
+            job_channels.len()
+        );
+        for channel_id in job_channels {
+            if let Some(retry_after) = state.check_rate_gate() {
+                state.agent_jobs.park_rate_limited(channel_id, retry_after);
+                continue;
+            }
+            if state
+                .agent_jobs
+                .send(ws, channel_id, agent_pubkey_hex)
+                .await
+            {
+                state.agent_jobs.clear_dropped(&channel_id);
+                if !pacing_sleep(cmd_rx, &mut deferred_commands, REQ_PACING_INTERVAL).await {
+                    return ResubscribeResult::Shutdown;
+                }
+            } else {
+                state.agent_jobs.mark_retry(channel_id);
+            }
+        }
+    }
+
     // Membership and observer-control are control-plane subscriptions: a silent
     // failure breaks join notifications and agent pause/resume. A shared quota
     // gate parks their intent for the main-loop drain just like channel REQs.
@@ -2782,7 +3176,7 @@ async fn resubscribe_after_reconnect(
             debug!("rate-gated: parking membership resubscribe after reconnect");
             state.membership_resub_needed = true;
         } else {
-            if !state.active_subscriptions.is_empty()
+            if (!state.active_subscriptions.is_empty() || !state.agent_jobs.is_empty())
                 && !pacing_sleep(cmd_rx, &mut deferred_commands, REQ_PACING_INTERVAL).await
             {
                 return ResubscribeResult::Shutdown;
@@ -3057,6 +3451,7 @@ async fn drain_commands(
                 return ReconnectOutcome::Shutdown;
             }
             RelayCommand::Subscribe { .. }
+            | RelayCommand::SubscribeAgentJobs { .. }
             | RelayCommand::SubscribeMembership
             | RelayCommand::SubscribeObserverControls => {
                 // A gated subscription is only parked in state; pace only an
@@ -3743,15 +4138,22 @@ fn drop_channel_on_access_denied(state: &mut BgState, sub_id: &str, message: &st
     if !CHANNEL_ACCESS_DENIED_REASONS.contains(&message) {
         return false;
     }
-    let Some(channel_id) = channel_id_from_sub_id(sub_id) else {
-        return false;
-    };
-    warn!(
-        "channel {channel_id} access denied by relay: {message} — dropping subscription, keeping connection"
-    );
-    state.active_subscriptions.remove(&channel_id);
-    state.clear_channel_state(&channel_id);
-    true
+    if let Some(channel_id) = channel_id_from_sub_id(sub_id) {
+        warn!(
+            "channel {channel_id} access denied by relay: {message} — dropping subscription, keeping connection"
+        );
+        state.active_subscriptions.remove(&channel_id);
+        state.clear_channel_state(&channel_id);
+        return true;
+    }
+    if let Some(channel_id) = agent_jobs::channel_from_subscription_id(sub_id) {
+        warn!(
+            "agent-job channel {channel_id} access denied by relay: {message} — dropping subscription, keeping connection"
+        );
+        state.agent_jobs.unsubscribe(&channel_id);
+        return true;
+    }
+    false
 }
 
 /// Apply the appropriate auth header to a reqwest request builder.
@@ -4221,6 +4623,99 @@ async fn wait_for_any_ok(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn one_response_rest_client(
+        keys: Keys,
+        body: Option<String>,
+    ) -> (RestClient, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind REST test server");
+        let base_url = format!("http://{}", listener.local_addr().expect("test address"));
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept REST request");
+            let mut request = [0_u8; 4096];
+            let _ = socket.read(&mut request).await;
+            if let Some(body) = body {
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        });
+        (
+            RestClient {
+                http: reqwest::Client::new(),
+                base_url,
+                keys,
+                auth_tag_json: None,
+            },
+            server,
+        )
+    }
+
+    fn durable_test_event(keys: &Keys) -> Event {
+        EventBuilder::new(Kind::TextNote, "durable")
+            .sign_with_keys(keys)
+            .expect("sign event")
+    }
+
+    #[test]
+    fn authenticated_context_is_strict_and_accepts_dev_authorities() {
+        let pubkey = Keys::generate().public_key().to_hex();
+        for host in ["buzz.example", "localhost:3000", "[::1]:3000"] {
+            let context = AuthenticatedContext {
+                schema_version: "buzz.context.v1".into(),
+                community_id: Uuid::new_v4().to_string(),
+                host: host.into(),
+                pubkey: pubkey.clone(),
+            };
+            validate_authenticated_context(&context, &format!("https://{host}"))
+                .expect("valid context");
+        }
+        let extra = serde_json::json!({
+            "schema_version": "buzz.context.v1",
+            "community_id": Uuid::new_v4(),
+            "host": "buzz.example",
+            "pubkey": pubkey,
+            "tenant_override": "attacker"
+        });
+        assert!(serde_json::from_value::<AuthenticatedContext>(extra).is_err());
+    }
+
+    #[tokio::test]
+    async fn durable_submit_rejects_negative_and_wrong_id_acknowledgements() {
+        let keys = Keys::generate();
+        let event = durable_test_event(&keys);
+        for body in [
+            serde_json::json!({"accepted": false, "event_id": event.id.to_hex()}).to_string(),
+            serde_json::json!({"accepted": true, "event_id": "f".repeat(64)}).to_string(),
+        ] {
+            let (client, server) = one_response_rest_client(keys.clone(), Some(body)).await;
+            assert!(client.submit_event_confirmed(&event).await.is_err());
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_submit_timeout_never_becomes_an_acknowledgement() {
+        let keys = Keys::generate();
+        let event = durable_test_event(&keys);
+        let (client, server) = one_response_rest_client(keys, None).await;
+        assert!(matches!(
+            client
+                .submit_event_confirmed_with_timeout(&event, Duration::from_millis(25))
+                .await,
+            Err(RelayError::Timeout)
+        ));
+        server.abort();
+    }
 
     async fn nip11_test_client(
         responses: HashMap<String, (u16, String)>,
@@ -4790,6 +5285,76 @@ mod tests {
                 replay_since: Some(1_000),
             },
         );
+    }
+
+    #[tokio::test]
+    async fn agent_job_reconnect_req_is_exact_and_ttl_bounded() {
+        let (mut client, mut server) = test_ws_pair().await;
+        let (_cmd_tx, mut cmd_rx) = mpsc::channel(1);
+        let mut state = BgState::new();
+        let channel_id = Uuid::new_v4();
+        apply_command_to_state(&mut state, RelayCommand::SubscribeAgentJobs { channel_id });
+        let before = unix_now_secs();
+
+        let result =
+            resubscribe_after_reconnect(&mut client, &mut cmd_rx, &mut state, "agent-pubkey", true)
+                .await;
+
+        assert!(matches!(result, ResubscribeResult::Ok));
+        let frame = next_test_frame(&mut server).await;
+        assert_eq!(frame[0], "REQ");
+        assert_eq!(frame[1], agent_jobs::subscription_id(channel_id));
+        let filter = frame[2].as_object().expect("job filter object");
+        assert_eq!(filter.len(), 4, "job REQ must have no inherited chat keys");
+        assert_eq!(
+            filter["kinds"],
+            json!([
+                buzz_core::kind::KIND_JOB_REQUEST,
+                buzz_core::kind::KIND_JOB_CANCEL
+            ])
+        );
+        assert_eq!(filter["#h"], json!([channel_id.to_string()]));
+        assert_eq!(filter["#p"], json!(["agent-pubkey"]));
+        let since = filter["since"].as_u64().expect("numeric since");
+        let ttl = u64::try_from(buzz_core::job::MAX_JOB_TTL_SECONDS).unwrap();
+        let after = unix_now_secs();
+        assert!(since >= before.saturating_sub(ttl));
+        assert!(since <= after.saturating_sub(ttl));
+        assert!(state.active_subscriptions.is_empty());
+        assert!(state.active_filters.is_empty());
+        assert!(state.last_seen.is_empty());
+    }
+
+    #[test]
+    fn agent_job_cursor_and_unsubscribe_do_not_touch_chat_state() {
+        let mut state = BgState::new();
+        let channel_id = Uuid::new_v4();
+        seed_test_subscription(&mut state, channel_id);
+        state.agent_jobs.subscribe(channel_id);
+        let now = unix_now_secs();
+        let keys = nostr::Keys::generate();
+        let chat = make_test_event(&keys, now - 10);
+        let job = make_test_event(&keys, now - 60);
+        assert!(state.record_event(channel_id, &chat));
+        assert!(state
+            .agent_jobs
+            .record_seen(&channel_id, job.created_at.as_secs()));
+        assert!(state.seen_ids.insert(job.id.to_hex()));
+        assert!(
+            !state.seen_ids.insert(job.id.to_hex()),
+            "the same signed event ID must not be forwarded twice"
+        );
+        assert_eq!(state.channel_since(&channel_id), Some(now - 10));
+        assert_eq!(state.agent_jobs.since(&channel_id), now - 65);
+
+        apply_command_to_state(
+            &mut state,
+            RelayCommand::UnsubscribeAgentJobs { channel_id },
+        );
+        assert!(state.active_subscriptions.contains_key(&channel_id));
+        assert!(state.active_filters.contains_key(&channel_id));
+        assert_eq!(state.channel_since(&channel_id), Some(now - 10));
+        assert!(!state.agent_jobs.contains(&channel_id));
     }
 
     #[tokio::test]

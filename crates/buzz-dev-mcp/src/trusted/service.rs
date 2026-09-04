@@ -15,10 +15,10 @@ use tokio_util::sync::CancellationToken;
 
 use super::tools::{prepare_handoff, publish_prepared_handoff};
 use super::{
-    cancel, dispatch, git, inbox, send_chat, status, A2aCancelParams, A2aDispatchParams,
-    A2aHandoffParams, A2aInboxParams, A2aStatusParams, ChatSendParams, JobPrivilegeGate,
-    PrivilegedGitOperationReceipt, PrivilegedOperationOutcome, ProjectGitCommitParams,
-    ProjectGitOperation, ProjectGitParams, TrustedRelay,
+    cancel, dispatch, git, inbox, peers, send_chat, status, A2aCancelParams, A2aDispatchParams,
+    A2aHandoffParams, A2aInboxParams, A2aPeersParams, A2aStatusParams, ChatSendParams,
+    JobPrivilegeGate, PrivilegedGitOperationReceipt, PrivilegedOperationOutcome,
+    ProjectGitCommitParams, ProjectGitOperation, ProjectGitParams, TrustedRelay,
 };
 
 /// Typed Buzz tools backed by a harness-owned signer.
@@ -104,6 +104,21 @@ impl TrustedSessionMcp {
     ) -> Result<CallToolResult, ErrorData> {
         let cancellation = combine_cancellation(&self.session_cancellation, context.ct);
         let result = inbox(&self.relay, params, cancellation.clone()).await;
+        cancellation.cancel();
+        Ok(result)
+    }
+
+    #[tool(
+        name = "buzz_a2a_peers",
+        description = "List or resolve enrolled agents in the verified Nemo peer roster. Use the returned public key as recipient_pubkey for buzz_a2a_dispatch; duplicate names remain explicit."
+    )]
+    async fn buzz_a2a_peers(
+        &self,
+        Parameters(params): Parameters<A2aPeersParams>,
+        context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let cancellation = combine_cancellation(&self.session_cancellation, context.ct);
+        let result = peers(&self.relay, params, cancellation.clone()).await;
         cancellation.cancel();
         Ok(result)
     }

@@ -52,6 +52,15 @@ pub struct A2aInboxParams {
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct A2aPeersParams {
+    /// Optional exact, case-insensitive display-name filter. Duplicate names
+    /// deliberately return every verified matching public key.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct A2aStatusParams {
     pub request_event_id: String,
 }
@@ -115,6 +124,29 @@ pub async fn inbox(
             .query_job_events(None, params.limit, &cancellation)
             .await,
     )
+}
+
+pub async fn peers(
+    relay: &Arc<TrustedRelay>,
+    params: A2aPeersParams,
+    cancellation: CancellationToken,
+) -> CallToolResult {
+    let name = match params.name.as_deref().map(str::trim) {
+        Some(name) if name.trim().is_empty() || name.chars().count() > 128 => {
+            return error_result("peer name must contain 1 to 128 characters".into())
+        }
+        Some(name) => Some(name),
+        None => None,
+    };
+    match super::peers::discover(relay, &cancellation).await {
+        Ok(mut peers) => {
+            if let Some(name) = name {
+                peers.retain(|peer| peer.name.eq_ignore_ascii_case(name));
+            }
+            json_result(&serde_json::json!({"peers": peers}))
+        }
+        Err(error) => error_result(error),
+    }
 }
 
 pub async fn status(

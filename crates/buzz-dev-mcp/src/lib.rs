@@ -244,6 +244,7 @@ mod tool_inventory_tests {
                 [
                     "buzz_a2a_dispatch",
                     "buzz_a2a_inbox",
+                    "buzz_a2a_peers",
                     "buzz_a2a_status",
                     "buzz_a2a_cancel",
                     "buzz_a2a_handoff",

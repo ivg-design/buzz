@@ -3,6 +3,7 @@
 mod credentials;
 mod git;
 mod media;
+mod peers;
 mod privilege;
 mod relay;
 mod scope;
@@ -20,8 +21,8 @@ pub use relay::{PublishedEvent, TrustedRelay};
 pub use scope::{GrantMatch, GrantSet};
 pub use service::TrustedSessionMcp;
 pub use tools::{
-    cancel, dispatch, inbox, send_chat, status, A2aCancelParams, A2aDispatchParams,
-    A2aHandoffParams, A2aInboxParams, A2aStatusParams, ChatSendParams,
+    cancel, dispatch, inbox, peers, send_chat, status, A2aCancelParams, A2aDispatchParams,
+    A2aHandoffParams, A2aInboxParams, A2aPeersParams, A2aStatusParams, ChatSendParams,
 };
 
 /// Environment names that belong to the harness boundary and must never reach

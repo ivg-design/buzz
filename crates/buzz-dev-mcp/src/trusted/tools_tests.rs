@@ -124,6 +124,23 @@ fn chat_schema_accepts_only_content() {
 }
 
 #[test]
+fn peer_schema_accepts_only_an_optional_name_filter() {
+    assert!(serde_json::from_value::<A2aPeersParams>(serde_json::json!({})).is_ok());
+    assert!(serde_json::from_value::<A2aPeersParams>(serde_json::json!({
+        "name": "Clauditron"
+    }))
+    .is_ok());
+    for forbidden in ["pubkey", "channel", "relay", "owner", "project"] {
+        let mut value = serde_json::json!({});
+        value[forbidden] = serde_json::json!("attacker-controlled");
+        assert!(
+            serde_json::from_value::<A2aPeersParams>(value).is_err(),
+            "peer discovery accepted caller-controlled {forbidden}"
+        );
+    }
+}
+
+#[test]
 fn dispatch_rejects_authority_fields_outside_the_typed_surface() {
     let base = serde_json::json!({
         "operation_id": "a580ca9b-47b4-4af9-b22a-1068778f26c6",

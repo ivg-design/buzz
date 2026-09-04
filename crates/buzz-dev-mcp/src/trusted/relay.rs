@@ -113,6 +113,43 @@ impl TrustedRelay {
         Ok(context)
     }
 
+    /// Resolve the relay's event-signing identity from its NIP-11 document.
+    ///
+    /// Peer discovery uses this key to distinguish the relay-authored current
+    /// membership snapshots from user-authored lookalikes returned by a broad
+    /// event query. The request is fixed to the already normalized relay
+    /// origin and redirects are disabled on the shared client.
+    pub(super) async fn relay_signer_pubkey(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<String, String> {
+        #[derive(Deserialize)]
+        struct RelayInformationDocument {
+            #[serde(default, rename = "self")]
+            relay_self: Option<String>,
+        }
+
+        let request = self
+            .http
+            .get(&self.base_url)
+            .header("Accept", "application/nostr+json");
+        let bytes =
+            send_bounded_cancellable(request, cancellation, "relay identity", MAX_HTTP_BODY_BYTES)
+                .await?;
+        let document: RelayInformationDocument = serde_json::from_slice(&bytes)
+            .map_err(|_| "relay returned an invalid NIP-11 document".to_owned())?;
+        let relay_self = document
+            .relay_self
+            .ok_or_else(|| "relay did not advertise its signing identity".to_owned())?;
+        validate_hex64("relay NIP-11 self", &relay_self)?;
+        let parsed = nostr::PublicKey::parse(&relay_self)
+            .map_err(|_| "relay advertised an invalid signing identity".to_owned())?;
+        if parsed.to_hex() != relay_self {
+            return Err("relay advertised a non-canonical signing identity".into());
+        }
+        Ok(relay_self)
+    }
+
     pub(super) async fn publish_job(
         &self,
         job: JobEvent,
@@ -265,6 +302,28 @@ impl TrustedRelay {
     ) -> Result<Vec<Event>, String> {
         let signer = self.signer_pubkey();
         let channel = self.bound_a2a_channel()?;
+        let events = self.query_signed_events(filters, cancellation).await?;
+        let mut validated = Vec::with_capacity(events.len());
+        for event in events {
+            let job = JobEvent::parse(&event)
+                .map_err(|_| "relay returned an invalid job event".to_owned())?;
+            if job.common().project.home_channel == channel
+                && self.grants.allows_event(&job, &signer)
+            {
+                validated.push(event);
+            }
+        }
+        Ok(validated)
+    }
+
+    /// Run a signed, authenticated event query and verify every returned
+    /// envelope. Callers remain responsible for validating event kinds,
+    /// authors, tags and application-specific scope.
+    pub(super) async fn query_signed_events(
+        &self,
+        filters: Vec<serde_json::Value>,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<Event>, String> {
         let url = format!("{}/query", self.base_url);
         let body =
             serde_json::to_vec(&filters).map_err(|_| "query serialization failed".to_owned())?;
@@ -281,19 +340,11 @@ impl TrustedRelay {
                 .await?;
         let events: Vec<Event> = serde_json::from_slice(&bytes)
             .map_err(|_| "relay returned an invalid event list".to_owned())?;
-        let mut validated = Vec::with_capacity(events.len());
-        for event in events {
-            buzz_core::verify_event(&event)
+        for event in &events {
+            buzz_core::verify_event(event)
                 .map_err(|_| "relay returned an invalid event signature".to_owned())?;
-            let job = JobEvent::parse(&event)
-                .map_err(|_| "relay returned an invalid job event".to_owned())?;
-            if job.common().project.home_channel == channel
-                && self.grants.allows_event(&job, &signer)
-            {
-                validated.push(event);
-            }
         }
-        Ok(validated)
+        Ok(events)
     }
 
     pub(super) fn bound_a2a_channel(&self) -> Result<&str, String> {

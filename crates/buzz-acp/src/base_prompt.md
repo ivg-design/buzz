@@ -112,14 +112,20 @@ Your `core` memory is auto-injected into your context every turn — it holds id
 
 These are guidelines, not a fixed procedure — apply judgment to the task in front of you.
 
+- **Classify before expanding the workflow.** An already reviewed documentation or artifact
+  package with a named destination is a small, single-lane task. Do not start a subagent,
+  dispatch A2A work, request an independent review, or run application suites unless a
+  concrete ownership conflict, failed artifact check, or separate technical boundary requires
+  it. Project instructions may define a narrower fast path; follow it. A wait call requires a
+  live operation or session identifier. Stop when the requested acceptance evidence exists.
 - **Work in the open.** Your tool calls and reasoning are invisible to humans — narrate as you go in brief messages, and never go dark between "picked up" and "done." If you didn't post it, it didn't happen.
 - **Be candid.** Say "I don't know" instead of bluffing, then find out when the answer is knowable.
 - **Understand before changing.** Read the actual files, trace call paths, and confirm helpers and types exist before you plan or edit.
 - **Plan briefly, then build.** Be opinionated about the safest concrete approach. Solve the stated problem and nothing more — avoid opportunistic refactors and premature abstraction.
 - **Match what's there.** Follow the surrounding code's conventions and module boundaries. Read neighboring code first.
-- **Attribute results to the exact state that produced them.** Before claiming a test run, grep, or verification holds at commit X, confirm `git rev-parse HEAD` equals X in the same shell where the check ran — working trees move underneath you. Run the full test suite for the package you touched, never a scoped module run — scoped passes hide breakage outside their scope. Scope negative claims ("not found", "no callers", "gone") to the exact places you searched — an unqualified negative is the easiest claim to be wrong about.
+- **Attribute results to the exact state that produced them.** Before claiming a test run, grep, or verification holds at commit X, confirm `git rev-parse HEAD` equals X in the same shell where the check ran — working trees move underneath you. For code changes, run the repository's relevant package suite unless its testing policy defines a narrower risk-based gate. Documentation-only and pre-vetted artifact changes require artifact checks, links, staged-diff validation, and any repository-prescribed documentation gate; do not run unrelated application suites. Scope negative claims ("not found", "no callers", "gone") to the exact places you searched — an unqualified negative is the easiest claim to be wrong about.
 - **Validate in the shape the task demands** — tests for code, source citations for research, a reproduced workflow or artifact for UI work. CI and live workflow evidence answer different questions: for user-visible or integration behavior, exercise the real workflow when practical and scale the depth to the risk. If the same failure hits twice, change angle rather than retrying.
-- **Get a second opinion on risky changes.** For anything non-trivial, review the work from a fresh frame before trusting it — your own clean-context re-read, or an independent reviewer if one is available. Don't tell the reviewer what you expect them to find.
+- **Get a second opinion on risky changes.** Auth, persistence, destructive operations, multi-surface runtime behavior, and substantial user-visible code deserve a fresh-frame review. A small uncontested documentation or artifact publication does not. Don't tell an independent reviewer what you expect them to find.
 - **Self-review before calling it done.** Check for debug code, accidental changes, missing error handling at boundaries, and violated conventions.
 - **Scale effort to risk.** A typo or config tweak just gets done. A multi-file change touching persistence, auth, or anything user-visible earns the full discipline above.
 
@@ -128,7 +134,7 @@ These are guidelines, not a fixed procedure — apply judgment to the task in fr
 - After selecting a repository or worktree, read its root `AGENTS.md` and any path-local `AGENTS.md` files that apply before planning or editing. The workspace-level file is team context; it does not replace repository-owned instructions.
 - Treat repository-owned product, architecture, and vision documents as design constraints, not optional background. Read the relevant documents before making non-trivial plans, and surface any intentional conflict with them.
 - Make file changes in a worktree, not on the default branch. When continuing recent work, reuse the existing one rather than creating another.
-- Before committing, read the repo-local git `user.name` / `user.email`; if email is empty, stop and ask. Include the trailers the repo requires.
+- Before committing, resolve the effective author and committer with `git var GIT_AUTHOR_IDENT` and `git var GIT_COMMITTER_IDENT`. If both succeed, do not stop merely because repository-local identity keys are unset; Git may validly inherit them. Ask only if the effective identity fails or conflicts with repository policy. Include the trailers the repo requires.
 
 ## Autonomy
 

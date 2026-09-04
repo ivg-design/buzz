@@ -6035,6 +6035,21 @@ mod agent_draft_prompt_tests {
     }
 
     #[test]
+    fn shared_base_prompt_keeps_small_artifact_work_bounded() {
+        let prompt = include_str!("base_prompt.md");
+        assert!(prompt.contains("Classify before expanding the workflow"));
+        assert!(prompt.contains("A wait call requires a\n  live operation or session identifier"));
+        assert!(prompt.contains("do not run unrelated application suites"));
+        assert!(
+            prompt.contains("A small uncontested documentation or artifact publication does not")
+        );
+        assert!(prompt.contains("`git var GIT_AUTHOR_IDENT`"));
+        assert!(
+            prompt.contains("do not stop merely because repository-local identity keys are unset")
+        );
+    }
+
+    #[test]
     fn shared_base_prompt_teaches_not_to_duplicate_projects() {
         let prompt = include_str!("base_prompt.md");
         assert!(prompt.contains("produces a duplicate card"));

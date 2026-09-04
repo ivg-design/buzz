@@ -3884,7 +3884,7 @@ sleep 10"#,
             .session_new_job_full(
                 "/tmp/verified-checkout",
                 vec![trusted_job_server()],
-                Some(SystemPromptTransport::ClaudeMeta("job instructions")),
+                Some(SystemPromptTransport::MetaAppend("job instructions")),
                 Some("job"),
                 &policy,
             )

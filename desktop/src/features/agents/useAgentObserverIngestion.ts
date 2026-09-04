@@ -1,6 +1,7 @@
 import * as React from "react";
 
 import { useActiveAgentTurnsBridge } from "@/features/agents/activeAgentTurnsStore";
+import { syncAgentWorkingEligibility } from "@/features/agents/agentWorkingSignal";
 import {
   useManagedAgentsQuery,
   useRelayAgentsQuery,
@@ -8,10 +9,10 @@ import {
 import { useManagedAgentObserverBridge } from "@/features/agents/observerRelayStore";
 import { useUsersBatchQuery } from "@/features/profile/hooks";
 import { useIdentityQuery } from "@/shared/api/hooks";
-import type { ManagedAgent } from "@/shared/api/types";
 import { normalizePubkey } from "@/shared/lib/pubkey";
+import type { ActiveTurnAgent } from "@/features/agents/activeAgentTurnsStore";
 
-type IngestionAgent = Pick<ManagedAgent, "pubkey" | "status">;
+type IngestionAgent = ActiveTurnAgent;
 
 /**
  * Combine locally managed agents with relay agents the current identity
@@ -29,10 +30,20 @@ export function combineObserverIngestionAgents(
   ownerByPubkey: ReadonlyMap<string, string>,
   currentPubkey: string | null | undefined,
 ): IngestionAgent[] {
-  const managed = managedAgents.map((agent) => ({
-    pubkey: agent.pubkey,
-    status: agent.status,
-  }));
+  const managed = managedAgents.map((agent) => {
+    const runtimeFacts =
+      "runtimeLifecycle" in agent
+        ? {
+            runtimeLifecycle: agent.runtimeLifecycle,
+            setupMode: agent.setupMode ?? false,
+          }
+        : {};
+    return {
+      pubkey: agent.pubkey,
+      status: agent.status,
+      ...runtimeFacts,
+    };
+  });
   if (!currentPubkey) {
     return managed;
   }
@@ -110,6 +121,13 @@ export function useAgentObserverIngestion() {
       currentPubkey,
     );
   }, [currentPubkey, managedAgents, profiles, relayAgentPubkeys]);
+
+  // A readiness downgrade is authoritative over retained observer/typing
+  // events. Clear both sources in a layout effect so no consumer can paint a
+  // setup listener or not-yet-ready pool as Working for one stale frame.
+  React.useLayoutEffect(() => {
+    syncAgentWorkingEligibility(ingestionAgents);
+  }, [ingestionAgents]);
 
   useManagedAgentObserverBridge(ingestionAgents);
   useActiveAgentTurnsBridge(ingestionAgents);

@@ -329,6 +329,20 @@ buzz messages send --channel <channel-id> --reply-to <thread-root-id> \
   --mention <agent-pubkey> --content '!cancel'
 ```
 
+## Managed-agent status truth
+
+Process liveness and ACP readiness are separate. A local managed agent may
+report **Working** only when `status === "running"`, `setupMode === false`, and
+`runtimeLifecycle === "ready"`; observer turns and typing are evidence of work
+only after that gate passes. The nudge-only setup listener never reports
+Working. A lazy pool in `listening` is operational and can accept a message,
+but remains Listening while idle, becomes Waking after accepted work triggers
+pool startup, and can report Working only after the pool emits `ready`.
+Readiness downgrades must clear retained observer and typing state so sidebar,
+composer, profile, and agent-row surfaces cannot render stale work. Remote
+`deployed` agents continue to use authenticated relay observer/typing evidence
+because Desktop has no local ACP lifecycle for them.
+
 ## The tests that enforce this
 
 - `lib/agentConfigCore.test.mjs` — field model per harness × scope, clearing
@@ -371,6 +385,10 @@ buzz messages send --channel <channel-id> --reply-to <thread-root-id> \
   unbroken Unicode text without horizontal overflow.
 - `lib/agentDescription.test.mjs` — authored-description resolution: trim,
   blank/missing → null.
+- `lib/managedAgentReadiness.test.mjs`, `activeAgentTurnsStore.test.mjs`, and
+  `agentWorkingSignal.test.mjs` — setup/listening/waking local runtimes cannot
+  surface Working, retained signals clear on downgrade, and ready/deployed
+  agents retain their intended observer/typing behavior.
 - Rust: `runtime_metadata_env_vars` tests pin spawn-time key application.
 - Rust: persona sharing/retention tests pin relay+owner scoping, durable
   enqueue errors, relay rejection/unavailability, and accepted publication.

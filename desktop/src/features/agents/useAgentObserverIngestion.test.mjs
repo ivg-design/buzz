@@ -24,6 +24,30 @@ describe("combineObserverIngestionAgents", () => {
     assert.deepEqual(result, [{ pubkey: AGENT_LOCAL, status: "running" }]);
   });
 
+  it("preserves managed setup and lifecycle readiness facts", () => {
+    const result = combineObserverIngestionAgents(
+      [
+        {
+          pubkey: AGENT_LOCAL,
+          status: "running",
+          runtimeLifecycle: "listening",
+          setupMode: true,
+        },
+      ],
+      [],
+      new Map(),
+      ME,
+    );
+    assert.deepEqual(result, [
+      {
+        pubkey: AGENT_LOCAL,
+        status: "running",
+        runtimeLifecycle: "listening",
+        setupMode: true,
+      },
+    ]);
+  });
+
   it("adds declared-owned relay agents as deployed", () => {
     const result = combineObserverIngestionAgents(
       [],

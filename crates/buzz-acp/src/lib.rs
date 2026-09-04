@@ -143,6 +143,29 @@ fn emit_runtime_lifecycle(
     }
 }
 
+fn initial_runtime_lifecycle(lazy_pool: bool) -> &'static str {
+    if lazy_pool {
+        "listening"
+    } else {
+        "ready"
+    }
+}
+
+#[cfg(test)]
+mod initial_runtime_lifecycle_tests {
+    use super::initial_runtime_lifecycle;
+
+    #[test]
+    fn non_lazy_pool_is_ready_after_eager_initialization() {
+        assert_eq!(initial_runtime_lifecycle(false), "ready");
+    }
+
+    #[test]
+    fn lazy_pool_listens_before_its_first_wake() {
+        assert_eq!(initial_runtime_lifecycle(true), "listening");
+    }
+}
+
 #[derive(Clone)]
 enum DeferredJobTerminal {
     Cancellation(Box<job_receiver::CancellationTerminal>),
@@ -3106,16 +3129,14 @@ async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
         }
     }
 
-    if config.lazy_pool {
-        emit_runtime_lifecycle(
-            observer.as_ref(),
-            &runtime_start_nonce,
-            &pubkey_hex,
-            &config.relay_url,
-            "listening",
-            None,
-        );
-    }
+    emit_runtime_lifecycle(
+        observer.as_ref(),
+        &runtime_start_nonce,
+        &pubkey_hex,
+        &config.relay_url,
+        initial_runtime_lifecycle(config.lazy_pool),
+        None,
+    );
 
     let base_prompt_content = config.base_prompt_content.take();
     let receiver_grants_json = grants_json.clone();

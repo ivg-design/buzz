@@ -138,6 +138,10 @@ export type RawManagedAgent = {
   needs_restart: boolean;
   restart_diff?: RawRestartDiffEntry[];
   env_vars?: Record<string, string>;
+  /** Added with pair lifecycle truth; optional for older E2E fixtures/builds. */
+  runtime_lifecycle?: ManagedAgent["runtimeLifecycle"];
+  /** Added with setup-listener truth; optional for older E2E fixtures/builds. */
+  setup_mode?: boolean;
   status: ManagedAgent["status"];
   pid: number | null;
   created_at: string;
@@ -634,6 +638,16 @@ function fromRawRelayAgent(agent: RawRelayAgent): RelayAgent {
 }
 
 export function fromRawManagedAgent(agent: RawManagedAgent): ManagedAgent {
+  // The packaged backend always sends `runtime_lifecycle`, including explicit
+  // null for a stopped/untracked pair. Only pre-feature fixtures/builds omit
+  // the key; preserve their historical running=>ready meaning for wire
+  // compatibility without treating an explicit unknown lifecycle as ready.
+  const runtimeLifecycle = Object.hasOwn(agent, "runtime_lifecycle")
+    ? (agent.runtime_lifecycle ?? null)
+    : agent.status === "running"
+      ? "ready"
+      : null;
+
   return {
     pubkey: agent.pubkey,
     name: agent.name,
@@ -660,6 +674,8 @@ export function fromRawManagedAgent(agent: RawManagedAgent): ManagedAgent {
     needsRestart: agent.needs_restart ?? false,
     restartDiff: agent.restart_diff ?? [],
     envVars: agent.env_vars ?? {},
+    runtimeLifecycle,
+    setupMode: agent.setup_mode ?? false,
     status: agent.status,
     pid: agent.pid,
     createdAt: agent.created_at,

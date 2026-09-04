@@ -747,6 +747,8 @@ fn summary_fixture(
         env_vars: Default::default(),
         backend: super::BackendKind::Local,
         backend_agent_id: None,
+        runtime_lifecycle: Some(crate::managed_agents::ManagedAgentRuntimeLifecycle::Ready),
+        setup_mode: false,
         status: "running".into(),
         pid: Some(4242),
         created_at: "2026-01-01T00:00:00Z".into(),
@@ -772,6 +774,12 @@ fn summary_without_drift_omits_restart_diff_from_the_wire() {
     // empty array on every stopped agent would bloat every list response.
     let wire = serde_json::to_value(summary_fixture(Vec::new())).expect("summary serializes");
     assert_eq!(wire.get("needs_restart"), Some(&serde_json::json!(false)));
+    assert_eq!(
+        wire.get("runtime_lifecycle"),
+        Some(&serde_json::json!("ready")),
+        "ACP readiness must cross the Rust-to-TypeScript boundary"
+    );
+    assert_eq!(wire.get("setup_mode"), Some(&serde_json::json!(false)));
     assert!(
         wire.get("restart_diff").is_none(),
         "empty restart_diff must be omitted, got: {wire}"

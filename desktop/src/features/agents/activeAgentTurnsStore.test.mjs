@@ -1822,6 +1822,63 @@ describe("observer → active-turns bridge sync", () => {
       "inactive agents must not populate the active-turns store",
     );
   });
+
+  it("clears retained turns and rejects new frames until a local pool is ready", () => {
+    const readyAgent = {
+      pubkey: AGENT,
+      status: "running",
+      runtimeLifecycle: "ready",
+      setupMode: false,
+    };
+    injectObserverEventsForE2E(AGENT, [
+      makeEvent({ seq: 1, kind: "turn_started" }),
+    ]);
+    syncActiveAgentTurnsFromObserver([readyAgent]);
+    assert.equal(getActiveTurnsForAgent(AGENT).length, 1);
+
+    for (const runtimeLifecycle of ["listening", "waking", "starting"]) {
+      syncActiveAgentTurnsFromObserver([{ ...readyAgent, runtimeLifecycle }]);
+      assert.equal(
+        getActiveTurnsForAgent(AGENT).length,
+        0,
+        `${runtimeLifecycle} must clear a retained ready-pool turn`,
+      );
+
+      const listener = createActiveAgentTurnsObserverListener([
+        { ...readyAgent, runtimeLifecycle },
+      ]);
+      listener({
+        agentPubkey: AGENT,
+        events: [
+          makeEvent({
+            seq: 2,
+            kind: "turn_started",
+            turnId: `turn-${runtimeLifecycle}`,
+          }),
+        ],
+      });
+      assert.equal(
+        getActiveTurnsForAgent(AGENT).length,
+        0,
+        `${runtimeLifecycle} must reject incremental turn frames`,
+      );
+    }
+  });
+
+  it("never hydrates setup-listener turns", () => {
+    injectObserverEventsForE2E(AGENT, [
+      makeEvent({ seq: 1, kind: "turn_started" }),
+    ]);
+    syncActiveAgentTurnsFromObserver([
+      {
+        pubkey: AGENT,
+        status: "running",
+        runtimeLifecycle: "ready",
+        setupMode: true,
+      },
+    ]);
+    assert.equal(getActiveTurnsForAgent(AGENT).length, 0);
+  });
 });
 
 describe("formatElapsed", () => {

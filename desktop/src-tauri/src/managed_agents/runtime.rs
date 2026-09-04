@@ -92,6 +92,7 @@ fn persona_drift_state(
     let Some(persona_id) = record.persona_id.as_deref() else {
         return (false, false);
     };
+
     let Some(persona) = personas.iter().find(|p| p.id == persona_id) else {
         return (false, true);
     };
@@ -200,6 +201,13 @@ pub fn build_managed_agent_summary(
             )
         }
     };
+
+    // A live wrapper process is not proof that an ACP pool exists. Preserve
+    // the pair lifecycle and the setup-listener stamp as separate summary
+    // facts so UI/store consumers can reserve Working for a real ready pool.
+    let (runtime_lifecycle, setup_mode) = pair_runtime
+        .map(|runtime| (Some(runtime.lifecycle.clone()), runtime.setup_mode))
+        .unwrap_or((None, false));
 
     let (persona_out_of_date, persona_orphaned) = persona_drift_state(record, personas);
 
@@ -333,6 +341,8 @@ pub fn build_managed_agent_summary(
         env_vars: record.env_vars.clone(),
         backend: record.backend.clone(),
         backend_agent_id: record.backend_agent_id.clone(),
+        runtime_lifecycle,
+        setup_mode,
         status,
         pid,
         created_at: record.created_at.clone(),

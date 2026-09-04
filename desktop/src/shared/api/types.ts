@@ -353,6 +353,10 @@ export type ManagedAgent = {
   restartDiff: RestartDiffEntry[];
   /** Per-agent env vars. Layered on top of persona envVars. */
   envVars: Record<string, string>;
+  /** Pair-scoped lifecycle reported by the current local buzz-acp process. */
+  runtimeLifecycle: ManagedAgentRuntimeLifecycle | null;
+  /** True when the live child is the nudge-only setup listener, not an ACP pool. */
+  setupMode: boolean;
   status: "running" | "stopped" | "deployed" | "not_deployed";
   pid: number | null;
   createdAt: string;

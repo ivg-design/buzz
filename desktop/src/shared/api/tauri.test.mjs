@@ -119,7 +119,65 @@ test("relay rate-limited: prefix check is case-sensitive (Rust always emits lowe
 // arrives as definitionEnv (camelCase), source "custom" is preserved, and the
 // env round-trips end-to-end so a save-then-edit cycle cannot erase env.
 
-const { fromRawAcpRuntimeCatalogEntry } = await import("./tauri.ts");
+const { fromRawAcpRuntimeCatalogEntry, fromRawManagedAgent } = await import(
+  "./tauri.ts"
+);
+
+function rawManagedAgent(overrides = {}) {
+  return {
+    pubkey: "ab".repeat(32),
+    name: "Test agent",
+    persona_id: null,
+    relay_url: "wss://relay.example",
+    acp_command: "buzz-acp",
+    agent_command: "codex-acp",
+    agent_args: [],
+    mcp_command: "buzz-dev-mcp",
+    turn_timeout_seconds: 900,
+    idle_timeout_seconds: null,
+    max_turn_duration_seconds: null,
+    parallelism: 1,
+    system_prompt: null,
+    model: null,
+    provider: null,
+    persona_out_of_date: false,
+    persona_orphaned: false,
+    needs_restart: false,
+    status: "running",
+    pid: 42,
+    created_at: "2026-09-04T00:00:00Z",
+    updated_at: "2026-09-04T00:00:00Z",
+    last_started_at: null,
+    last_stopped_at: null,
+    last_exit_code: null,
+    last_error: null,
+    last_error_code: null,
+    log_path: "/tmp/test.log",
+    start_on_app_launch: false,
+    backend: { type: "local" },
+    backend_agent_id: null,
+    ...overrides,
+  };
+}
+
+test("fromRawManagedAgent preserves explicit non-ready lifecycle truth", () => {
+  const listening = fromRawManagedAgent(
+    rawManagedAgent({ runtime_lifecycle: "listening", setup_mode: true }),
+  );
+  assert.equal(listening.runtimeLifecycle, "listening");
+  assert.equal(listening.setupMode, true);
+
+  const unknown = fromRawManagedAgent(
+    rawManagedAgent({ runtime_lifecycle: null, setup_mode: false }),
+  );
+  assert.equal(unknown.runtimeLifecycle, null);
+});
+
+test("fromRawManagedAgent keeps compatibility for a pre-lifecycle running fixture", () => {
+  const legacy = fromRawManagedAgent(rawManagedAgent());
+  assert.equal(legacy.runtimeLifecycle, "ready");
+  assert.equal(legacy.setupMode, false);
+});
 
 test("fromRawAcpRuntimeCatalogEntry maps definition_env to definitionEnv", () => {
   const raw = {

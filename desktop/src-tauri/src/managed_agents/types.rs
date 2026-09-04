@@ -572,6 +572,14 @@ pub struct ManagedAgentSummary {
     pub env_vars: BTreeMap<String, String>,
     pub backend: BackendKind,
     pub backend_agent_id: Option<String>,
+    /// Pair-scoped harness lifecycle reported by the current `buzz-acp`
+    /// generation. `None` means no tracked local pair (stopped, remote, or a
+    /// migration-only adopted PID), and must not be interpreted as ACP-ready.
+    pub runtime_lifecycle: Option<super::ManagedAgentRuntimeLifecycle>,
+    /// Whether the tracked child is the nudge-only setup listener rather than
+    /// an ACP agent pool. Process liveness and work readiness are separate:
+    /// setup listeners stay stoppable but can never truthfully report Working.
+    pub setup_mode: bool,
     pub status: String,
     pub pid: Option<u32>,
     pub created_at: String,

@@ -326,7 +326,9 @@ export function buildOwnerFields({
           className="normal-case tracking-normal"
           presenceLoaded={presenceLoaded}
           presenceStatus={presenceStatus}
+          runtimeLifecycle={managedAgent.runtimeLifecycle}
           sentenceCase
+          setupMode={managedAgent.setupMode}
           status={managedAgent.status}
         />
       ),

@@ -2,12 +2,14 @@ import assert from "node:assert/strict";
 import { beforeEach, describe, it } from "node:test";
 
 import {
+  clearAgentWorkingSignalForAgent,
   getAgentWorkingState,
   getWorkingAgentPubkeysForChannel,
   getWorkingChannels,
   reportChannelBotTyping,
   resetAgentWorkingSignal,
   subscribeAgentWorkingSignal,
+  syncAgentWorkingEligibility,
 } from "./agentWorkingSignal.ts";
 import {
   resetActiveAgentTurnsStore,
@@ -113,6 +115,41 @@ describe("getAgentWorkingState", () => {
     reportChannelBotTyping("chan-1", [AGENT, AGENT_2]);
     const again = getAgentWorkingState(AGENT).channels[0].anchorAt;
     assert.equal(again, first);
+  });
+
+  it("suppresses every stale source while the ACP pool is not ready", () => {
+    startTurn(AGENT, "chan-1");
+    reportChannelBotTyping("chan-2", [AGENT, AGENT_2]);
+    syncAgentWorkingEligibility([
+      {
+        pubkey: AGENT,
+        status: "running",
+        runtimeLifecycle: "listening",
+        setupMode: false,
+      },
+      { pubkey: AGENT_2, status: "deployed" },
+    ]);
+
+    assert.equal(getAgentWorkingState(AGENT).working, false);
+    assert.equal(getAgentWorkingState(AGENT_2, "chan-2").working, true);
+    assert.deepEqual(getWorkingAgentPubkeysForChannel("chan-2"), [AGENT_2]);
+
+    // A later typing refresh must not resurrect Working while listening.
+    reportChannelBotTyping("chan-2", [AGENT, AGENT_2]);
+    assert.equal(getAgentWorkingState(AGENT).working, false);
+    assert.deepEqual(getWorkingAgentPubkeysForChannel("chan-2"), [AGENT_2]);
+  });
+
+  it("clears one agent without disturbing another agent's work", () => {
+    startTurn(AGENT, "chan-1");
+    startTurn(AGENT_2, "chan-2");
+    reportChannelBotTyping("chan-3", [AGENT, AGENT_2]);
+
+    clearAgentWorkingSignalForAgent(AGENT);
+
+    assert.equal(getAgentWorkingState(AGENT).working, false);
+    assert.equal(getAgentWorkingState(AGENT_2).working, true);
+    assert.deepEqual(getWorkingAgentPubkeysForChannel("chan-3"), [AGENT_2]);
   });
 });
 

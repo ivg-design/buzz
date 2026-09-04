@@ -24,6 +24,7 @@ import { PubKey } from "@/shared/ui/PubKey";
 import { SubsectionLabel } from "@/shared/ui/PageHeader";
 import { resolveModelLabel } from "@/features/agents/lib/formatAgentModelLabel";
 import { RestartDiffBadge } from "./RestartDiffBadge";
+import { canManagedAgentReportWorking } from "@/features/agents/lib/managedAgentReadiness";
 
 export function ManagedAgentRow({
   agent,
@@ -60,16 +61,17 @@ export function ManagedAgentRow({
     : null;
   const presenceStatus = presenceLookup[agent.pubkey.trim().toLowerCase()];
   const activeTurns = useAgentWorking(agent.pubkey).channels;
+  const canReportWorking = canManagedAgentReportWorking(agent);
   const activeWorkingChannels = React.useMemo(
     () =>
-      activeTurns
+      (canReportWorking ? activeTurns : [])
         .map(({ channelId, anchorAt }) => ({
           id: channelId,
           name: channelIdToName[channelId] ?? channelId,
           anchorAt,
         }))
         .slice(0, 3),
-    [activeTurns, channelIdToName],
+    [activeTurns, canReportWorking, channelIdToName],
   );
   const isWorking = activeWorkingChannels.length > 0;
   const processDetail =
@@ -125,6 +127,8 @@ export function ManagedAgentRow({
                 presenceLoaded={presenceLoaded}
                 presenceStatus={presenceStatus}
                 processDetail={processDetail}
+                runtimeLifecycle={agent.runtimeLifecycle}
+                setupMode={agent.setupMode}
                 status={agent.status}
               />
               <RuntimeBlock agent={agent} runtimeSource={runtimeSource} />
@@ -148,6 +152,8 @@ export function ManagedAgentRow({
                 presenceLoaded={presenceLoaded}
                 presenceStatus={presenceStatus}
                 processDetail={processDetail}
+                runtimeLifecycle={agent.runtimeLifecycle}
+                setupMode={agent.setupMode}
                 status={agent.status}
               />
               <RuntimeBlock agent={agent} runtimeSource={runtimeSource} />
@@ -359,6 +365,8 @@ function StatusBlock({
   presenceLoaded,
   presenceStatus,
   processDetail,
+  runtimeLifecycle,
+  setupMode,
   status,
 }: {
   friendlyError: ReturnType<typeof friendlyAgentLastError>;
@@ -366,6 +374,8 @@ function StatusBlock({
   presenceLoaded: boolean;
   presenceStatus: PresenceStatus | undefined;
   processDetail: string;
+  runtimeLifecycle: ManagedAgent["runtimeLifecycle"];
+  setupMode: boolean;
   status: ManagedAgent["status"];
 }) {
   return (
@@ -375,6 +385,8 @@ function StatusBlock({
         isWorking={isWorking}
         presenceLoaded={presenceLoaded}
         presenceStatus={presenceStatus}
+        runtimeLifecycle={runtimeLifecycle}
+        setupMode={setupMode}
         status={status}
       />
       <p className="text-xs text-muted-foreground">{processDetail}</p>

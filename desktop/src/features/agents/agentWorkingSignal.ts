@@ -1,7 +1,13 @@
 import * as React from "react";
 
+import { canManagedAgentReportWorking } from "@/features/agents/lib/managedAgentReadiness";
+import type {
+  ManagedAgent,
+  ManagedAgentRuntimeLifecycle,
+} from "@/shared/api/types";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 import {
+  clearActiveTurnsForAgent,
   type ActiveChannelTurnSummary,
   getActiveTurnsByChannel,
   getActiveTurnsForAgent,
@@ -61,6 +67,16 @@ const IDLE_STATE: AgentWorkingState = {
 // typing TTL because the hooks re-report whenever their entries change.
 const typingByChannel = new Map<string, Map<string, number>>();
 
+type AgentWorkingReadiness = Pick<ManagedAgent, "pubkey" | "status"> & {
+  runtimeLifecycle?: ManagedAgentRuntimeLifecycle | null;
+  setupMode?: boolean;
+};
+
+// Known managed/owned agents are gated by their current ACP readiness. An
+// unknown pubkey keeps the historical typing fallback for relay bots that are
+// not represented by a local ManagedAgent summary.
+const workingEligibilityByAgent = new Map<string, boolean>();
+
 const listeners = new Set<() => void>();
 let unsubscribeTurns: (() => void) | null = null;
 
@@ -112,6 +128,7 @@ export function reportChannelBotTyping(
   const now = Date.now();
   for (const pubkey of pubkeys) {
     const key = normalizePubkey(pubkey);
+    if (workingEligibilityByAgent.get(key) === false) continue;
     next.set(key, current?.get(key) ?? now);
   }
 
@@ -130,11 +147,64 @@ export function reportChannelBotTyping(
   notify();
 }
 
+/**
+ * Clear every source that can render Working for one agent. Runtime readiness
+ * transitions call this before paint, so an old observer turn or typing TTL
+ * cannot outlive a switch into setup/listening/waking state.
+ */
+export function clearAgentWorkingSignalForAgent(agentPubkey: string): void {
+  const key = normalizePubkey(agentPubkey);
+  let typingChanged = false;
+  for (const [channelId, entries] of typingByChannel) {
+    if (!entries.delete(key)) continue;
+    typingChanged = true;
+    if (entries.size === 0) typingByChannel.delete(channelId);
+  }
+
+  clearActiveTurnsForAgent(key);
+  if (typingChanged) notify();
+}
+
+/**
+ * Synchronize the authoritative runtime gate used by every Working consumer.
+ * A readiness downgrade clears retained observer and typing evidence, and
+ * subsequent typing frames remain suppressed until the ACP pool is ready.
+ */
+export function syncAgentWorkingEligibility(
+  agents: readonly AgentWorkingReadiness[],
+): void {
+  const nextKeys = new Set<string>();
+  for (const agent of agents) {
+    const key = normalizePubkey(agent.pubkey);
+    nextKeys.add(key);
+    const eligible = canManagedAgentReportWorking({
+      status: agent.status,
+      runtimeLifecycle:
+        agent.runtimeLifecycle === undefined && agent.status === "running"
+          ? "ready"
+          : (agent.runtimeLifecycle ?? null),
+      setupMode: agent.setupMode ?? false,
+    });
+    workingEligibilityByAgent.set(key, eligible);
+    if (!eligible) clearAgentWorkingSignalForAgent(key);
+  }
+
+  for (const key of [...workingEligibilityByAgent.keys()]) {
+    if (nextKeys.has(key)) continue;
+    workingEligibilityByAgent.delete(key);
+    clearAgentWorkingSignalForAgent(key);
+  }
+  invalidateCaches();
+}
+
 function computeAgentWorkingState(
   agentPubkey: string,
   channelId: string | null,
 ): AgentWorkingState {
   const key = normalizePubkey(agentPubkey);
+  if (workingEligibilityByAgent.get(key) === false) {
+    return IDLE_STATE;
+  }
   const turns = getActiveTurnsForAgent(key);
 
   const channels: AgentWorkingChannel[] = turns.map((turn) => ({
@@ -213,7 +283,17 @@ export function getWorkingChannels(): WorkingChannelSummary[] {
 
   const byChannel = new Map<string, WorkingChannelSummary>();
   for (const summary of getActiveTurnsByChannel()) {
-    byChannel.set(summary.channelId, { ...summary, source: "observer" });
+    const eligiblePubkeys = summary.agentPubkeys.filter(
+      (pubkey) =>
+        workingEligibilityByAgent.get(normalizePubkey(pubkey)) !== false,
+    );
+    if (eligiblePubkeys.length === 0) continue;
+    byChannel.set(summary.channelId, {
+      ...summary,
+      agentCount: eligiblePubkeys.length,
+      agentPubkeys: eligiblePubkeys,
+      source: "observer",
+    });
   }
 
   for (const [channelId, entries] of typingByChannel) {
@@ -224,6 +304,7 @@ export function getWorkingChannels(): WorkingChannelSummary[] {
       );
       const merged = [...existing.agentPubkeys];
       for (const pubkey of entries.keys()) {
+        if (workingEligibilityByAgent.get(pubkey) === false) continue;
         if (!known.has(pubkey)) {
           merged.push(pubkey);
         }
@@ -238,8 +319,12 @@ export function getWorkingChannels(): WorkingChannelSummary[] {
       continue;
     }
 
+    const eligibleEntries = [...entries].filter(
+      ([pubkey]) => workingEligibilityByAgent.get(pubkey) !== false,
+    );
+    if (eligibleEntries.length === 0) continue;
     let anchorAt = Number.POSITIVE_INFINITY;
-    for (const since of entries.values()) {
+    for (const [, since] of eligibleEntries) {
       if (since < anchorAt) {
         anchorAt = since;
       }
@@ -247,8 +332,8 @@ export function getWorkingChannels(): WorkingChannelSummary[] {
     byChannel.set(channelId, {
       channelId,
       anchorAt,
-      agentCount: entries.size,
-      agentPubkeys: [...entries.keys()],
+      agentCount: eligibleEntries.length,
+      agentPubkeys: eligibleEntries.map(([pubkey]) => pubkey),
       source: "typing",
     });
   }
@@ -282,13 +367,14 @@ export function getWorkingAgentPubkeysForChannel(
       continue;
     }
     for (const pubkey of summary.agentPubkeys) {
-      merged.add(normalizePubkey(pubkey));
+      const key = normalizePubkey(pubkey);
+      if (workingEligibilityByAgent.get(key) !== false) merged.add(key);
     }
   }
   const typing = typingByChannel.get(channelId);
   if (typing) {
     for (const pubkey of typing.keys()) {
-      merged.add(pubkey);
+      if (workingEligibilityByAgent.get(pubkey) !== false) merged.add(pubkey);
     }
   }
   const result = merged.size === 0 ? EMPTY_PUBKEYS : [...merged].sort();
@@ -328,6 +414,7 @@ export function useChannelWorkingAgentPubkeys(
 /** Community-switch reset (see resetCommunityState in useCommunityInit). */
 export function resetAgentWorkingSignal() {
   typingByChannel.clear();
+  workingEligibilityByAgent.clear();
   invalidateCaches();
   for (const listener of listeners) {
     listener();

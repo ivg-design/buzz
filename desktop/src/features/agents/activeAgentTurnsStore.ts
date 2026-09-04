@@ -12,6 +12,11 @@ import {
   subscribeDocumentVisibility,
 } from "@/shared/lib/useDocumentVisible";
 import type { ObserverEvent } from "./ui/agentSessionTypes";
+import type {
+  ManagedAgent,
+  ManagedAgentRuntimeLifecycle,
+} from "@/shared/api/types";
+import { canManagedAgentReportWorking } from "./lib/managedAgentReadiness";
 
 /** Harness emits turn_liveness every ~10s (BUZZ_ACP_TURN_LIVENESS_SECS). */
 const LIVENESS_INTERVAL_MS = 10_000;
@@ -57,6 +62,25 @@ type ActiveTurn = {
   startedAt: number;
   lastActivityAt: number;
 };
+
+/** Runtime facts needed to decide whether observer turns may surface as
+ * Working. Optional fields preserve pre-feature test/bridge compatibility;
+ * production managed-agent summaries always send both fields. */
+export type ActiveTurnAgent = Pick<ManagedAgent, "pubkey" | "status"> & {
+  runtimeLifecycle?: ManagedAgentRuntimeLifecycle | null;
+  setupMode?: boolean;
+};
+
+export function isAgentEligibleForActiveTurns(agent: ActiveTurnAgent): boolean {
+  return canManagedAgentReportWorking({
+    status: agent.status,
+    runtimeLifecycle:
+      agent.runtimeLifecycle === undefined && agent.status === "running"
+        ? "ready"
+        : (agent.runtimeLifecycle ?? null),
+    setupMode: agent.setupMode ?? false,
+  });
+}
 
 /** One working channel surfaced to the UI, anchored to the desktop clock. */
 export type ActiveTurnSummary = {
@@ -622,10 +646,17 @@ export function useActiveAgentTurnsByChannel(): ActiveChannelTurnSummary[] {
  * observer→derived-liveness path without a React renderer.
  */
 export function syncActiveAgentTurnsFromObserver(
-  agents: readonly { pubkey: string; status: string }[],
+  agents: readonly ActiveTurnAgent[],
 ) {
   for (const agent of agents) {
-    if (agent.status !== "running" && agent.status !== "deployed") continue;
+    if (!isAgentEligibleForActiveTurns(agent)) {
+      // A prior generation may have left a turn without a terminal frame.
+      // Setup/listening/waking state is authoritative and clears that stale
+      // derivative immediately instead of leaving a false Working badge for
+      // the three-minute crash backstop.
+      clearActiveTurnsForAgent(agent.pubkey);
+      continue;
+    }
     const snapshot = getAgentObserverSnapshot(agent.pubkey, true);
     syncAgentTurnsFromEvents(agent.pubkey, snapshot.events);
   }
@@ -637,13 +668,11 @@ export function syncActiveAgentTurnsFromObserver(
  * does not revisit unrelated agents or their retained journals.
  */
 export function createActiveAgentTurnsObserverListener(
-  agents: readonly { pubkey: string; status: string }[],
+  agents: readonly ActiveTurnAgent[],
 ): (update?: AgentObserverStoreUpdate) => void {
   const activeAgentPubkeys = new Set(
     agents
-      .filter(
-        (agent) => agent.status === "running" || agent.status === "deployed",
-      )
+      .filter(isAgentEligibleForActiveTurns)
       .map((agent) => normalizePubkey(agent.pubkey)),
   );
 
@@ -658,9 +687,7 @@ export function createActiveAgentTurnsObserverListener(
   };
 }
 
-export function useActiveAgentTurnsBridge(
-  agents: readonly { pubkey: string; status: string }[],
-) {
+export function useActiveAgentTurnsBridge(agents: readonly ActiveTurnAgent[]) {
   React.useEffect(() => {
     syncActiveAgentTurnsFromObserver(agents);
     return subscribeAgentObserverStore(

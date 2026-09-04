@@ -539,7 +539,7 @@ mod postgres_tests {
     use std::collections::HashSet;
     use std::sync::Mutex;
 
-    use nostr::{EventBuilder, EventId, Keys, Kind, Tag};
+    use nostr::{EventBuilder, EventId, Keys, Kind, Tag, ToBech32};
 
     /// The vulnerability this file's ban gate closes: `ingest_event` exempts
     /// relay-admin kinds 9030–9033 from its durable write-path restriction
@@ -904,12 +904,105 @@ mod postgres_tests {
         handle_relay_admin_event(tenant, state, &event).await
     }
 
+    /// Normalize the operator-facing npub/hex forms before signing the
+    /// canonical hex `p` tag required by NIP-43, then exercise the real relay
+    /// admission, authorization, replay, and persistence path.
+    async fn submit_9030(
+        state: &Arc<AppState>,
+        tenant: &TenantContext,
+        actor: &Keys,
+        target_input: &str,
+    ) -> Result<(), RelayAdminError> {
+        let target_hex = PublicKey::parse(target_input)
+            .expect("valid operator pubkey input")
+            .to_hex();
+        let event = EventBuilder::new(Kind::Custom(9030), "")
+            .tags(vec![
+                Tag::parse(["p", target_hex.as_str()]).expect("target tag"),
+                Tag::parse(["role", "member"]).expect("role tag"),
+            ])
+            .sign_with_keys(actor)
+            .expect("sign member-add command");
+        handle_relay_admin_event(tenant, state, &event).await
+    }
+
     async fn stored_icon(state: &Arc<AppState>, tenant: &TenantContext) -> Option<String> {
         state
             .db
             .get_community_icon(tenant.community())
             .await
             .expect("read icon")
+    }
+
+    /// Direct human adds use kind:9030, independently of reusable invite
+    /// links. Both accepted operator input forms must reach the production
+    /// handler, and its role check—not a test-only policy mirror—must reject a
+    /// plain member before any row is written.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn direct_9030_add_accepts_owner_and_admin_but_rejects_member() {
+        let host = format!("member-add-{}.example", uuid::Uuid::new_v4().simple());
+        let (state, tenant) = workspace_profile_test_state(&host, true).await;
+        let owner = Keys::generate();
+        let admin = Keys::generate();
+        let member = Keys::generate();
+        for (actor, role) in [(&owner, "owner"), (&admin, "admin"), (&member, "member")] {
+            state
+                .db
+                .add_relay_member(tenant.community(), &actor.public_key().to_hex(), role, None)
+                .await
+                .expect("seed relay actor");
+        }
+
+        let npub_target = Keys::generate();
+        let npub_input = npub_target
+            .public_key()
+            .to_bech32()
+            .expect("encode target npub");
+        submit_9030(&state, &tenant, &owner, &npub_input)
+            .await
+            .expect("owner adds a human from npub input");
+
+        let hex_target = Keys::generate();
+        submit_9030(&state, &tenant, &admin, &hex_target.public_key().to_hex())
+            .await
+            .expect("admin adds a human from hex input");
+
+        for target in [&npub_target, &hex_target] {
+            assert_eq!(
+                state
+                    .db
+                    .get_relay_member(tenant.community(), &target.public_key().to_hex())
+                    .await
+                    .expect("read added human")
+                    .expect("human was persisted")
+                    .role,
+                "member"
+            );
+        }
+
+        let refused_target = Keys::generate();
+        assert_eq!(
+            submit_9030(
+                &state,
+                &tenant,
+                &member,
+                &refused_target.public_key().to_hex(),
+            )
+            .await,
+            Err(RelayAdminError::Rejected(
+                "actor not authorized: must be admin or owner".to_string()
+            ))
+        );
+        assert!(
+            state
+                .db
+                .get_relay_member(tenant.community(), &refused_target.public_key().to_hex())
+                .await
+                .expect("read refused target")
+                .is_none(),
+            "ordinary-member rejection must not create a relay member"
+        );
     }
 
     /// Open relay (`require_relay_membership = false`): a rosterless

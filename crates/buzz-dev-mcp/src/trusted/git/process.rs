@@ -906,6 +906,7 @@ fn reconciled_ref_outcome(
     }
 }
 
+#[cfg(unix)]
 fn parse_exact_ref_records(bytes: &[u8], expected_ref: &str) -> Result<Option<String>, String> {
     let mut object = None;
     for record in bytes
@@ -919,7 +920,7 @@ fn parse_exact_ref_records(bytes: &[u8], expected_ref: &str) -> Result<Option<St
             .map_err(|_| "trusted Git returned an invalid ref object".to_owned())?;
         let full_ref = std::str::from_utf8(&record[separator + 1..])
             .map_err(|_| "trusted Git returned an invalid ref name".to_owned())?;
-        validate_object_id(candidate)?;
+        super::validate_object_id(candidate)?;
         if full_ref != expected_ref || object.replace(candidate.to_owned()).is_some() {
             return Err("trusted Git ref query was not exact".into());
         }

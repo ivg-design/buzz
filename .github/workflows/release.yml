@@ -95,6 +95,11 @@ jobs:
           ./scripts/bundle-sidecars.sh
           node scripts/bundle-codex-runtime.mjs "${TARGET:-$(rustc -vV | sed -n 's|host: ||p')}"
 
+      - name: Verify staged Codex macOS signatures
+        run: |
+          python3 scripts/verify-codex-macos-signing.py staged \
+            --target "${TARGET:-$(rustc -vV | sed -n 's|host: ||p')}"
+
       # Mesh rev derived from Cargo.lock (no lockstep edit on dep bump); cache key tracks it.
       - name: Resolve mesh-llm rev
         id: mesh_rev
@@ -211,12 +216,15 @@ jobs:
 
       - name: Verify code signature
         run: |
+          APP_DIR="desktop/src-tauri/target/release/bundle/macos/Buzz.app"
           codesign --verify --deep --strict --verbose=2 \
-            desktop/src-tauri/target/release/bundle/macos/Buzz.app
+            "$APP_DIR"
           spctl --assess --type execute --verbose=4 \
-            desktop/src-tauri/target/release/bundle/macos/Buzz.app
-          desktop/scripts/verify-macos-entitlements.sh \
-            desktop/src-tauri/target/release/bundle/macos/Buzz.app
+            "$APP_DIR"
+          desktop/scripts/verify-macos-entitlements.sh "$APP_DIR"
+          python3 scripts/verify-codex-macos-signing.py app \
+            --target "${TARGET:-$(rustc -vV | sed -n 's|host: ||p')}" \
+            --app "$APP_DIR"
 
       - name: Locate build artifacts
         id: artifacts
@@ -314,6 +322,9 @@ jobs:
           ./scripts/bundle-sidecars.sh "$TARGET"
           node scripts/bundle-codex-runtime.mjs "${TARGET:-$(rustc -vV | sed -n 's|host: ||p')}"
 
+      - name: Verify staged Codex macOS signatures
+        run: python3 scripts/verify-codex-macos-signing.py staged --target "$TARGET"
+
       - name: Build unsigned Tauri app
         run: cd desktop && pnpm tauri build --verbose --no-sign --target "$TARGET" --config src-tauri/tauri.release.conf.json
         env:
@@ -390,6 +401,9 @@ jobs:
           codesign --verify --deep --strict --verbose=2 "$APP_DIR"
           spctl --assess --type execute --verbose=4 "$APP_DIR"
           desktop/scripts/verify-macos-entitlements.sh "$APP_DIR"
+          python3 scripts/verify-codex-macos-signing.py app \
+            --target "$TARGET" \
+            --app "$APP_DIR"
 
       - name: Locate updater archive
         id: artifacts

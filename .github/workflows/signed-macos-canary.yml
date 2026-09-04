@@ -119,6 +119,9 @@ jobs:
           ./scripts/bundle-sidecars.sh
           node scripts/bundle-codex-runtime.mjs "${TARGET:-$(rustc -vV | sed -n 's|host: ||p')}"
 
+      - name: Verify staged Codex macOS signatures
+        run: python3 scripts/verify-codex-macos-signing.py staged --target aarch64-apple-darwin
+
       # Mesh rev derived from Cargo.lock (no lockstep edit on dep bump); cache key tracks it.
       - name: Resolve mesh-llm rev
         id: mesh_rev
@@ -213,6 +216,9 @@ jobs:
           codesign --verify --deep --strict --verbose=2 "$EXTRACT_DIR/Buzz.app"
           spctl --assess --type execute --verbose=4 "$EXTRACT_DIR/Buzz.app"
           desktop/scripts/verify-macos-entitlements.sh "$EXTRACT_DIR/Buzz.app"
+          python3 scripts/verify-codex-macos-signing.py app \
+            --target aarch64-apple-darwin \
+            --app "$EXTRACT_DIR/Buzz.app"
 
       - name: Stage signed DMG
         id: artifact

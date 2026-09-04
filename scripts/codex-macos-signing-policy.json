@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "resourcePath": "Contents/Resources/codex-cli",
+  "requiredControlFiles": [
+    "PROVENANCE.json",
+    "SHA256SUMS.txt"
+  ],
+  "optionalControlFiles": [
+    ".keep"
+  ],
+  "requiredPayloads": [
+    "licenses/openai-codex-LICENSE",
+    "runtime/bin/codex",
+    "runtime/bin/codex-code-mode-host",
+    "runtime/codex-package.json",
+    "runtime/codex-path/rg",
+    "runtime/codex-resources/zsh/bin/zsh"
+  ],
+  "targets": {
+    "aarch64-apple-darwin": "arm64",
+    "x86_64-apple-darwin": "x86_64"
+  },
+  "allowedSigners": [
+    {
+      "commonName": "Developer ID Application: OpenAI OpCo, LLC (2DC432GLL2)",
+      "teamIdentifier": "2DC432GLL2",
+      "authorityChain": [
+        "Developer ID Application: OpenAI OpCo, LLC (2DC432GLL2)",
+        "Developer ID Certification Authority",
+        "Apple Root CA"
+      ]
+    }
+  ]
+}

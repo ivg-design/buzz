@@ -14,3 +14,12 @@ the `CODEX_PATH` environment variable configured by Buzz Desktop.
 
 Generated payloads are ignored. Rebuild them for every target; never commit
 generated binaries to this repository.
+
+For macOS, every release lane runs
+`scripts/verify-codex-macos-signing.py staged --target <rust-target>` before
+Tauri builds the app. Signed lanes run the `app` phase again against the exact
+`Buzz.app` extracted from the signing service. The tracked policy pins the
+OpenAI Developer ID chain and team, hardened runtime, secure timestamp, thin
+architecture, provenance checksums, and final
+`Contents/Resources/codex-cli` placement. A Codex package update that changes
+the payload inventory or signer must update that policy through review.

@@ -87,6 +87,9 @@ jobs:
           ./scripts/bundle-sidecars.sh "$TARGET"
           node scripts/bundle-codex-runtime.mjs "${TARGET:-$(rustc -vV | sed -n 's|host: ||p')}"
 
+      - name: Verify staged Codex macOS signatures
+        run: python3 scripts/verify-codex-macos-signing.py staged --target "$TARGET"
+
       - name: Build unsigned Intel DMG
         run: cd desktop && pnpm tauri build --verbose --no-sign --target "$TARGET" --bundles dmg --config src-tauri/tauri.canary.conf.json
         env:

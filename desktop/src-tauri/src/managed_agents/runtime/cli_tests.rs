@@ -24,7 +24,7 @@ fn claude_spawn_uses_the_probed_cli_executable() {
     crate::managed_agents::clear_resolve_cache();
 
     let mut command = std::process::Command::new("buzz-acp");
-    configure_runtime_cli(&mut command, known_acp_runtime("claude-agent-acp"));
+    configure_runtime_cli(&mut command, known_acp_runtime("claude-agent-acp")).unwrap();
 
     if let Some(path) = original_path {
         std::env::set_var("PATH", path);

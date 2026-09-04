@@ -93,6 +93,7 @@ jobs:
         run: |
           cargo build --release -p buzz-acp -p buzz-agent -p buzz-backend-kubernetes -p buzz-dev-mcp -p git-credential-nostr -p buzz-cli
           ./scripts/bundle-sidecars.sh
+          node scripts/bundle-codex-runtime.mjs "${TARGET:-$(rustc -vV | sed -n 's|host: ||p')}"
 
       # Mesh rev derived from Cargo.lock (no lockstep edit on dep bump); cache key tracks it.
       - name: Resolve mesh-llm rev
@@ -141,6 +142,7 @@ jobs:
           BUZZ_UPDATER_ENDPOINT: https://github.com/block/buzz/releases/download/buzz-desktop-latest/latest.json
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          BUZZ_BUNDLED_CODEX_CLI_REQUIRED: "1"
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
           MACOSX_DEPLOYMENT_TARGET: "10.15"
           CMAKE_OSX_DEPLOYMENT_TARGET: "10.15"
@@ -310,6 +312,7 @@ jobs:
         run: |
           cargo build --release --target "$TARGET" -p buzz-acp -p buzz-agent -p buzz-backend-kubernetes -p buzz-dev-mcp -p git-credential-nostr -p buzz-cli
           ./scripts/bundle-sidecars.sh "$TARGET"
+          node scripts/bundle-codex-runtime.mjs "${TARGET:-$(rustc -vV | sed -n 's|host: ||p')}"
 
       - name: Build unsigned Tauri app
         run: cd desktop && pnpm tauri build --verbose --no-sign --target "$TARGET" --config src-tauri/tauri.release.conf.json
@@ -318,6 +321,7 @@ jobs:
           BUZZ_UPDATER_ENDPOINT: https://github.com/block/buzz/releases/download/buzz-desktop-latest/latest.json
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          BUZZ_BUNDLED_CODEX_CLI_REQUIRED: "1"
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
           MACOSX_DEPLOYMENT_TARGET: "10.15"
           CMAKE_OSX_DEPLOYMENT_TARGET: "10.15"
@@ -565,6 +569,7 @@ jobs:
         run: |
           cargo build --release -p buzz-acp -p buzz-agent -p buzz-backend-kubernetes -p buzz-dev-mcp -p git-credential-nostr -p buzz-cli
           ./scripts/bundle-sidecars.sh
+          node scripts/bundle-codex-runtime.mjs "${TARGET:-$(rustc -vV | sed -n 's|host: ||p')}"
 
       - name: Generate release config
         run: cd desktop && node scripts/build-release-config.mjs
@@ -577,6 +582,7 @@ jobs:
         env:
           BUZZ_UPDATER_PUBLIC_KEY: ${{ secrets.BUZZ_UPDATER_PUBLIC_KEY || secrets.SPROUT_UPDATER_PUBLIC_KEY }}
           BUZZ_UPDATER_ENDPOINT: https://github.com/block/buzz/releases/download/buzz-desktop-latest/latest.json
+          BUZZ_BUNDLED_CODEX_CLI_REQUIRED: "1"
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
@@ -714,6 +720,7 @@ jobs:
         run: |
           cargo build --release --target "$TARGET" -p buzz-acp -p buzz-agent -p buzz-dev-mcp -p git-credential-nostr -p buzz-cli
           ./scripts/bundle-sidecars.sh "$TARGET"
+          node scripts/bundle-codex-runtime.mjs "${TARGET:-$(rustc -vV | sed -n 's|host: ||p')}"
 
       - name: Build Windows NSIS installer (unsigned)
         shell: bash
@@ -723,6 +730,7 @@ jobs:
           BUZZ_UPDATER_ENDPOINT: https://github.com/block/buzz/releases/download/buzz-desktop-latest/latest.json
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          BUZZ_BUNDLED_CODEX_CLI_REQUIRED: "1"
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 
       - name: Locate Windows build artifacts

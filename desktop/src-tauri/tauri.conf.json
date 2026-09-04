@@ -60,6 +60,9 @@
       "binaries/git-credential-nostr",
       "binaries/buzz"
     ],
+    "resources": {
+      "bundle-resources/codex-cli/": "codex-cli/"
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

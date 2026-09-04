@@ -6,6 +6,47 @@ include!("src/commands/reconnect_hook_config.rs");
 include!("src/managed_agents/reserved_env_keys.rs");
 
 use base64::Engine as _;
+use sha2::{Digest as _, Sha256};
+
+fn embed_bundled_codex_cli_manifest() {
+    const REQUIRED_ENV: &str = "BUZZ_BUNDLED_CODEX_CLI_REQUIRED";
+    println!("cargo:rerun-if-env-changed={REQUIRED_ENV}");
+    println!("cargo:rerun-if-changed=bundle-resources/codex-cli/PROVENANCE.json");
+
+    let required = std::env::var_os(REQUIRED_ENV).is_some();
+    let manifest_path = std::path::Path::new("bundle-resources/codex-cli/PROVENANCE.json");
+    if !manifest_path.is_file() {
+        if required {
+            panic!(
+                "{REQUIRED_ENV} requires a staged verified native Codex CLI; run scripts/bundle-codex-runtime.mjs for the Cargo TARGET first"
+            );
+        }
+        return;
+    }
+    if !required {
+        return;
+    }
+
+    let bytes = std::fs::read(manifest_path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", manifest_path.display()));
+    let parsed: serde_json::Value = serde_json::from_slice(&bytes)
+        .unwrap_or_else(|error| panic!("failed to parse {}: {error}", manifest_path.display()));
+    let staged_target = parsed
+        .get("target")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("{} is missing target", manifest_path.display()));
+    let cargo_target = std::env::var("TARGET")
+        .unwrap_or_else(|error| panic!("Cargo TARGET must be set: {error}"));
+    if staged_target != cargo_target {
+        panic!(
+            "staged Codex CLI target {staged_target} does not match Cargo TARGET {cargo_target}"
+        );
+    }
+
+    let manifest_sha256 = hex::encode(Sha256::digest(&bytes));
+    println!("cargo:rustc-env=BUZZ_DESKTOP_BUNDLED_CODEX_CLI_MANIFEST_SHA256={manifest_sha256}");
+    println!("cargo:rustc-env=BUZZ_DESKTOP_BUNDLED_CODEX_CLI_TARGET={staged_target}");
+}
 
 fn main() {
     println!("cargo:rerun-if-env-changed=BUZZ_RELAY_URL");
@@ -20,6 +61,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=BUZZ_BUILD_AUTO_CONNECT_DEFAULT_RELAY");
     println!("cargo:rerun-if-env-changed=BUZZ_BUILD_DEMO_SLUG");
     println!("cargo:rustc-check-cfg=cfg(buzz_updater_enabled)");
+    embed_bundled_codex_cli_manifest();
 
     if let Ok(slug) = std::env::var("BUZZ_BUILD_DEMO_SLUG") {
         let valid = !slug.is_empty()

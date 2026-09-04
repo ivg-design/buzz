@@ -143,11 +143,13 @@ jobs:
         run: |
           cargo build --release --target "$TARGET" -p buzz-acp -p buzz-agent -p buzz-dev-mcp -p git-credential-nostr -p buzz-cli
           ./scripts/bundle-sidecars.sh "$TARGET"
+          node scripts/bundle-codex-runtime.mjs "${TARGET:-$(rustc -vV | sed -n 's|host: ||p')}"
 
       - name: Build Windows NSIS installer (unsigned)
         shell: bash
         run: cd desktop && pnpm tauri build --target "$TARGET" --bundles nsis --config src-tauri/tauri.canary.conf.json
         env:
+          BUZZ_BUNDLED_CODEX_CLI_REQUIRED: "1"
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 
       - name: Locate NSIS installer

@@ -587,7 +587,7 @@ fn name_matches_interpreter_rejects_node_prefix() {
 #[test]
 fn codex_spawn_does_not_set_a_claude_executable() {
     let mut command = std::process::Command::new("buzz-acp");
-    super::configure_runtime_cli(&mut command, super::known_acp_runtime("codex-acp"));
+    super::configure_runtime_cli(&mut command, super::known_acp_runtime("codex-acp")).unwrap();
     assert!(!command
         .get_envs()
         .any(|(key, _)| key == "CLAUDE_CODE_EXECUTABLE"));

@@ -383,12 +383,15 @@ pub(crate) fn build_respond_to_env(
 pub(crate) fn configure_runtime_cli(
     command: &mut std::process::Command,
     runtime: Option<&KnownAcpRuntime>,
-) {
+) -> Result<(), String> {
     let Some(runtime) = runtime else {
-        return;
+        return Ok(());
     };
+    if runtime.id == "codex" {
+        return super::bundled_codex_cli::configure_command(command);
+    }
     if runtime.id != "claude" {
-        return;
+        return Ok(());
     }
     if let Some(cli_path) = runtime.underlying_cli.and_then(resolve_command) {
         // On Windows, `.cmd` and `.bat` files are batch shims — they cannot be
@@ -398,10 +401,11 @@ pub(crate) fn configure_runtime_cli(
         // its own PATH lookup and finds the real binary instead.
         // Non-Windows: `.cmd`/`.bat` are valid executables and must be assigned.
         if should_skip_claude_executable(&cli_path, cfg!(windows)) {
-            return;
+            return Ok(());
         }
         command.env("CLAUDE_CODE_EXECUTABLE", cli_path);
     }
+    Ok(())
 }
 
 /// Proof token for the effort-application outer binding. `#[must_use]`;
@@ -773,7 +777,7 @@ pub fn spawn_agent_child(
     {
         apply_claude_model_env(&mut command, effective_model.as_deref());
     }
-    configure_runtime_cli(&mut command, runtime_meta);
+    configure_runtime_cli(&mut command, runtime_meta)?;
 
     // Buzz shared compute is stored as a native provider; derive the OpenAI-compatible
     // transport at spawn time and scrub any unrelated ambient OpenAI key.

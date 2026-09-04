@@ -236,6 +236,9 @@ pub fn run() {
         .manage(channel_head_cache::ChannelHeadCacheStore::default())
         .setup(move |app| {
             let app_handle = app.handle().clone();
+            if let Ok(resource_dir) = app_handle.path().resource_dir() {
+                managed_agents::bundled_codex_cli::initialize_resource_dir(resource_dir);
+            }
             #[cfg(target_os = "macos")]
             {
                 tray_menu::init(&app_handle)?;

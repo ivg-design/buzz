@@ -188,10 +188,12 @@ jobs:
         run: |
           cargo build --release -p buzz-acp -p buzz-agent -p buzz-backend-kubernetes -p buzz-dev-mcp -p git-credential-nostr -p buzz-cli
           ./scripts/bundle-sidecars.sh
+          node scripts/bundle-codex-runtime.mjs "${TARGET:-$(rustc -vV | sed -n 's|host: ||p')}"
 
       - name: Build Linux Tauri app
         run: cd desktop && pnpm tauri build --ci --bundles deb,appimage --features mesh-llm --config src-tauri/tauri.canary.conf.json
         env:
+          BUZZ_BUNDLED_CODEX_CLI_REQUIRED: "1"
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 
       - name: Fix AppImage (remove infra libs, symlink system GStreamer)

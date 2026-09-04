@@ -2,6 +2,8 @@
 /target/
 /dist/
 /admin-web/dist/
+/desktop/src-tauri/bundle-resources/codex-cli/*
+!/desktop/src-tauri/bundle-resources/codex-cli/.keep
 
 # Python cache
 __pycache__/

@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "codex": {
+    "version": "0.153.2",
+    "upstreamCommit": "657a993cbee87acf52d14b758ce49dbd46d1b8eb",
+    "license": "LICENSE.openai-codex",
+    "licenseSha256": "d17f227e4df5da1600391338865ce0f3055211760a36688f816941d58232d8dc",
+    "platforms": {
+      "aarch64-apple-darwin": {
+        "packageSuffix": "darwin-arm64",
+        "vendorTriple": "aarch64-apple-darwin",
+        "integrity": "sha512-8cEJWOIW5WnSn2+W1RUjc1sm2sN1H6NP+cCrOe73ImamUy2yOk3QKjZM2SfkA9jf3fqgwlBNUslhGMen2omc5g=="
+      },
+      "x86_64-apple-darwin": {
+        "packageSuffix": "darwin-x64",
+        "vendorTriple": "x86_64-apple-darwin",
+        "integrity": "sha512-hY68UBhIUE3xIn40SdoujokNiCBeHn9Jp9bEtcIrYeYd2IUtu1oCFwxFnkGhw6+UjHn7piiMxohAomddRA4MCg=="
+      },
+      "aarch64-unknown-linux-gnu": {
+        "packageSuffix": "linux-arm64",
+        "vendorTriple": "aarch64-unknown-linux-musl",
+        "integrity": "sha512-QDkOdJzIdMGaOCViY2dqGqr8WhQv81WfmJkAghC3doFedsOfHt87RuAO4yFN7m0FSR3y5UsScSDUT4zOCcmEVA=="
+      },
+      "x86_64-unknown-linux-gnu": {
+        "packageSuffix": "linux-x64",
+        "vendorTriple": "x86_64-unknown-linux-musl",
+        "integrity": "sha512-CPUPhFmykKRdIcgwiOfKvFKHBP62dPfaiP+pzQ2bVNAfLTW+i0Kasd7hQryoxZUmTPvw0h9HyM2NgsnQ9AJlTw=="
+      },
+      "aarch64-pc-windows-msvc": {
+        "packageSuffix": "win32-arm64",
+        "vendorTriple": "aarch64-pc-windows-msvc",
+        "integrity": "sha512-+49dim0F4FoxKLBDBLzMQL4C1m9FG2kx6twg98jo2USesKfmj8XG3HSCe2tW2zOfRArSgHCDyNDHFdts3AfaBg=="
+      },
+      "x86_64-pc-windows-msvc": {
+        "packageSuffix": "win32-x64",
+        "vendorTriple": "x86_64-pc-windows-msvc",
+        "integrity": "sha512-x1PnFo9Uy81NEIlPx3qxkP3PQgkfmJOY/2LqKCKlvxArWIL+PrEV9xKcmKeo9Yw23PPU2TDH3AyqcdeblqtNNg=="
+      }
+    }
+  }
+}

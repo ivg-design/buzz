@@ -530,7 +530,7 @@ fn valid_revision(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn canonical_github_repository(value: &str) -> Option<String> {
+pub(crate) fn canonical_github_repository(value: &str) -> Option<String> {
     let value = value.trim();
     let parsed = Url::parse(value).ok()?;
     if parsed.scheme() != "https"

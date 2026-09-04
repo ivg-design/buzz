@@ -281,9 +281,19 @@ fn adapter_terminal_argv(
         ));
     }
 
-    let command_path = resolve_command(command)
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|| command.to_string());
+    let command_path = match resolve_command(command) {
+        Some(path) => path.display().to_string(),
+        None if std::path::Path::new(command)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                matches!(name, "codex-acp" | "codex-acp.exe" | "codex-acp.cmd")
+            }) =>
+        {
+            return Err("Codex authentication requires Buzz's verified bundled adapter".into());
+        }
+        None => command.to_string(),
+    };
     let mut argv = vec![command_path];
     argv.extend(args.iter().cloned());
     if method.id == "claude-login" && terminal_auth_meta_command(method)?.is_some() {
@@ -725,5 +735,21 @@ mod tests {
                 .unwrap(),
             vec!["definitely-not-on-path-buzz-test".to_string()]
         );
+    }
+
+    #[test]
+    fn terminal_argv_rejects_unverified_codex_adapter_command() {
+        let method = AcpAuthMethod {
+            id: "codex-login".into(),
+            name: "Codex Login".into(),
+            description: None,
+            method_type: Some("terminal".into()),
+            args: vec![],
+            command: vec!["/tmp/unverified-codex/codex-acp".into(), "login".into()],
+            meta: None,
+        };
+        assert!(adapter_terminal_argv("Codex", &method, "unused")
+            .unwrap_err()
+            .contains("verified bundled adapter"));
     }
 }

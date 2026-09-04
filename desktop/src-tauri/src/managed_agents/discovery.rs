@@ -4,9 +4,9 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::managed_agents::{
-    buzz_managed_command_path, buzz_managed_node_bin_dir, buzz_managed_npm_bin_dir,
-    AcpAvailabilityStatus, AcpRuntimeCatalogEntry, AuthStatus, CommandAvailabilityInfo,
-    HarnessSource,
+    bundled_codex_acp_is_verified, buzz_managed_command_path, buzz_managed_node_bin_dir,
+    buzz_managed_npm_bin_dir, AcpAvailabilityStatus, AcpRuntimeCatalogEntry, AuthStatus,
+    CommandAvailabilityInfo, HarnessSource,
 };
 mod auth_status_cache;
 pub(crate) mod bounded_command;
@@ -453,6 +453,9 @@ fn resolve_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String
 /// The cache eliminates redundant login-shell spawns when multiple agents share
 /// the same binaries (e.g. `npx`, `uvx`).
 pub fn resolve_command(command: &str) -> Option<PathBuf> {
+    if is_codex_acp_command(command) {
+        return resolve_verified_codex_acp_command(command);
+    }
     if let Some(managed) = resolve_buzz_managed_command(command) {
         return Some(managed);
     }
@@ -490,6 +493,9 @@ pub fn resolve_command(command: &str) -> Option<PathBuf> {
 /// freeze the cheap path exists to avoid. `resolve_command` (the forced path)
 /// is the sole prober and cache populator.
 pub fn resolve_command_cached(command: &str) -> Option<PathBuf> {
+    if is_codex_acp_command(command) {
+        return resolve_verified_codex_acp_command(command);
+    }
     if let Some(managed) = resolve_buzz_managed_command(command) {
         return Some(managed);
     }
@@ -613,7 +619,30 @@ fn resolve_buzz_managed_command(command: &str) -> Option<PathBuf> {
         .find_map(|basename| buzz_managed_command_path(command, basename))
 }
 
+fn is_codex_acp_command(command: &str) -> bool {
+    Path::new(command)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| matches!(name, "codex-acp" | "codex-acp.exe" | "codex-acp.cmd"))
+}
+
+/// Resolve Codex only from Buzz's app-private adapter directory and require
+/// the installed compiled payload to match the reviewed bundle. This is the
+/// common seam used by discovery, runtime launch, readiness, and auth.
+fn resolve_verified_codex_acp_command(command: &str) -> Option<PathBuf> {
+    let candidate = if command_looks_like_path(command) {
+        let path = PathBuf::from(command);
+        is_executable_file(&path).then_some(path)
+    } else {
+        resolve_buzz_managed_command(command)
+    }?;
+    bundled_codex_acp_is_verified(&candidate).then_some(candidate)
+}
+
 fn resolve_command_uncached(command: &str) -> Option<PathBuf> {
+    if is_codex_acp_command(command) {
+        return resolve_verified_codex_acp_command(command);
+    }
     if let Some(path) = resolve_workspace_command(command) {
         return Some(path);
     }
@@ -945,6 +974,7 @@ pub(crate) fn codex_adapter_is_outdated(path: &Path) -> bool {
 
 /// Returns `true` when the codex-acp binary at `path` is below
 /// [`MIN_CODEX_ACP_VERSION`] or cannot be probed with the supplied PATH.
+#[cfg(test)]
 pub(crate) fn codex_adapter_is_outdated_with_path(
     path: &Path,
     augmented_path: Option<&str>,
@@ -990,7 +1020,12 @@ fn discover_acp_runtime_phase1(runtime: &'static KnownAcpRuntime, force: bool) -
     {
         if force {
             if let Some(path_str) = &binary_path {
-                availability = codex_adapter_availability(&PathBuf::from(path_str));
+                let path = PathBuf::from(path_str);
+                availability = if bundled_codex_acp_is_verified(&path) {
+                    codex_adapter_availability(&path)
+                } else {
+                    AcpAvailabilityStatus::AdapterOutdated
+                };
             }
         } else if let Some(cached) = adapter_availability_cached() {
             availability = cached;

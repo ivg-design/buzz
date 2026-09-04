@@ -12,6 +12,8 @@ use std::{
 };
 
 pub(crate) const WORKSPACE_PROJECT_CHANNEL_ENV: &str = "BUZZ_ACP_WORKSPACE_PROJECT_CHANNEL";
+pub(crate) const WORKSPACE_PROJECT_ADDRESS_ENV: &str = "BUZZ_ACP_WORKSPACE_PROJECT_ADDRESS";
+pub(crate) const WORKSPACE_PROJECT_REPOSITORY_ENV: &str = "BUZZ_ACP_WORKSPACE_PROJECT_REPOSITORY";
 pub(crate) const WORKSPACE_PROJECT_REVISION_ENV: &str = "BUZZ_ACP_WORKSPACE_PROJECT_REVISION";
 
 const STORE_KEY: &str = "workspace-projects.v1";
@@ -251,10 +253,14 @@ pub(crate) fn apply_workspace_project_env(
     project: Option<&WorkspaceProject>,
 ) -> Result<(), String> {
     command.env_remove(WORKSPACE_PROJECT_CHANNEL_ENV);
+    command.env_remove(WORKSPACE_PROJECT_ADDRESS_ENV);
+    command.env_remove(WORKSPACE_PROJECT_REPOSITORY_ENV);
     command.env_remove(WORKSPACE_PROJECT_REVISION_ENV);
     if let Some(project) = project {
         validate_workspace_project(project)?;
         command.env(WORKSPACE_PROJECT_CHANNEL_ENV, &project.home_channel);
+        command.env(WORKSPACE_PROJECT_ADDRESS_ENV, &project.project_address);
+        command.env(WORKSPACE_PROJECT_REPOSITORY_ENV, &project.repository);
         command.env(
             WORKSPACE_PROJECT_REVISION_ENV,
             &project.instruction_revision,
@@ -322,10 +328,12 @@ mod tests {
     }
 
     #[test]
-    fn channel_and_revision_are_applied_or_removed_together_after_overrides() {
+    fn complete_selector_is_applied_or_removed_together_after_overrides() {
         let mut command = std::process::Command::new("true");
         command
             .env(WORKSPACE_PROJECT_CHANNEL_ENV, "attacker-channel")
+            .env(WORKSPACE_PROJECT_ADDRESS_ENV, "attacker-address")
+            .env(WORKSPACE_PROJECT_REPOSITORY_ENV, "attacker-repository")
             .env(WORKSPACE_PROJECT_REVISION_ENV, "attacker-revision");
         apply_workspace_project_env(&mut command, Some(&project())).expect("apply project");
         let env = command.get_envs().collect::<BTreeMap<_, _>>();
@@ -336,6 +344,18 @@ mod tests {
             Some(project().home_channel.as_str())
         );
         assert_eq!(
+            env.get(std::ffi::OsStr::new(WORKSPACE_PROJECT_ADDRESS_ENV))
+                .and_then(|value| value.as_ref())
+                .and_then(|value| value.to_str()),
+            Some(project().project_address.as_str())
+        );
+        assert_eq!(
+            env.get(std::ffi::OsStr::new(WORKSPACE_PROJECT_REPOSITORY_ENV))
+                .and_then(|value| value.as_ref())
+                .and_then(|value| value.to_str()),
+            Some(project().repository.as_str())
+        );
+        assert_eq!(
             env.get(std::ffi::OsStr::new(WORKSPACE_PROJECT_REVISION_ENV))
                 .and_then(|value| value.as_ref())
                 .and_then(|value| value.to_str()),
@@ -343,6 +363,8 @@ mod tests {
         );
         apply_workspace_project_env(&mut command, None).expect("clear project env");
         assert_eq!(env_value(&command, WORKSPACE_PROJECT_CHANNEL_ENV), None);
+        assert_eq!(env_value(&command, WORKSPACE_PROJECT_ADDRESS_ENV), None);
+        assert_eq!(env_value(&command, WORKSPACE_PROJECT_REPOSITORY_ENV), None);
         assert_eq!(env_value(&command, WORKSPACE_PROJECT_REVISION_ENV), None);
     }
 

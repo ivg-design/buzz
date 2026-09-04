@@ -160,6 +160,8 @@ pub(crate) struct SpawnConfigSnapshot {
     /// Keeping them outside `env` makes owner-selection drift explicit while
     /// avoiding duplicate or attacker-controlled snapshot representations.
     pub workspace_project_channel: Option<String>,
+    pub workspace_project_address: Option<String>,
+    pub workspace_project_repository: Option<String>,
     pub workspace_project_revision: Option<String>,
 }
 
@@ -270,6 +272,10 @@ impl SpawnConfigSnapshot {
             session_policy: session_policy.as_str().to_string(),
             workspace_project_channel: workspace_project
                 .map(|project| project.home_channel.clone()),
+            workspace_project_address: workspace_project
+                .map(|project| project.project_address.clone()),
+            workspace_project_repository: workspace_project
+                .map(|project| project.repository.clone()),
             workspace_project_revision: workspace_project
                 .map(|project| project.instruction_revision.clone()),
         }

@@ -327,6 +327,9 @@ pub struct AcpClient {
     /// Whether the adapter accepts ACP `McpServerHttp` entries. Unsupported or
     /// missing capability values fail closed to credential-free stdio only.
     http_mcp_supported: bool,
+    /// Whether the adapter explicitly advertises the ACP v1 append-only system
+    /// prompt extension targeting Codex `developerInstructions` on session/new.
+    developer_instructions_append_supported: bool,
     /// Per-turn channel for receiving goose-native non-cancelling steer
     /// requests from the main loop. Installed by
     /// [`install_steer_rx`](Self::install_steer_rx) at dispatch and
@@ -376,6 +379,10 @@ const HARNESS_ONLY_ENV: &[&str] = &[
     "BUZZ_ACP_OWNER_GITHUB_LOGIN",
     "BUZZ_ACP_ALLOW_INSECURE_LOOPBACK_JOBS",
     "BUZZ_ACP_STARTUP_STDIN",
+    "BUZZ_ACP_WORKSPACE_PROJECT_CHANNEL",
+    "BUZZ_ACP_WORKSPACE_PROJECT_ADDRESS",
+    "BUZZ_ACP_WORKSPACE_PROJECT_REPOSITORY",
+    "BUZZ_ACP_WORKSPACE_PROJECT_REVISION",
 ];
 
 pub(crate) fn is_harness_only_env(name: &str) -> bool {
@@ -603,6 +610,30 @@ fn build_client_capabilities() -> serde_json::Value {
     })
 }
 
+fn supports_developer_instructions_append(result: &serde_json::Value) -> bool {
+    let capability = result.pointer("/_meta/systemPrompt");
+    capability
+        .and_then(|value| value.get("version"))
+        .and_then(|v| v.as_u64())
+        == Some(1)
+        && capability
+            .and_then(|value| value.get("target"))
+            .and_then(|value| value.as_str())
+            == Some("developerInstructions")
+        && capability
+            .and_then(|value| value.get("modes"))
+            .and_then(|value| value.as_array())
+            .is_some_and(|values| values.iter().any(|value| value.as_str() == Some("append")))
+        && capability
+            .and_then(|value| value.get("methods"))
+            .and_then(|value| value.as_array())
+            .is_some_and(|values| {
+                values
+                    .iter()
+                    .any(|value| value.as_str() == Some("session/new"))
+            })
+}
+
 impl AcpClient {
     /// Kill the agent subprocess and wait for it to exit (no zombies).
     ///
@@ -636,9 +667,9 @@ impl AcpClient {
     /// Spawn the agent binary as a subprocess and connect to its stdio pipes.
     ///
     /// `has_generated_codex_config` must be true when `codex_network_env()` successfully
-    /// injected a `CODEX_CONFIG` entry into `extra_env`.  The spawn path uses it to
+    /// injected a `CODEX_CONFIG` entry into `extra_env`. The spawn path uses it to
     /// trigger the recursive merge + forced `network_access=true` in
-    /// `build_codex_config_env`.  Pass `false` for test spawns and non-Codex agents.
+    /// `build_codex_config_env`. Pass `false` for test spawns and non-Codex agents.
     ///
     /// After spawning, call [`initialize`](Self::initialize) before any other method.
     pub async fn spawn(
@@ -762,6 +793,7 @@ impl AcpClient {
             active_run_id: None,
             steering_supported: false,
             http_mcp_supported: false,
+            developer_instructions_append_supported: false,
             steer_rx: None,
             goose_usage: UsageTracker::default(),
             standard_usage: StandardUsageTracker::default(),
@@ -826,6 +858,8 @@ impl AcpClient {
             .pointer("/agentCapabilities/mcpCapabilities/http")
             .and_then(|value| value.as_bool())
             .unwrap_or(false);
+        self.developer_instructions_append_supported =
+            supports_developer_instructions_append(&result);
         tracing::debug!(target: "acp::init", "initialize response: {result}");
         Ok(result)
     }
@@ -847,12 +881,12 @@ impl AcpClient {
     /// - `None` — no system-prompt field in the request (legacy framing).
     /// - `Some(SystemPromptTransport::Field(text))` — bare `systemPrompt` field
     ///   (ACP protocol v2, buzz-agent, goose unused).
-    /// - `Some(SystemPromptTransport::ClaudeMeta(text))` — `_meta.systemPrompt`
-    ///   as `{"append": text}`, keeping claude-agent-acp's native preset intact.
+    /// - `Some(SystemPromptTransport::MetaAppend(text))` — `_meta.systemPrompt`
+    ///   as `{"append": text}`, for an adapter that explicitly supports append.
     ///
     /// `session_title` rides in `_meta.sessionTitle` when `Some`; `_meta` is
     /// omitted entirely otherwise, since adapters may distinguish an absent
-    /// member from a null one. When both `ClaudeMeta` and `session_title` are
+    /// member from a null one. When both `MetaAppend` and `session_title` are
     /// present the two `_meta` members are merged into a single object.
     ///
     /// Callers use [`extract_model_config_options`] and [`extract_model_state`]
@@ -872,14 +906,14 @@ impl AcpClient {
             Some(SystemPromptTransport::Field(sp)) => {
                 params["systemPrompt"] = serde_json::Value::String(sp.to_owned());
             }
-            Some(SystemPromptTransport::ClaudeMeta(sp)) => {
+            Some(SystemPromptTransport::MetaAppend(sp)) => {
                 // Merge into _meta so sessionTitle (set below) is not clobbered.
                 params["_meta"]["systemPrompt"] = serde_json::json!({ "append": sp });
             }
             None => {}
         }
         if let Some(title) = session_title {
-            // Merge — _meta may already carry systemPrompt from ClaudeMeta above.
+            // Merge — _meta may already carry systemPrompt from MetaAppend above.
             params["_meta"]["sessionTitle"] = serde_json::Value::String(title.to_owned());
         }
         let result = self.send_request("session/new", params).await?;
@@ -1090,6 +1124,19 @@ impl AcpClient {
     /// for the supervisor's post-initialize log line.
     pub fn steering_supported(&self) -> bool {
         self.steering_supported
+    }
+
+    pub(crate) fn developer_instructions_append_supported(&self) -> bool {
+        self.developer_instructions_append_supported
+    }
+
+    pub(crate) fn is_codex_adapter(&self) -> bool {
+        self.standard_adapter == Some(StandardAdapterKind::Codex)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_developer_instructions_append_supported_for_test(&mut self) {
+        self.developer_instructions_append_supported = true;
     }
 
     /// Whether the initialized adapter accepts Streamable HTTP MCP servers.
@@ -2364,15 +2411,14 @@ pub struct SessionNewResponse {
 /// The two variants match the two mechanisms supported by current adapters:
 ///
 /// - **`Field`** — bare `systemPrompt` field (ACP protocol v2, buzz-agent).
-/// - **`ClaudeMeta`** — `_meta.systemPrompt: {"append": text}`, used by
-///   `claude-agent-acp` to append to the adapter's own native system prompt
-///   while keeping its tool-use preset intact.
+/// - **`MetaAppend`** — `_meta.systemPrompt: {"append": text}`, used by an
+///   adapter that advertises append semantics (including patched codex-acp).
 #[derive(Debug, Clone, PartialEq)]
 pub enum SystemPromptTransport<'a> {
     /// Deliver as a bare top-level `systemPrompt` field.
     Field(&'a str),
     /// Deliver as `_meta.systemPrompt: {"append": text}`.
-    ClaudeMeta(&'a str),
+    MetaAppend(&'a str),
 }
 
 /// How to switch to a particular model on a session.
@@ -3993,7 +4039,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_new_full_sends_claude_meta_system_prompt_when_claude_meta_transport() {
-        // When ClaudeMeta transport is requested, the prompt must appear as
+        // When MetaAppend transport is requested, the prompt must appear as
         // _meta.systemPrompt: {"append": text} — never as a bare systemPrompt field.
         let script = r#"
             read -t 2 _init
@@ -4012,7 +4058,7 @@ mod tests {
             .session_new_full(
                 "/tmp",
                 vec![],
-                Some(SystemPromptTransport::ClaudeMeta("Be concise")),
+                Some(SystemPromptTransport::MetaAppend("Be concise")),
                 None,
             )
             .await
@@ -4021,7 +4067,7 @@ mod tests {
         let received = &resp.raw["_receivedRequest"];
         assert!(
             received["params"].get("systemPrompt").is_none(),
-            "bare systemPrompt must not be present for ClaudeMeta transport"
+            "bare systemPrompt must not be present for MetaAppend transport"
         );
         assert_eq!(
             received["params"]["_meta"]["systemPrompt"]["append"].as_str(),
@@ -4032,7 +4078,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_new_full_merges_claude_meta_and_session_title_into_single_meta_object() {
-        // Both ClaudeMeta prompt and session_title must coexist under _meta —
+        // Both MetaAppend prompt and session_title must coexist under _meta —
         // the prompt must not clobber sessionTitle or vice versa.
         let script = r#"
             read -t 2 _init
@@ -4051,7 +4097,7 @@ mod tests {
             .session_new_full(
                 "/tmp",
                 vec![],
-                Some(SystemPromptTransport::ClaudeMeta("Be concise")),
+                Some(SystemPromptTransport::MetaAppend("Be concise")),
                 Some("Fizz · #buzz-dev"),
             )
             .await
@@ -4494,6 +4540,20 @@ mod tests {
         client.http_mcp_supported()
     }
 
+    async fn developer_append_supported_after_initialize(init_result: &str) -> bool {
+        let script = format!(
+            "read -r _init; printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{result}}}'; \
+             sleep 5",
+            result = init_result,
+        );
+        let mut client = spawn_script(&script).await;
+        client
+            .initialize()
+            .await
+            .expect("initialize should succeed");
+        client.developer_instructions_append_supported()
+    }
+
     #[tokio::test]
     async fn initialize_enables_http_mcp_only_on_exact_true_capability() {
         let supported = http_mcp_supported_after_initialize(
@@ -4522,6 +4582,51 @@ mod tests {
         assert!(
             supported,
             "_meta.steering.supported: true must set steering_supported"
+        );
+    }
+
+    #[test]
+    fn developer_instruction_append_requires_the_complete_explicit_capability() {
+        let capable = serde_json::json!({
+            "_meta": {"systemPrompt": {
+                "version": 1,
+                "modes": ["append"],
+                "target": "developerInstructions",
+                "methods": ["session/new"]
+            }}
+        });
+        assert!(supports_developer_instructions_append(&capable));
+
+        for pointer in ["version", "modes", "target", "methods"] {
+            let mut incomplete = capable.clone();
+            incomplete["_meta"]["systemPrompt"]
+                .as_object_mut()
+                .unwrap()
+                .remove(pointer);
+            assert!(
+                !supports_developer_instructions_append(&incomplete),
+                "missing {pointer} must fail closed"
+            );
+        }
+        assert!(!supports_developer_instructions_append(
+            &serde_json::json!({
+                "_meta": {"systemPrompt": {
+                    "version": 1,
+                    "modes": ["append"],
+                    "target": "systemPrompt",
+                    "methods": ["session/new"]
+                }}
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn initialize_records_explicit_developer_instruction_capability() {
+        let capable = r#"{"protocolVersion":1,"_meta":{"systemPrompt":{"version":1,"modes":["append"],"target":"developerInstructions","methods":["session/new"]}}}"#;
+        assert!(developer_append_supported_after_initialize(capable).await);
+        assert!(
+            !developer_append_supported_after_initialize(r#"{"protocolVersion":1,"_meta":{}}"#)
+                .await
         );
     }
 

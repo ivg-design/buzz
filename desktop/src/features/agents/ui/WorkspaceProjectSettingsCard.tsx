@@ -51,7 +51,7 @@ export function WorkspaceProjectSettingsCard({
   candidate: WorkspaceProject | null;
   current: WorkspaceProject | null;
   codexInstructionError: string | null;
-  codexInstructionStatus: "blocked" | "supported" | null;
+  codexInstructionStatus: "verified" | "unavailable" | null;
   expectedRelayUrl: string | null;
   expectedSignerPubkey: string | null;
   isError: boolean;
@@ -132,7 +132,7 @@ export function WorkspaceProjectSettingsCard({
           the Nemo project instructions until an owner pins one below.
         </div>
       ) : null}
-      {!isPending && codexInstructionStatus === "blocked" ? (
+      {!isPending && codexInstructionStatus === "unavailable" ? (
         <div
           className="flex items-start gap-2 rounded-lg border border-destructive/40 bg-destructive/5 p-3 text-sm text-destructive"
           role="alert"
@@ -140,8 +140,17 @@ export function WorkspaceProjectSettingsCard({
           <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
           <span>
             {codexInstructionError ??
-              "Managed Codex instruction delivery is blocked."}
+              "Managed Codex instruction delivery is unavailable."}
           </span>
+        </div>
+      ) : null}
+      {!isPending && codexInstructionStatus === "verified" ? (
+        <div
+          className="flex items-start gap-2 rounded-lg border border-emerald-500/40 bg-emerald-500/5 p-3 text-sm text-emerald-700"
+          role="status"
+        >
+          <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" />
+          <span>Managed Codex instruction delivery is verified.</span>
         </div>
       ) : null}
 

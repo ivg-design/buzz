@@ -637,6 +637,8 @@ type E2eConfig = {
      * the Agents tab." status text in AgentDefaultsSettingsCard.
      */
     globalConfigFailedRestartCount?: number;
+    /** Workspace Project Codex delivery state. Defaults to the shipped verified path. */
+    workspaceCodexInstructionStatus?: "verified" | "unavailable";
     /**
      * Milliseconds to delay the mocked `set_global_agent_config` response.
      * Defaults to 0 (resolve immediately). Use to hold a save in flight so a
@@ -14114,12 +14116,16 @@ export function maybeInstallE2eTauriMocks() {
       }
       case "get_workspace_project": {
         const relayUrl = normalizeMockRelayUrl(getRelayWsUrl(activeConfig));
+        const codexInstructionStatus =
+          activeConfig?.mock?.workspaceCodexInstructionStatus ?? "verified";
         return {
           relayUrl,
           project: mockWorkspaceProjects.get(relayUrl) ?? null,
-          codexInstructionStatus: "blocked",
+          codexInstructionStatus,
           codexInstructionError:
-            "The managed Codex ACP adapter does not yet provide verified developerInstructions delivery.",
+            codexInstructionStatus === "verified"
+              ? null
+              : "Install Buzz's reviewed Codex adapter before starting managed Codex agents.",
         };
       }
       case "set_workspace_project": {
@@ -14140,15 +14146,19 @@ export function maybeInstallE2eTauriMocks() {
           JSON.stringify(previous) !== JSON.stringify(args.project);
         if (args.project) mockWorkspaceProjects.set(relayUrl, args.project);
         else mockWorkspaceProjects.delete(relayUrl);
+        const codexInstructionStatus =
+          activeConfig?.mock?.workspaceCodexInstructionStatus ?? "verified";
         return {
           relayUrl,
           project: args.project,
           changed,
           restartedCount: 0,
           failedRestartCount: 0,
-          codexInstructionStatus: "blocked",
+          codexInstructionStatus,
           codexInstructionError:
-            "The managed Codex ACP adapter does not yet provide verified developerInstructions delivery.",
+            codexInstructionStatus === "verified"
+              ? null
+              : "Install Buzz's reviewed Codex adapter before starting managed Codex agents.",
         };
       }
       case "list_a2a_checkouts":

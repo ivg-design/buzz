@@ -52,6 +52,17 @@ fn test_shell_quote_escapes_single_quotes() {
     );
 }
 
+#[test]
+fn bundled_codex_install_is_local_private_and_disables_lifecycle_scripts() {
+    assert_eq!(
+        bundled_codex_acp_npm_command(
+            std::path::Path::new("/tmp/Buzz Node"),
+            std::path::Path::new("/tmp/codex-acp.tgz"),
+        ),
+        "npm install --global --ignore-scripts --prefix '/tmp/Buzz Node' '/tmp/codex-acp.tgz'"
+    );
+}
+
 // ── zip validation tests ──────────────────────────────────────────────────────
 
 /// Build an in-memory zip archive with the supplied entry names and return

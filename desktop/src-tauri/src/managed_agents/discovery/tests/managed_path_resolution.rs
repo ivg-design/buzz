@@ -51,7 +51,7 @@ fn common_binary_paths_probes_legacy_goose_install_dir() {
 
 #[cfg(unix)]
 #[test]
-fn resolve_command_prefers_buzz_managed_npm_shim_over_path() {
+fn resolve_command_rejects_unverified_managed_and_global_codex_shims() {
     use std::os::unix::fs::PermissionsExt;
 
     let _guard = crate::managed_agents::lock_path_mutex();
@@ -105,11 +105,7 @@ fn resolve_command_prefers_buzz_managed_npm_shim_over_path() {
     }
     clear_resolve_cache();
 
-    assert_eq!(
-        resolved.as_deref(),
-        Some(managed_shim.as_path()),
-        "Buzz-managed npm shim must win over PATH/global shims"
-    );
+    assert_eq!(resolved, None, "neither unverified shim may satisfy Codex");
 }
 
 /// The cheap discovery path must never spawn a login shell — not even on a

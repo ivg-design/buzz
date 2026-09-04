@@ -323,10 +323,11 @@ fn has_system_prompt_support(
     protocol_version: u32,
     agent_name: &str,
     goose_system_prompt_supported: Option<bool>,
+    developer_instructions_append_supported: bool,
 ) -> bool {
     if agent_name == "goose" {
         goose_system_prompt_supported == Some(true)
-    } else if agent_name == CLAUDE_AGENT_ACP_NAME {
+    } else if developer_instructions_append_supported || agent_name == CLAUDE_AGENT_ACP_NAME {
         true
     } else {
         protocol_version >= 2
@@ -337,12 +338,15 @@ fn session_new_system_prompt<'a>(
     is_goose: bool,
     protocol_version: u32,
     agent_name: &str,
+    developer_instructions_append_supported: bool,
     prompt: Option<&'a str>,
 ) -> Option<SystemPromptTransport<'a>> {
-    if is_goose || (protocol_version < 2 && agent_name != CLAUDE_AGENT_ACP_NAME) {
+    if is_goose {
         None
-    } else if agent_name == CLAUDE_AGENT_ACP_NAME {
-        prompt.map(SystemPromptTransport::ClaudeMeta)
+    } else if developer_instructions_append_supported || agent_name == CLAUDE_AGENT_ACP_NAME {
+        prompt.map(SystemPromptTransport::MetaAppend)
+    } else if protocol_version < 2 {
+        None
     } else {
         prompt.map(SystemPromptTransport::Field)
     }
@@ -354,6 +358,7 @@ impl OwnedAgent {
             self.protocol_version,
             &self.agent_name,
             self.goose_system_prompt_supported,
+            self.acp.developer_instructions_append_supported(),
         )
     }
 }
@@ -839,6 +844,10 @@ pub struct PromptContext {
     /// this Buzz workspace. This is a prompt source, never an authorization
     /// substitute for channel membership or an A2A checkout grant.
     pub workspace_project_channel: Option<Uuid>,
+    /// Exact owner-selected NIP-MP Project coordinate and canonical repository.
+    /// These are re-bound to every strict relay lookup before ACP delivery.
+    pub workspace_project_address: Option<String>,
+    pub workspace_project_repository: Option<String>,
     /// Exact reviewed commit containing the immutable workspace preload.
     pub workspace_project_revision: Option<String>,
     pub heartbeat_prompt: Option<String>,
@@ -915,23 +924,50 @@ async fn resolve_workspace_prompt_project(
                     workspace_home
                 )));
             }
-            return workspace?.map(Some).ok_or_else(|| {
+            let workspace = workspace?.ok_or_else(|| {
                 ProjectLookupError(format!(
                     "configured workspace home {workspace_home} has no authoritative Project"
                 ))
-            });
+            })?;
+            validate_selected_workspace_identity(ctx, &workspace)?;
+            return Ok(Some(workspace));
         }
     }
 
-    ctx.channel_info
+    let workspace = ctx
+        .channel_info
         .lookup_project_strict(workspace_home)
         .await?
-        .map(Some)
         .ok_or_else(|| {
             ProjectLookupError(format!(
                 "configured workspace home {workspace_home} has no authoritative Project"
             ))
-        })
+        })?;
+    validate_selected_workspace_identity(ctx, &workspace)?;
+    Ok(Some(workspace))
+}
+
+fn validate_selected_workspace_identity(
+    ctx: &PromptContext,
+    project: &PromptProjectInfo,
+) -> Result<(), ProjectLookupError> {
+    let address = ctx.workspace_project_address.as_deref().ok_or_else(|| {
+        ProjectLookupError("configured workspace has no expected Project address".into())
+    })?;
+    let repository = ctx.workspace_project_repository.as_deref().ok_or_else(|| {
+        ProjectLookupError("configured workspace has no expected repository".into())
+    })?;
+    let repository_matches = project.default_repo_clone_urls.iter().any(|candidate| {
+        crate::project_preload::canonical_github_repository(candidate).as_deref()
+            == Some(repository)
+    });
+    if project.coordinate != address || !repository_matches {
+        return Err(ProjectLookupError(format!(
+            "configured workspace identity changed (expected {address} at {repository}, found {})",
+            project.coordinate
+        )));
+    }
+    Ok(())
 }
 
 impl AgentPool {
@@ -1405,6 +1441,15 @@ async fn create_session_and_apply_model_at(
     agent_core: Option<&str>,
     channel: NewSessionChannelContext<'_>,
 ) -> Result<String, AcpError> {
+    if ctx.workspace_project_channel.is_some()
+        && agent.acp.is_codex_adapter()
+        && !agent.acp.developer_instructions_append_supported()
+    {
+        return Err(AcpError::Protocol(format!(
+            "adapter '{}' does not advertise the required Workspace Project developerInstructions capability",
+            agent.agent_name
+        )));
+    }
     // Build base_prompt + system_prompt + agent core + canvas metadata into a
     // single prompt. Standard protocol-v2 agents receive it in `session/new`;
     // Goose receives it through the custom request below. Legacy agents receive
@@ -1478,6 +1523,7 @@ async fn create_session_and_apply_model_at(
                 is_goose,
                 agent.protocol_version,
                 &agent.agent_name,
+                agent.acp.developer_instructions_append_supported(),
                 combined_system_prompt.as_deref(),
             ),
             session_title.as_deref(),
@@ -5788,33 +5834,37 @@ mod tests {
 
     #[test]
     fn goose_uses_system_prompt_only_after_custom_method_succeeds() {
-        assert!(!has_system_prompt_support(2, "goose", None));
-        assert!(!has_system_prompt_support(2, "goose", Some(false)));
-        assert!(has_system_prompt_support(2, "goose", Some(true)));
-        assert!(has_system_prompt_support(1, "goose", Some(true)));
-        assert!(has_system_prompt_support(2, "buzz-agent", None));
+        assert!(!has_system_prompt_support(2, "goose", None, false));
+        assert!(!has_system_prompt_support(2, "goose", Some(false), false));
+        assert!(has_system_prompt_support(2, "goose", Some(true), false));
+        assert!(has_system_prompt_support(1, "goose", Some(true), false));
+        assert!(has_system_prompt_support(2, "buzz-agent", None, false));
         // Goose never receives system prompt via session/new (uses post-hoc method).
         assert_eq!(
-            session_new_system_prompt(true, 2, "goose", Some("instructions")),
+            session_new_system_prompt(true, 2, "goose", false, Some("instructions")),
             None
         );
         // Protocol-v2 non-goose gets Field transport.
         assert_eq!(
-            session_new_system_prompt(false, 2, "buzz-agent", Some("instructions")),
+            session_new_system_prompt(false, 2, "buzz-agent", false, Some("instructions")),
             Some(SystemPromptTransport::Field("instructions"))
         );
         // Protocol-v1 non-goose, non-claude gets None (legacy user-message framing).
         assert_eq!(
-            session_new_system_prompt(false, 1, "codex", Some("instructions")),
+            session_new_system_prompt(false, 1, "codex", false, Some("instructions")),
             None
         );
-        // claude-agent-acp gets ClaudeMeta transport regardless of protocol version.
         assert_eq!(
-            session_new_system_prompt(false, 1, CLAUDE_AGENT_ACP_NAME, Some("instructions")),
-            Some(SystemPromptTransport::ClaudeMeta("instructions"))
+            session_new_system_prompt(false, 1, "codex", true, Some("instructions")),
+            Some(SystemPromptTransport::MetaAppend("instructions"))
+        );
+        // claude-agent-acp gets MetaAppend transport regardless of protocol version.
+        assert_eq!(
+            session_new_system_prompt(false, 1, CLAUDE_AGENT_ACP_NAME, false, Some("instructions")),
+            Some(SystemPromptTransport::MetaAppend("instructions"))
         );
         assert_eq!(
-            session_new_system_prompt(true, 1, CLAUDE_AGENT_ACP_NAME, Some("instructions")),
+            session_new_system_prompt(true, 1, CLAUDE_AGENT_ACP_NAME, false, Some("instructions")),
             None,
             "goose path must never produce a transport even when agent_name matches"
         );
@@ -5824,8 +5874,18 @@ mod tests {
     fn claude_agent_acp_has_system_prompt_support_regardless_of_protocol_version() {
         // claude-agent-acp declares protocolVersion:1 but supports _meta.systemPrompt;
         // has_system_prompt_support must return true so user-message framing is suppressed.
-        assert!(has_system_prompt_support(1, CLAUDE_AGENT_ACP_NAME, None));
-        assert!(has_system_prompt_support(2, CLAUDE_AGENT_ACP_NAME, None));
+        assert!(has_system_prompt_support(
+            1,
+            CLAUDE_AGENT_ACP_NAME,
+            None,
+            false
+        ));
+        assert!(has_system_prompt_support(
+            2,
+            CLAUDE_AGENT_ACP_NAME,
+            None,
+            false
+        ));
     }
 
     #[test]
@@ -5833,8 +5893,8 @@ mod tests {
         // The renamed @zed-industries package predates the _meta.systemPrompt support,
         // so it must not be treated as capable and stays on legacy user-message framing.
         let old_name = "@zed-industries/claude-code-acp";
-        assert!(!has_system_prompt_support(1, old_name, None));
-        assert!(has_system_prompt_support(2, old_name, None));
+        assert!(!has_system_prompt_support(1, old_name, None, false));
+        assert!(has_system_prompt_support(2, old_name, None, false));
     }
 
     #[test]
@@ -9176,6 +9236,8 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             session_title: None,
             team_instructions: None,
             workspace_project_channel: None,
+            workspace_project_address: None,
+            workspace_project_repository: None,
             workspace_project_revision: None,
             heartbeat_prompt: None,
             base_prompt: None,
@@ -10587,12 +10649,13 @@ done"#;
     }
 
     #[tokio::test]
-    async fn fresh_legacy_heartbeat_delivers_complete_pinned_workspace_skill_once() {
+    async fn fresh_codex_heartbeat_delivers_complete_pinned_workspace_skill_once() {
         let (harness, project, revision) = heartbeat_workspace_fixture();
         let workspace_home = Uuid::new_v4();
         let (relay_base_url, relay_server) =
             workspace_project_relay(workspace_home, &project).await;
-        let (acp, capture) = scripted_turn_agent().await;
+        let (mut acp, capture) = scripted_turn_agent().await;
+        acp.set_developer_instructions_append_supported_for_test();
         let mut agent = owned(acp);
         agent.agent_name = "@agentclientprotocol/codex-acp".into();
         agent.protocol_version = 1;
@@ -10603,6 +10666,11 @@ done"#;
         ctx.system_prompt = Some("agent persona".into());
         ctx.team_instructions = Some("team policy".into());
         ctx.workspace_project_channel = Some(workspace_home);
+        ctx.workspace_project_address = Some(project.coordinate.clone());
+        ctx.workspace_project_repository = project
+            .default_repo_clone_urls
+            .first()
+            .and_then(|repository| crate::project_preload::canonical_github_repository(repository));
         ctx.workspace_project_revision = Some(revision);
         ctx.channel_info = ChannelInfoResolver::new(
             HashMap::new(),
@@ -10654,15 +10722,17 @@ done"#;
             .filter(|request| request["method"] == "session/prompt")
             .map(|request| request["params"]["prompt"][0]["text"].as_str().unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(prompts.len(), 2);
-        assert!(prompts[0].contains("<base>\nbase policy\n</base>"));
-        assert!(prompts[0].contains("<system>\nagent persona\n</system>"));
-        assert!(prompts[0].contains("# Project Instructions"));
-        assert!(prompts[0].contains("NEMO-A2A-1"));
-        assert!(prompts[0].contains("buzz_a2a_handoff"));
-        assert!(prompts[0].contains("END-NEMO-SKILL"));
-        assert!(prompts[0].ends_with("heartbeat-1"));
-        assert_eq!(prompts[1], "heartbeat-2");
+        assert_eq!(prompts, vec!["heartbeat-1", "heartbeat-2"]);
+        let startup = requests
+            .iter()
+            .find(|request| request["method"] == "session/new")
+            .and_then(|request| request["params"]["_meta"]["systemPrompt"]["append"].as_str())
+            .expect("Codex developer instruction append");
+        assert!(startup.contains("<base>\nbase policy\n</base>"));
+        assert!(startup.contains("<system>\nagent persona\n</system>"));
+        assert!(startup.contains("NEMO-A2A-1"));
+        assert!(startup.contains("buzz_a2a_handoff"));
+        assert!(startup.contains("END-NEMO-SKILL"));
         relay_server.abort();
     }
 
@@ -10765,6 +10835,11 @@ not acceptance. Never put credentials or host-local paths in a prompt."#;
             workspace_project_relay(workspace_home, &project).await;
         let mut prompt_context = tests::make_prompt_context_no_owner();
         prompt_context.workspace_project_channel = Some(workspace_home);
+        prompt_context.workspace_project_address = Some(project.coordinate.clone());
+        prompt_context.workspace_project_repository = project
+            .default_repo_clone_urls
+            .first()
+            .and_then(|repository| crate::project_preload::canonical_github_repository(repository));
         prompt_context.channel_info = ChannelInfoResolver::new(
             HashMap::new(),
             RestClient {
@@ -10879,13 +10954,18 @@ not acceptance. Never put credentials or host-local paths in a prompt."#;
         let checkout = preload.working_directory.to_string_lossy().into_owned();
 
         for (agent_name, protocol_version, transport) in [
-            ("@agentclientprotocol/codex-acp", 2, "field"),
-            (CLAUDE_AGENT_ACP_NAME, 1, "claude-meta"),
+            ("@agentclientprotocol/codex-acp", 1, "meta-append"),
+            (CLAUDE_AGENT_ACP_NAME, 1, "meta-append"),
         ] {
             let (acp, capture) = scripted_agent(Some(true)).await;
             let mut agent = owned(acp);
             agent.agent_name = agent_name.into();
             agent.protocol_version = protocol_version;
+            if agent_name == "@agentclientprotocol/codex-acp" {
+                agent
+                    .acp
+                    .set_developer_instructions_append_supported_for_test();
+            }
             create_session_and_apply_model_at(
                 &mut agent,
                 &prompt_context,
@@ -10908,12 +10988,9 @@ not acceptance. Never put credentials or host-local paths in a prompt."#;
                     .expect("session/new JSON");
             assert_eq!(wire["params"]["cwd"], checkout);
             let startup_prompt = match transport {
-                "field" => wire["params"]["systemPrompt"]
+                "meta-append" => wire["params"]["_meta"]["systemPrompt"]["append"]
                     .as_str()
-                    .expect("Codex systemPrompt"),
-                "claude-meta" => wire["params"]["_meta"]["systemPrompt"]["append"]
-                    .as_str()
-                    .expect("Claude systemPrompt append"),
+                    .expect("systemPrompt append"),
                 _ => unreachable!(),
             };
             assert!(startup_prompt.contains(nemo_skill.trim()));

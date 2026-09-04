@@ -634,6 +634,44 @@ pub(super) fn managed_npm_command(command: &str) -> Result<Option<String>, Box<I
     Ok(Some(rewrite_npm_global_install(command, &prefix_arg)))
 }
 
+/// Build the app-private install command for Buzz's compile-time bundled,
+/// checksum-pinned Codex adapter. The public package name in the catalog is a
+/// UI/planning identity only; npm receives this local tarball path.
+pub(super) fn managed_codex_acp_install_command() -> Result<Option<String>, Box<InstallStepResult>>
+{
+    let tarball = crate::managed_agents::materialize_bundled_codex_acp().map_err(|error| {
+        Box::new(InstallStepResult {
+            step: "adapter".to_string(),
+            command: "bundled @agentclientprotocol/codex-acp@1.9.0".to_string(),
+            success: false,
+            stdout: String::new(),
+            stderr: error,
+            exit_code: None,
+            hint: Some(managed_npm_prefix_hint()),
+        })
+    })?;
+    let prefix = crate::managed_agents::buzz_managed_npm_prefix().ok_or_else(|| {
+        Box::new(InstallStepResult {
+            step: "adapter".to_string(),
+            command: "bundled @agentclientprotocol/codex-acp@1.9.0".to_string(),
+            success: false,
+            stdout: String::new(),
+            stderr: "failed to resolve Buzz app-data directory for private npm prefix".to_string(),
+            exit_code: None,
+            hint: Some(managed_npm_prefix_hint()),
+        })
+    })?;
+    Ok(Some(bundled_codex_acp_npm_command(&prefix, &tarball)))
+}
+
+fn bundled_codex_acp_npm_command(prefix: &std::path::Path, tarball: &std::path::Path) -> String {
+    format!(
+        "npm install --global --ignore-scripts --prefix {} {}",
+        shell_quote(prefix),
+        shell_quote(tarball)
+    )
+}
+
 fn rewrite_npm_global_install(command: &str, quoted_prefix: &str) -> String {
     let trimmed = command.trim_start();
     if let Some(rest) = trimmed.strip_prefix("npm install -g ") {

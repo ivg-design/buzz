@@ -11,7 +11,7 @@ export type WorkspaceProject = {
 export type WorkspaceProjectState = {
   relayUrl: string;
   project: WorkspaceProject | null;
-  codexInstructionStatus: "blocked" | "supported";
+  codexInstructionStatus: "verified" | "unavailable";
   codexInstructionError: string | null;
 };
 

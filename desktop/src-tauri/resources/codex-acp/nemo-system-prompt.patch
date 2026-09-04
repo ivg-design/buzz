@@ -1,0 +1,128 @@
+diff --git a/src/CodexAcpClient.ts b/src/CodexAcpClient.ts
+index f9995a9..6ad1539 100644
+--- a/src/CodexAcpClient.ts
++++ b/src/CodexAcpClient.ts
+@@ -79,6 +79,23 @@ export type {SessionMetadata, SessionMetadataWithThread} from "./SessionMetadata
+  */
+ export const CUSTOM_GATEWAY_PROVIDER_ID = "custom-gateway";
+ export const OPENAI_PROVIDER_ID = "openai";
++
++/**
++ * Read the ACP v1 extension used by clients that need to append trusted
++ * session instructions while preserving Codex's built-in base prompt.
++ */
++function readDeveloperInstructions(meta: acp.NewSessionRequest["_meta"]): string | undefined {
++    const systemPrompt = meta?.["systemPrompt"];
++    if (systemPrompt === undefined) return undefined;
++    if (typeof systemPrompt !== "object" || systemPrompt === null || Array.isArray(systemPrompt)) {
++        throw RequestError.invalidParams(undefined, "_meta.systemPrompt must be an object");
++    }
++    const append = (systemPrompt as Record<string, unknown>)["append"];
++    if (typeof append !== "string" || append.trim().length === 0) {
++        throw RequestError.invalidParams(undefined, "_meta.systemPrompt.append must be a non-empty string");
++    }
++    return append;
++}
+ const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
+
+ /**
+@@ -604,12 +621,14 @@ export class CodexAcpClient {
+
+     async newSession(request: acp.NewSessionRequest): Promise<SessionMetadata> {
+         const additionalDirectories = readAdditionalDirectories(request.cwd, request.additionalDirectories, request._meta);
++        const developerInstructions = readDeveloperInstructions(request._meta);
+         await this.refreshSkills(request.cwd, additionalDirectories);
+
+         const response = await this.codexClient.threadStart({
+             config: await this.createSessionConfig(request.cwd, additionalDirectories, request.mcpServers),
+             modelProvider: this.getModelProvider(),
+             cwd: request.cwd,
++            ...(developerInstructions !== undefined ? {developerInstructions} : {}),
+         });
+
+         const codexModels = await this.fetchAvailableModels();
+diff --git a/src/CodexAcpServer.ts b/src/CodexAcpServer.ts
+index 4dc15e0..600ac23 100644
+--- a/src/CodexAcpServer.ts
++++ b/src/CodexAcpServer.ts
+@@ -381,6 +381,12 @@ export class CodexAcpServer {
+             },
+             authMethods: getCodexAuthMethods(_params.clientCapabilities),
+             _meta: {
++                systemPrompt: {
++                    version: 1,
++                    modes: ["append"],
++                    target: "developerInstructions",
++                    methods: ["session/new"],
++                },
+                 steering: {
+                     supported: true,
+                 },
+diff --git a/src/__tests__/CodexACPAgent/CodexAcpClient.test.ts b/src/__tests__/CodexACPAgent/CodexAcpClient.test.ts
+index bb5daf6..6f2beb8 100644
+--- a/src/__tests__/CodexACPAgent/CodexAcpClient.test.ts
++++ b/src/__tests__/CodexACPAgent/CodexAcpClient.test.ts
+@@ -475,6 +475,46 @@ describe('ACP server test', { timeout: 40_000 }, () => {
+         expect(listSkillsSpy.mock.invocationCallOrder[0]!).toBeLessThan(threadStartSpy.mock.invocationCallOrder[0]!);
+     });
+
++    it('forwards ACP v1 appended system prompt as Codex developer instructions', async () => {
++        const mockFixture = createCodexMockTestFixture();
++        const codexAcpClient = mockFixture.getCodexAcpClient();
++        const codexAppServerClient = mockFixture.getCodexAppServerClient();
++        vi.spyOn(codexAppServerClient, "listSkills").mockResolvedValue({data: []});
++        const threadStartSpy = vi.spyOn(codexAppServerClient, "threadStart").mockResolvedValue({
++            thread: {id: "thread-id"} as any,
++            model: "gpt-5",
++            reasoningEffort: "medium",
++            serviceTier: null,
++        } as any);
++        vi.spyOn(codexAppServerClient, "listModels").mockResolvedValue({
++            data: [createTestModel({id: "gpt-5"})],
++            nextCursor: null,
++        });
++
++        await codexAcpClient.newSession({
++            cwd: "/workspace",
++            mcpServers: [],
++            _meta: {systemPrompt: {append: "NEMO-A2A-1 trusted workspace policy"}},
++        });
++
++        expect(threadStartSpy).toHaveBeenCalledWith(expect.objectContaining({
++            developerInstructions: "NEMO-A2A-1 trusted workspace policy",
++        }));
++    });
++
++    it('rejects malformed ACP v1 system prompt metadata before thread start', async () => {
++        const mockFixture = createCodexMockTestFixture();
++        const codexAcpClient = mockFixture.getCodexAcpClient();
++        const threadStartSpy = vi.spyOn(mockFixture.getCodexAppServerClient(), "threadStart");
++
++        await expect(codexAcpClient.newSession({
++            cwd: "/workspace",
++            mcpServers: [],
++            _meta: {systemPrompt: {append: "   "}},
++        })).rejects.toThrow("_meta.systemPrompt.append must be a non-empty string");
++        expect(threadStartSpy).not.toHaveBeenCalled();
++    });
++
+     it('prefers ACP additional directories over legacy meta roots for new session skill discovery', async () => {
+         const mockFixture = createCodexMockTestFixture();
+         const codexAcpClient = mockFixture.getCodexAcpClient();
+diff --git a/src/__tests__/CodexACPAgent/initialize.test.ts b/src/__tests__/CodexACPAgent/initialize.test.ts
+index 7fff772..07b86d5 100644
+--- a/src/__tests__/CodexACPAgent/initialize.test.ts
++++ b/src/__tests__/CodexACPAgent/initialize.test.ts
+@@ -67,6 +67,12 @@ describe('CodexACPAgent - initialize', () => {
+             },
+             authMethods: getCodexAuthMethods(),
+             _meta: {
++                systemPrompt: {
++                    version: 1,
++                    modes: ["append"],
++                    target: "developerInstructions",
++                    methods: ["session/new"],
++                },
+                 steering: {
+                     supported: true,
+                 },

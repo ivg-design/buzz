@@ -44,8 +44,20 @@ pub struct WorkspaceProjectSaveResult {
     codex_instruction_error: Option<&'static str>,
 }
 
-const CODEX_INSTRUCTION_STATUS: &str = "blocked";
-const CODEX_INSTRUCTION_ERROR: &str = "The managed Codex ACP adapter does not yet provide verified developerInstructions delivery. Codex sessions fail closed while Workspace Project policy is active.";
+const CODEX_INSTRUCTION_UNAVAILABLE: &str =
+    "Install Buzz's reviewed Codex adapter before starting managed Codex agents.";
+
+fn codex_instruction_delivery_state(verified: bool) -> (&'static str, Option<&'static str>) {
+    if verified {
+        ("verified", None)
+    } else {
+        ("unavailable", Some(CODEX_INSTRUCTION_UNAVAILABLE))
+    }
+}
+
+fn current_codex_instruction_delivery_state() -> (&'static str, Option<&'static str>) {
+    codex_instruction_delivery_state(crate::managed_agents::resolve_command("codex-acp").is_some())
+}
 
 #[tauri::command]
 pub async fn get_workspace_project(
@@ -61,11 +73,13 @@ pub async fn get_workspace_project(
     })
     .await
     .map_err(|error| format!("Workspace Project read failed: {error}"))??;
+    let (codex_instruction_status, codex_instruction_error) =
+        current_codex_instruction_delivery_state();
     Ok(WorkspaceProjectState {
         relay_url: canonical_relay,
         project,
-        codex_instruction_status: CODEX_INSTRUCTION_STATUS,
-        codex_instruction_error: Some(CODEX_INSTRUCTION_ERROR),
+        codex_instruction_status,
+        codex_instruction_error,
     })
 }
 
@@ -99,14 +113,16 @@ pub async fn set_workspace_project(
     } else {
         (0, 0)
     };
+    let (codex_instruction_status, codex_instruction_error) =
+        current_codex_instruction_delivery_state();
     Ok(WorkspaceProjectSaveResult {
         relay_url: canonical_relay,
         project,
         changed,
         restarted_count,
         failed_restart_count,
-        codex_instruction_status: CODEX_INSTRUCTION_STATUS,
-        codex_instruction_error: Some(CODEX_INSTRUCTION_ERROR),
+        codex_instruction_status,
+        codex_instruction_error,
     })
 }
 
@@ -176,8 +192,11 @@ mod tests {
     }
 
     #[test]
-    fn codex_policy_reports_blocked_until_verified_instruction_delivery_exists() {
-        assert_eq!(CODEX_INSTRUCTION_STATUS, "blocked");
-        assert!(CODEX_INSTRUCTION_ERROR.contains("developerInstructions"));
+    fn codex_policy_status_requires_verified_delivery() {
+        assert_eq!(codex_instruction_delivery_state(true), ("verified", None));
+        assert_eq!(
+            codex_instruction_delivery_state(false),
+            ("unavailable", Some(CODEX_INSTRUCTION_UNAVAILABLE))
+        );
     }
 }

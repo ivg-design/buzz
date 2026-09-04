@@ -66,8 +66,10 @@ pub(crate) const RESERVED_ENV_KEYS: &[&str] = &[
     // for whether channel threads receive independent ACP sessions.
     "BUZZ_ACP_SESSION_POLICY",
     // Workspace Project coordinates are owner-selected, per-relay launch
-    // authority. User env must not substitute a different channel or commit.
+    // authority. User env must not substitute a different identity or commit.
     "BUZZ_ACP_WORKSPACE_PROJECT_CHANNEL",
+    "BUZZ_ACP_WORKSPACE_PROJECT_ADDRESS",
+    "BUZZ_ACP_WORKSPACE_PROJECT_REPOSITORY",
     "BUZZ_ACP_WORKSPACE_PROJECT_REVISION",
     "BUZZ_ACP_NO_PRESENCE",
     // Readiness handoff: desktop is the ONLY readiness source. A saved or

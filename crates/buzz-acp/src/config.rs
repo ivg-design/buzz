@@ -517,6 +517,14 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_WORKSPACE_PROJECT_CHANNEL")]
     pub workspace_project_channel: Option<Uuid>,
 
+    /// Exact canonical NIP-MP address selected by the owner.
+    #[arg(long, env = "BUZZ_ACP_WORKSPACE_PROJECT_ADDRESS", hide = true)]
+    pub workspace_project_address: Option<String>,
+
+    /// Canonical repository selected with the Workspace Project.
+    #[arg(long, env = "BUZZ_ACP_WORKSPACE_PROJECT_REPOSITORY", hide = true)]
+    pub workspace_project_repository: Option<String>,
+
     /// Exact reviewed Git commit containing the workspace Project's preload
     /// manifest and skills. Required with --workspace-project-channel.
     #[arg(long, env = "BUZZ_ACP_WORKSPACE_PROJECT_REVISION")]
@@ -584,6 +592,8 @@ pub struct Config {
     /// in every session. This carries policy only; it grants no Project, Git,
     /// channel, or A2A authority.
     pub workspace_project_channel: Option<Uuid>,
+    pub workspace_project_address: Option<String>,
+    pub workspace_project_repository: Option<String>,
     /// Exact reviewed Git commit used to load immutable workspace instructions.
     pub workspace_project_revision: Option<String>,
     pub initial_message: Option<String>,
@@ -1213,6 +1223,29 @@ impl Config {
                 ));
             }
         };
+        match (
+            args.workspace_project_channel,
+            args.workspace_project_address.as_deref(),
+            args.workspace_project_repository.as_deref(),
+        ) {
+            (None, None, None) => {}
+            (Some(_), Some(address), Some(repository))
+                if valid_workspace_project_address(address)
+                    && crate::project_preload::canonical_github_repository(repository)
+                        .as_deref()
+                        == Some(repository) => {}
+            (Some(_), Some(_), Some(_)) => {
+                return Err(ConfigError::ConfigFile(
+                    "workspace Project address or repository is not canonical".into(),
+                ));
+            }
+            _ => {
+                return Err(ConfigError::ConfigFile(
+                    "workspace Project channel, address, repository, and revision must be set together"
+                        .into(),
+                ));
+            }
+        }
 
         let config = Config {
             keys,
@@ -1234,6 +1267,8 @@ impl Config {
                 .filter(|value| !value.is_empty())
                 .map(str::to_string),
             workspace_project_channel: args.workspace_project_channel,
+            workspace_project_address: args.workspace_project_address,
+            workspace_project_repository: args.workspace_project_repository,
             workspace_project_revision,
             initial_message: args.initial_message,
             subscribe_mode: args.subscribe,
@@ -1334,6 +1369,20 @@ fn valid_workspace_revision(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_workspace_project_address(value: &str) -> bool {
+    let mut parts = value.splitn(3, ':');
+    matches!(parts.next(), Some("30621"))
+        && parts.next().is_some_and(|owner| {
+            owner.len() == 64
+                && owner
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        })
+        && parts.next().is_some_and(|dtag| {
+            !dtag.is_empty() && dtag.len() <= 128 && !dtag.chars().any(char::is_control)
+        })
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1643,6 +1692,8 @@ mod tests {
             system_prompt: None,
             team_instructions: None,
             workspace_project_channel: None,
+            workspace_project_address: None,
+            workspace_project_repository: None,
             workspace_project_revision: None,
             initial_message: None,
             subscribe_mode: mode,
@@ -1742,6 +1793,8 @@ mod tests {
     fn workspace_project_requires_channel_and_reviewed_revision_together() {
         let channel = Uuid::new_v4().to_string();
         let revision = "a".repeat(40);
+        let address = format!("30621:{}:nemo", "b".repeat(64));
+        let repository = "https://github.com/mysteropodes/nemo";
 
         let only_channel = CliArgs::try_parse_from([
             "buzz-acp",
@@ -1775,6 +1828,10 @@ mod tests {
             TEST_PRIVATE_KEY,
             "--workspace-project-channel",
             &channel,
+            "--workspace-project-address",
+            &address,
+            "--workspace-project-repository",
+            repository,
             "--workspace-project-revision",
             &revision,
         ])

@@ -71,17 +71,20 @@ Each declared skill resolves only to a bounded, regular, non-symlink
 `.agents/skills/<name>/SKILL.md` file inside that checkout. Only that embedded, commit-pinned
 content is authoritative system policy; linked files in the mutable checkout are supplementary
 and cannot extend or override it. Buzz starts the Project session in
-the verified checkout and adds the complete skill to the standing instructions through Codex's
-`systemPrompt`, Claude's `_meta.systemPrompt.append`, or the legacy first-message fallback. A
+the verified checkout and adds the complete skill to the standing instructions through an
+adapter-supported system-prompt transport. A
 wrong origin is ignored; an invalid present manifest fails closed. Restart a managed agent to
 replace existing sessions after changing the manifest. There is no per-agent preload setting.
 
-For a workspace dedicated to one Project, set `BUZZ_ACP_WORKSPACE_PROJECT_CHANNEL` to that
-Project's home-channel UUID and `BUZZ_ACP_WORKSPACE_PROJECT_REVISION` to the exact lowercase
-40- or 64-character reviewed Git commit containing the manifest and skills. Both values are
-required together. Buzz loads the instruction bytes from that immutable commit and injects
+For a workspace dedicated to one Project, set `BUZZ_ACP_WORKSPACE_PROJECT_CHANNEL`,
+`BUZZ_ACP_WORKSPACE_PROJECT_ADDRESS`, `BUZZ_ACP_WORKSPACE_PROJECT_REPOSITORY`, and
+`BUZZ_ACP_WORKSPACE_PROJECT_REVISION`. All four values are required together. Buzz revalidates
+the exact relay Project/repository identity, loads the instruction bytes from the immutable
+commit, and injects
 them into every new session in the workspace, including DMs, ordinary channels, and
-heartbeats. Dirty or later working-tree edits cannot change the system instructions. A channel
+heartbeats. Managed Codex requires the adapter's explicit ACP v1 append capability targeting
+`thread/start.developerInstructions`; an ordinary public adapter fails before `session/new`.
+Dirty or later working-tree edits cannot change the system instructions. A channel
 that is itself the home of a different Project fails closed. These settings supply system
 policy only; they do not add channel membership, authorize A2A work, or widen a repository
 checkout grant.

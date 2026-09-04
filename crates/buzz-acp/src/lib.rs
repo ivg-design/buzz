@@ -3122,6 +3122,8 @@ async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
         session_title: config.session_title.clone(),
         team_instructions: config.team_instructions.clone(),
         workspace_project_channel: config.workspace_project_channel,
+        workspace_project_address: config.workspace_project_address.clone(),
+        workspace_project_repository: config.workspace_project_repository.clone(),
         workspace_project_revision: config.workspace_project_revision.clone(),
         base_prompt: if config.no_base_prompt {
             None
@@ -3498,10 +3500,20 @@ async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
                 let args = config.agent_args.clone();
                 let env = config.persona_env_vars.clone();
                 let has_codex = config.has_generated_codex_config;
+                let require_workspace = config.workspace_project_channel.is_some();
                 let observer = observer.clone();
                 let guard = RespawnGuard::new(idx, respawn_tx.clone());
                 respawn_tasks.spawn(async move {
-                    let result = spawn_and_init(&cmd, &args, &env, has_codex, idx, observer).await;
+                    let result = spawn_and_init(
+                        &cmd,
+                        &args,
+                        &env,
+                        has_codex,
+                        require_workspace,
+                        idx,
+                        observer,
+                    )
+                    .await;
                     guard.send(result);
                 });
             }
@@ -5869,12 +5881,14 @@ fn recover_panicked_agent(
     let args = config.agent_args.clone();
     let env = config.persona_env_vars.clone();
     let has_codex = config.has_generated_codex_config;
+    let require_workspace = config.workspace_project_channel.is_some();
     let guard = RespawnGuard::new(i, respawn_tx.clone());
     respawn_tasks.spawn(async move {
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
-        let result = spawn_and_init(&cmd, &args, &env, has_codex, i, observer).await;
+        let result =
+            spawn_and_init(&cmd, &args, &env, has_codex, require_workspace, i, observer).await;
         guard.send(result);
     });
 }
@@ -6118,6 +6132,7 @@ fn spawn_respawn_task(
     let args = config.agent_args.clone();
     let env = config.persona_env_vars.clone();
     let has_codex = config.has_generated_codex_config;
+    let require_workspace = config.workspace_project_channel.is_some();
     let guard = RespawnGuard::new(index, respawn_tx.clone());
     respawn_tasks.spawn(async move {
         // Shutdown old agent (reap child, prevent zombie).
@@ -6129,7 +6144,16 @@ fn spawn_respawn_task(
             tokio::time::sleep(delay).await;
         }
 
-        let result = spawn_and_init(&cmd, &args, &env, has_codex, index, observer).await;
+        let result = spawn_and_init(
+            &cmd,
+            &args,
+            &env,
+            has_codex,
+            require_workspace,
+            index,
+            observer,
+        )
+        .await;
         guard.send(result);
     });
 
@@ -6173,6 +6197,7 @@ struct PoolStartup {
     args: Vec<String>,
     extra_env: Vec<(String, String)>,
     has_generated_codex_config: bool,
+    require_workspace_developer_instructions: bool,
     model: Option<String>,
     effort_level: Option<String>,
     observer: Option<observer::ObserverHandle>,
@@ -6186,6 +6211,7 @@ impl PoolStartup {
             args: config.agent_args.clone(),
             extra_env: config.persona_env_vars.clone(),
             has_generated_codex_config: config.has_generated_codex_config,
+            require_workspace_developer_instructions: config.workspace_project_channel.is_some(),
             model: config.model.clone(),
             effort_level: config.effort_level.clone(),
             observer,
@@ -6248,6 +6274,19 @@ async fn initialize_agent_pool(
                             }),
                         );
                         let agent_name = normalized_agent_name(&init_result);
+                        if startup.require_workspace_developer_instructions
+                            && acp.is_codex_adapter()
+                            && !acp.developer_instructions_append_supported()
+                        {
+                            tracing::error!(
+                                agent = i,
+                                name = %agent_name,
+                                "adapter lacks required Workspace Project developerInstructions capability"
+                            );
+                            acp.shutdown().await;
+                            agent_slots.push(None);
+                            continue;
+                        }
                         agent_slots.push(Some(OwnedAgent {
                             index: i,
                             acp,
@@ -6309,6 +6348,7 @@ async fn spawn_and_init(
     args: &[String],
     extra_env: &[(String, String)],
     has_generated_codex_config: bool,
+    require_workspace_developer_instructions: bool,
     agent_index: usize,
     observer: Option<observer::ObserverHandle>,
 ) -> Result<(AcpClient, u32, String)> {
@@ -6329,6 +6369,15 @@ async fn spawn_and_init(
                 }),
             );
             let agent_name = normalized_agent_name(&init_result);
+            if require_workspace_developer_instructions
+                && acp.is_codex_adapter()
+                && !acp.developer_instructions_append_supported()
+            {
+                acp.shutdown().await;
+                return Err(anyhow::anyhow!(
+                    "adapter '{agent_name}' does not advertise the required Workspace Project developerInstructions capability"
+                ));
+            }
             Ok((acp, protocol_version, agent_name))
         }
         Err(e) => {
@@ -6338,6 +6387,53 @@ async fn spawn_and_init(
             acp.shutdown().await;
             Err(anyhow::anyhow!("agent initialize failed: {e}"))
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod workspace_capability_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[tokio::test]
+    async fn configured_workspace_rejects_uncapable_adapter_before_session_new() {
+        let temp = tempfile::tempdir().unwrap();
+        let capture = temp.path().join("wire.jsonl");
+        let adapter = temp.path().join("codex-acp");
+        std::fs::write(
+            &adapter,
+            format!(
+                "#!/bin/sh\nwhile IFS= read -r line; do\n  printf '%s\\n' \"$line\" >> '{}'\n  case \"$line\" in\n    *initialize*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{{\"protocolVersion\":1,\"agentInfo\":{{\"name\":\"@agentclientprotocol/codex-acp\",\"version\":\"1.9.0\"}}}}}}' ;;\n    *session/new*) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"sessionId\":\"forbidden\"}}}}' ;;\n  esac\ndone\n",
+                capture.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&adapter).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&adapter, permissions).unwrap();
+
+        let startup = PoolStartup {
+            agents: 1,
+            command: adapter.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            extra_env: Vec::new(),
+            has_generated_codex_config: false,
+            require_workspace_developer_instructions: true,
+            model: None,
+            effort_level: None,
+            observer: None,
+        };
+        let error = match initialize_agent_pool(&startup, None).await {
+            Ok(_) => panic!("uncapable adapter must not produce a pool"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("all 1 agents failed"));
+        let wire = std::fs::read_to_string(capture).unwrap();
+        assert!(wire.contains("initialize"));
+        assert!(
+            !wire.contains("session/new"),
+            "wire must fail before session/new"
+        );
     }
 }
 
@@ -9762,6 +9858,8 @@ mod build_mcp_servers_tests {
             system_prompt: None,
             team_instructions: None,
             workspace_project_channel: None,
+            workspace_project_address: None,
+            workspace_project_repository: None,
             workspace_project_revision: None,
             initial_message: None,
             subscribe_mode: config::SubscribeMode::All,
@@ -10030,6 +10128,8 @@ mod error_outcome_emission_tests {
             system_prompt: None,
             team_instructions: None,
             workspace_project_channel: None,
+            workspace_project_address: None,
+            workspace_project_repository: None,
             workspace_project_revision: None,
             initial_message: None,
             subscribe_mode: config::SubscribeMode::All,

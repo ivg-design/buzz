@@ -11,7 +11,10 @@ import {
 import { pubkeyToNpub } from "../../../shared/lib/nostrUtils.ts";
 
 const AGENT_PUBKEY = "a".repeat(64);
-const USER_PUBKEY = "b".repeat(64);
+// Generator-point x-coordinate: a real x-only secp256k1 public key. The
+// production parser rejects arbitrary 32-byte fixtures before npub matching.
+const USER_PUBKEY =
+  "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
 
 const PROFILES = {
   [AGENT_PUBKEY]: {

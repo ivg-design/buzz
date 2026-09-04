@@ -4,14 +4,62 @@ use crate::managed_agents::{
     DEFAULT_ACP_COMMAND,
 };
 
+mod adapter_bootstrap;
 mod forced_single_flight;
 mod post_install_verification;
+pub(crate) use adapter_bootstrap::{
+    ensure_record_bundled_adapter_for_start, ensure_records_bundled_adapters_for_start,
+};
 
-fn active_installs() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+struct ActiveInstalls {
+    runtimes: std::sync::Mutex<std::collections::HashSet<String>>,
+    available: std::sync::Condvar,
+}
+
+fn active_installs() -> &'static ActiveInstalls {
     use std::collections::HashSet;
-    use std::sync::{Mutex, OnceLock};
-    static ACTIVE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-    ACTIVE.get_or_init(|| Mutex::new(HashSet::new()))
+    use std::sync::{Condvar, Mutex, OnceLock};
+    static ACTIVE: OnceLock<ActiveInstalls> = OnceLock::new();
+    ACTIVE.get_or_init(|| ActiveInstalls {
+        runtimes: Mutex::new(HashSet::new()),
+        available: Condvar::new(),
+    })
+}
+
+struct ActiveInstallGuard(String);
+
+impl Drop for ActiveInstallGuard {
+    fn drop(&mut self) {
+        let installs = active_installs();
+        if let Ok(mut runtimes) = installs.runtimes.lock() {
+            runtimes.remove(&self.0);
+            installs.available.notify_all();
+        }
+    }
+}
+
+/// Reserve one runtime's installer. Interactive install requests fail fast so
+/// the UI can report an already-running install; start-time bootstrap waits for
+/// that same install and then re-checks the verified adapter before doing work.
+fn acquire_install_guard(runtime_id: &str, wait: bool) -> Result<ActiveInstallGuard, String> {
+    let installs = active_installs();
+    let mut runtimes = installs
+        .runtimes
+        .lock()
+        .map_err(|_| "install lock poisoned".to_string())?;
+    while runtimes.contains(runtime_id) {
+        if !wait {
+            return Err(format!(
+                "an install is already in progress for {runtime_id}"
+            ));
+        }
+        runtimes = installs
+            .available
+            .wait(runtimes)
+            .map_err(|_| "install lock poisoned".to_string())?;
+    }
+    runtimes.insert(runtime_id.to_string());
+    Ok(ActiveInstallGuard(runtime_id.to_string()))
 }
 
 /// Returns the adapter install commands that `install_acp_runtime_blocking` would
@@ -266,27 +314,10 @@ fn install_acp_runtime_blocking(
     // Clear the resolve cache so newly-installed binaries are found.
     crate::managed_agents::clear_resolve_cache();
 
-    // Prevent concurrent installs for the same runtime.
-    {
-        let mut set = active_installs()
-            .lock()
-            .map_err(|_| "install lock poisoned".to_string())?;
-        if !set.insert(runtime_id.to_string()) {
-            return Err(format!(
-                "an install is already in progress for {runtime_id}"
-            ));
-        }
-    }
-
-    struct Guard(String);
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            if let Ok(mut set) = active_installs().lock() {
-                set.remove(&self.0);
-            }
-        }
-    }
-    let _guard = Guard(runtime_id.to_string());
+    // Prevent concurrent installs for the same runtime. The explicit Settings
+    // action retains its fail-fast behavior; start-time bootstrap waits through
+    // this same guard and rechecks the adapter after it is released.
+    let _guard = acquire_install_guard(runtime_id, false)?;
 
     let runtime = crate::managed_agents::known_acp_runtime_exact(runtime_id)
         .ok_or_else(|| format!("unknown runtime: {runtime_id}"))?;
@@ -312,37 +343,63 @@ fn install_acp_runtime_blocking(
         }
     }
 
-    // Phase 2: Install adapter if missing (or outdated) and commands are available.
-    // For the codex runtime, "found" is not enough — the resolved binary must also
-    // pass the 1.x version gate. An outdated 0.16.x adapter must be overwritten by
-    // the new npm install so the CODEX_CONFIG spawn contract works correctly.
+    // Phase 2: install only the adapter. This implementation is shared with
+    // start-time bootstrap, whose contract deliberately excludes provider CLI
+    // installation and authentication.
+    if !install_adapter_if_needed(runtime, &reporter, &mut steps) {
+        return Ok(reporter.failed(steps));
+    }
+
+    post_install_verification::run(runtime_id, &mut steps, &reporter);
+
+    Ok(InstallRuntimeResult {
+        success: steps.iter().all(|step| step.success),
+        steps,
+        restarted_count: 0,
+        failed_restart_count: 0,
+        log_path: reporter.log_path(),
+    })
+}
+
+/// Install a known runtime's ACP adapter without touching its provider CLI or
+/// authentication state. Failures are appended to `steps` and reported as
+/// `false`, preserving the explicit installer and automatic-start behavior at
+/// one implementation seam.
+fn install_adapter_if_needed(
+    runtime: &'static crate::managed_agents::KnownAcpRuntime,
+    reporter: &InstallReporter,
+    steps: &mut Vec<crate::managed_agents::InstallStepResult>,
+) -> bool {
     let adapter_path = resolve_adapter_path(runtime.commands, runtime.adapter_install_commands);
     let adapter_probe_path = crate::managed_agents::readiness::cli_probe::augmented_path();
-    if let Some(cmds) = plan_adapter_install(
-        runtime_id,
+    let plan = plan_adapter_install(
+        runtime.id,
         adapter_path.as_deref(),
         runtime.adapter_install_commands,
         adapter_probe_path.as_deref(),
-    ) {
+    );
+    let bundled_runtime = matches!(runtime.id, "codex" | "claude");
+    if bundled_runtime && managed_node_runtime_supported() && !managed_node_runtime_ready() {
+        if let Err(step) = ensure_managed_node_runtime_blocking() {
+            reporter.record_step(steps, *step);
+            return false;
+        }
+    }
+
+    if let Some(cmds) = plan {
         let use_managed_npm =
             cmds.iter().any(|cmd| is_npm_global_install(cmd)) && managed_node_runtime_supported();
-        if use_managed_npm {
-            if let Err(step) = ensure_managed_node_runtime_blocking() {
-                reporter.record_step(&mut steps, *step);
-                return Ok(reporter.failed(steps));
-            }
-        }
 
         for cmd in cmds {
             let planned = match if use_managed_npm
-                && runtime_id == "codex"
+                && runtime.id == "codex"
                 && cmd
                     .trim_start()
                     .starts_with("npm install -g @agentclientprotocol/codex-acp")
             {
                 managed_codex_acp_install_command()
             } else if use_managed_npm
-                && runtime_id == "claude"
+                && runtime.id == "claude"
                 && cmd
                     .trim_start()
                     .starts_with("npm install -g @agentclientprotocol/claude-agent-acp")
@@ -356,8 +413,8 @@ fn install_acp_runtime_blocking(
                 Ok(Some(command)) => command,
                 Ok(None) => cmd.to_string(),
                 Err(step) => {
-                    reporter.record_step(&mut steps, *step);
-                    return Ok(reporter.failed(steps));
+                    reporter.record_step(steps, *step);
+                    return false;
                 }
             };
 
@@ -368,20 +425,11 @@ fn install_acp_runtime_blocking(
             let success = result.success;
             steps.push(result);
             if !success {
-                return Ok(reporter.failed(steps));
+                return false;
             }
         }
     }
-
-    post_install_verification::run(runtime_id, &mut steps, &reporter);
-
-    Ok(InstallRuntimeResult {
-        success: steps.iter().all(|step| step.success),
-        steps,
-        restarted_count: 0,
-        failed_restart_count: 0,
-        log_path: reporter.log_path(),
-    })
+    true
 }
 
 // ── Post-install auto-restart (Phase 2 of install_acp_runtime) ───────────────
@@ -1014,8 +1062,8 @@ use install_report::InstallReporter;
 mod managed_node;
 use managed_node::{
     ensure_managed_node_runtime_blocking, managed_claude_acp_install_command,
-    managed_codex_acp_install_command, managed_node_runtime_supported, managed_npm_command,
-    npm_eacces_hint, resolve_adapter_path,
+    managed_codex_acp_install_command, managed_node_runtime_ready, managed_node_runtime_supported,
+    managed_npm_command, npm_eacces_hint, resolve_adapter_path,
 };
 
 #[tauri::command]

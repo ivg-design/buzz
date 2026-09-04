@@ -236,6 +236,26 @@ pub async fn restore_managed_agents_on_launch(
         return Ok(());
     }
 
+    // A packaged upgrade can introduce a new checksum-pinned adapter while
+    // existing auto-start records remain valid. Prepare each distinct bundled
+    // runtime before taking the transition lock or spawning any child, so a
+    // cold launch cannot report a setup listener as a working agent.
+    let adapter_failures =
+        crate::commands::ensure_records_bundled_adapters_for_start(app, &agents_to_start).await;
+    if !adapter_failures.is_empty() {
+        let failed_pubkeys = adapter_failures
+            .iter()
+            .map(|(pubkey, _)| pubkey.clone())
+            .collect::<std::collections::HashSet<_>>();
+        for (pubkey, error) in adapter_failures {
+            persist_restore_error(app, &state, &pubkey, error)?;
+        }
+        agents_to_start.retain(|record| !failed_pubkeys.contains(&record.pubkey));
+    }
+    if agents_to_start.is_empty() {
+        return Ok(());
+    }
+
     // Snapshot the workspace owner pubkey once for the legacy auth_tag fallback.
     // Read outside the per-agent spawn loop so all parallel spawns see the same
     // value and we don't lock `state.keys` repeatedly.
@@ -561,7 +581,6 @@ mod profile_reconcile_tests {
     }
 }
 
-#[cfg(feature = "mesh-llm")]
 fn persist_restore_error(
     app: &tauri::AppHandle,
     state: &AppState,

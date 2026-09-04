@@ -132,6 +132,7 @@ pub(super) async fn start_local_agent_pairs_with_preflight(
     if record_snapshot.backend != BackendKind::Local {
         return Err(format!("agent {pubkey} is not a local agent"));
     }
+    super::agent_discovery::ensure_record_bundled_adapter_for_start(app, &record_snapshot).await?;
     let personas_for_preflight = load_personas(app).unwrap_or_default();
     let global_for_preflight =
         crate::managed_agents::load_global_agent_config(app).unwrap_or_default();
@@ -231,6 +232,7 @@ pub(super) async fn start_local_agent_with_preflight(
     // default, which record-byte sniffing could never see.
     let personas = load_personas(app).unwrap_or_default();
     let global = crate::managed_agents::load_global_agent_config(app).unwrap_or_default();
+    super::agent_discovery::ensure_record_bundled_adapter_for_start(app, &record_snapshot).await?;
     let mesh_model_id =
         crate::managed_agents::effective_config::resolve_effective_relay_mesh_model_id(
             &record_snapshot,

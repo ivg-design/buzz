@@ -109,7 +109,7 @@ pub async fn set_workspace_project(
     .map_err(|error| format!("Workspace Project write failed: {error}"))??;
 
     let (restarted_count, failed_restart_count) = if changed {
-        restart_running_pairs(&app, &canonical_relay)?
+        restart_running_pairs(&app, &canonical_relay).await?
     } else {
         (0, 0)
     };
@@ -126,7 +126,7 @@ pub async fn set_workspace_project(
     })
 }
 
-fn restart_running_pairs(app: &AppHandle, relay_url: &str) -> Result<(u32, u32), String> {
+async fn restart_running_pairs(app: &AppHandle, relay_url: &str) -> Result<(u32, u32), String> {
     let state = app.state::<AppState>();
     let live_keys = {
         let mut runtimes = state
@@ -144,7 +144,7 @@ fn restart_running_pairs(app: &AppHandle, relay_url: &str) -> Result<(u32, u32),
     let mut restarted = 0u32;
     let mut failed = 0u32;
     for key in targets {
-        match restart_managed_agent_runtime(key.pubkey, key.relay_url, app.clone()) {
+        match restart_managed_agent_runtime(key.pubkey, key.relay_url, app.clone()).await {
             Ok(_) => restarted += 1,
             Err(error) => {
                 failed += 1;

@@ -233,12 +233,32 @@ pub(crate) fn start_managed_agent_runtime_pair_lazy(
 }
 
 #[tauri::command]
-pub fn start_managed_agent_runtime(
+pub async fn start_managed_agent_runtime(
     pubkey: String,
     relay_url: String,
     app: AppHandle,
 ) -> Result<ManagedAgentRuntimeStatus, String> {
-    start_managed_agent_runtime_pair_lazy(pubkey, relay_url, app)
+    ensure_runtime_record_adapter(&app, &pubkey).await?;
+    tokio::task::spawn_blocking(move || {
+        start_managed_agent_runtime_pair_lazy(pubkey, relay_url, app)
+    })
+    .await
+    .map_err(|error| format!("runtime start task panicked: {error}"))?
+}
+
+async fn ensure_runtime_record_adapter(app: &AppHandle, pubkey: &str) -> Result<(), String> {
+    let record = {
+        let state = app.state::<AppState>();
+        let _store = state
+            .managed_agents_store_lock
+            .lock()
+            .map_err(|error| error.to_string())?;
+        load_managed_agents(app)?
+            .into_iter()
+            .find(|record| record.pubkey.eq_ignore_ascii_case(pubkey))
+            .ok_or_else(|| format!("agent {pubkey} not found"))?
+    };
+    crate::commands::ensure_record_bundled_adapter_for_start(app, &record).await
 }
 
 fn start_pair(
@@ -383,13 +403,23 @@ pub fn stop_managed_agent_runtime(
 }
 
 #[tauri::command]
-pub fn restart_managed_agent_runtime(
+pub async fn restart_managed_agent_runtime(
     pubkey: String,
     relay_url: String,
     app: AppHandle,
 ) -> Result<ManagedAgentRuntimeStatus, String> {
-    stop_managed_agent_runtime(pubkey.clone(), relay_url.clone(), app.clone())?;
-    start_pair(pubkey, relay_url, true, None, app)
+    let stop_pubkey = pubkey.clone();
+    let stop_relay = relay_url.clone();
+    let stop_app = app.clone();
+    tokio::task::spawn_blocking(move || {
+        stop_managed_agent_runtime(stop_pubkey, stop_relay, stop_app)
+    })
+    .await
+    .map_err(|error| format!("runtime stop task panicked: {error}"))??;
+    ensure_runtime_record_adapter(&app, &pubkey).await?;
+    tokio::task::spawn_blocking(move || start_pair(pubkey, relay_url, true, None, app))
+        .await
+        .map_err(|error| format!("runtime start task panicked: {error}"))?
 }
 
 /// Probe whether this agent can operate on `requested_relay_url`.
@@ -470,16 +500,33 @@ pub async fn reconcile_managed_agent_runtimes(
     use futures_util::{stream, StreamExt};
 
     let records = load_managed_agents(&app)?;
+    let eligible_records = records
+        .iter()
+        .filter(|record| record.start_on_app_launch && record.backend == BackendKind::Local)
+        .cloned()
+        .collect::<Vec<_>>();
+    let adapter_failures =
+        crate::commands::ensure_records_bundled_adapters_for_start(&app, &eligible_records).await;
+    let adapter_failures = adapter_failures
+        .into_iter()
+        .collect::<std::collections::HashMap<_, _>>();
     let mut jobs = Vec::new();
+    let mut bootstrap_failed_jobs = Vec::new();
     for community in communities {
-        for record in records
-            .iter()
-            .filter(|record| record.start_on_app_launch && record.backend == BackendKind::Local)
+        for record in &eligible_records
         // The legacy per-record relay pin is deliberately ignored here — see
         // `effective_agent_relay_url`. Every local auto-start agent fans out
         // to every configured community.
         {
-            jobs.push((record.clone(), community.relay_url.clone()));
+            if let Some(error) = adapter_failures.get(&record.pubkey) {
+                bootstrap_failed_jobs.push((
+                    record.clone(),
+                    community.relay_url.clone(),
+                    error.clone(),
+                ));
+            } else {
+                jobs.push((record.clone(), community.relay_url.clone()));
+            }
         }
     }
     let probes: Vec<_> = stream::iter(jobs)
@@ -505,6 +552,28 @@ pub async fn reconcile_managed_agent_runtimes(
         let personas = load_personas(&app).unwrap_or_default();
         let global = load_global_agent_config(&app).unwrap_or_default();
         let mut rows = Vec::new();
+        for (record, requested, error) in bootstrap_failed_jobs {
+            let status = match ManagedAgentRuntimeKey::new(record.pubkey.clone(), &requested) {
+                Ok(key) => {
+                    let mut status = status_for_with(
+                        &app,
+                        &record,
+                        &key,
+                        None,
+                        Some(requested),
+                        StatusInputs {
+                            personas: &personas,
+                            global: &global,
+                        },
+                    );
+                    status.lifecycle = ManagedAgentRuntimeLifecycle::Failed;
+                    status.error = Some(error);
+                    status
+                }
+                Err(_) => unkeyable_failed_status(&record, requested, error, &personas, &global),
+            };
+            rows.push(status);
+        }
         for probe in probes {
             match probe {
                 Ok((record, key, requested)) => {

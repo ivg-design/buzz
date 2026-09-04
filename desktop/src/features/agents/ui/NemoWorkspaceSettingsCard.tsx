@@ -14,8 +14,11 @@ import {
 
 import {
   getNemoWorkspaceStatus,
+  nemoWorkspaceStatusQueryKey,
   type NemoWorkspaceStatus,
 } from "@/shared/api/tauriNemoWorkspace";
+import { normalizeRelayUrl } from "@/features/communities/communityStorage";
+import { useCommunities } from "@/features/communities/useCommunities";
 import { Badge } from "@/shared/ui/badge";
 import { Button } from "@/shared/ui/button";
 import { SettingsOptionGroup } from "@/features/settings/ui/SettingsOptionGroup";
@@ -225,9 +228,20 @@ export function NemoWorkspaceStatusView({
 }
 
 export function NemoWorkspaceSettingsCard() {
+  const { activeCommunity } = useCommunities();
+  const scope = activeCommunity
+    ? {
+        communityId: activeCommunity.id,
+        relayUrl: normalizeRelayUrl(activeCommunity.relayUrl),
+      }
+    : null;
   const statusQuery = useQuery({
-    queryKey: ["nemo-workspace-status"],
-    queryFn: getNemoWorkspaceStatus,
+    enabled: scope !== null,
+    queryKey: nemoWorkspaceStatusQueryKey(scope),
+    queryFn: () => {
+      if (!scope) throw new Error("No active community.");
+      return getNemoWorkspaceStatus(scope);
+    },
     staleTime: 5_000,
     retry: 1,
   });
@@ -239,8 +253,8 @@ export function NemoWorkspaceSettingsCard() {
       title="Nemo workspace"
     >
       <NemoWorkspaceStatusView
-        error={statusQuery.error}
-        isPending={statusQuery.isPending}
+        error={scope ? statusQuery.error : new Error("No active community.")}
+        isPending={scope !== null && statusQuery.isPending}
         onRetry={() => void statusQuery.refetch()}
         status={statusQuery.data ?? null}
       />

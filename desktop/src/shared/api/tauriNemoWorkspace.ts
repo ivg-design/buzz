@@ -23,7 +23,22 @@ export type NemoWorkspaceStatus = {
   instructions: NemoWorkspaceInstructionStatus;
 };
 
+export type NemoWorkspaceScope = {
+  communityId: string;
+  relayUrl: string;
+};
+
+export function nemoWorkspaceStatusQueryKey(scope: NemoWorkspaceScope | null) {
+  return [
+    "nemo-workspace-status",
+    scope?.communityId ?? "none",
+    scope?.relayUrl ?? "none",
+  ] as const;
+}
+
 /** Effective Nemo policy reported by the desktop backend. */
-export async function getNemoWorkspaceStatus(): Promise<NemoWorkspaceStatus> {
-  return invokeTauri<NemoWorkspaceStatus>("get_nemo_workspace_status");
+export async function getNemoWorkspaceStatus(
+  scope: NemoWorkspaceScope,
+): Promise<NemoWorkspaceStatus> {
+  return invokeTauri<NemoWorkspaceStatus>("get_nemo_workspace_status", scope);
 }

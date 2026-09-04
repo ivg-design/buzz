@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
+import { QueryClient } from "@tanstack/react-query";
 
 import { NemoWorkspaceStatusView } from "./NemoWorkspaceSettingsCard.tsx";
+import { nemoWorkspaceStatusQueryKey } from "../../../shared/api/tauriNemoWorkspace.ts";
 
 function render(status) {
   return renderToStaticMarkup(
@@ -88,4 +90,27 @@ test("query failure is explicit and retryable", () => {
   assert.match(html, /Nemo workspace could not be verified/);
   assert.match(html, /desktop command unavailable/);
   assert.match(html, /Try again/);
+});
+
+test("Nemo status cache is isolated across community switches", () => {
+  const first = {
+    communityId: "nemo-community",
+    relayUrl: "wss://buzz.mograph.life",
+  };
+  const second = {
+    communityId: "other-community",
+    relayUrl: "wss://other.example",
+  };
+  const client = new QueryClient();
+
+  client.setQueryData(nemoWorkspaceStatusQueryKey(first), readyStatus());
+
+  assert.deepEqual(
+    client.getQueryData(nemoWorkspaceStatusQueryKey(first)),
+    readyStatus(),
+  );
+  assert.equal(
+    client.getQueryData(nemoWorkspaceStatusQueryKey(second)),
+    undefined,
+  );
 });

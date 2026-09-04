@@ -17,6 +17,42 @@ const OWNER = "ab".repeat(32);
 const RELAY_ORIGIN = "https://relay.example";
 const REPOS_DIR = "/Users/dev/github";
 
+test("local file reads forward the selected branch to the native loader", async () => {
+  const calls = [];
+  const originalWindow = globalThis.window;
+  const originalInternals = globalThis.__TAURI_INTERNALS__;
+  const tauriInternals = {
+    invoke: async (command, args) => {
+      calls.push({ command, args });
+      return "feature content";
+    },
+  };
+  globalThis.window = { __TAURI_INTERNALS__: tauriInternals };
+  globalThis.__TAURI_INTERNALS__ = tauriInternals;
+  try {
+    const source = buildRepositoryFileContentSource(
+      {
+        activeBranch: "GHproject_and_issue_triage",
+        activeTag: null,
+        pullRequest: null,
+        repository: repository("https://github.com/mysteropodes/nemo.git"),
+        reposDir: REPOS_DIR,
+        selectedTag: null,
+        source: "local",
+      },
+      RELAY_ORIGIN,
+    );
+    assert.equal(await source.load("README.md"), "feature content");
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].command, "get_project_local_repo_file_content");
+    assert.equal(calls[0].args.defaultBranch, "GHproject_and_issue_triage");
+    assert.equal(calls[0].args.path, "README.md");
+  } finally {
+    globalThis.window = originalWindow;
+    globalThis.__TAURI_INTERNALS__ = originalInternals;
+  }
+});
+
 function repository(cloneUrl) {
   return {
     id: `${OWNER}:nemo`,

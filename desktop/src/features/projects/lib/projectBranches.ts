@@ -43,6 +43,19 @@ export function projectBranchOptions(
   return [...new Set([...remoteBranches, ...localBranches].filter(Boolean))];
 }
 
+/** Keep the selected ref on a source where it exists without changing Git HEAD. */
+export function projectBranchSource(
+  current: "local" | "remote",
+  branch: string,
+  remoteBranches: string[],
+  localBranches?: string[],
+): "local" | "remote" {
+  if (localBranches?.includes(branch)) {
+    return remoteBranches.includes(branch) ? current : "local";
+  }
+  return current === "local" && localBranches ? "remote" : current;
+}
+
 export function projectBranchOptionsFromSync(
   remoteBranches: string[],
   syncStatus?: {

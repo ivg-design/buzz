@@ -32,6 +32,7 @@ import {
   projectBranchCreationReason,
   projectBranchManagementState,
   projectBranchOptionsFromSync,
+  projectBranchSource,
   resolveProjectDefaultBranch,
 } from "@/features/projects/lib/projectBranches";
 import { workspaceTabForShareTab } from "@/features/projects/lib/projectShareLinks";
@@ -293,16 +294,16 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
     (branch: string | null) => {
       selectBranch(branch);
       if (!branch) return;
-      const localBranches = repoSyncStatusQuery.data?.localBranches;
-      if (
-        repoSource === "local" &&
-        localBranches &&
-        !localBranches.includes(branch)
-      ) {
-        setRepoSource("remote");
-      }
+      setRepoSource((current) =>
+        projectBranchSource(
+          current,
+          branch,
+          branchOptions,
+          repoSyncStatusQuery.data?.localBranches,
+        ),
+      );
     },
-    [repoSource, repoSyncStatusQuery.data?.localBranches, selectBranch],
+    [branchOptions, repoSyncStatusQuery.data?.localBranches, selectBranch],
   );
   const handleTagChange = React.useCallback(
     (tag: string) => {

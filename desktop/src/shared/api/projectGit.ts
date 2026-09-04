@@ -285,12 +285,14 @@ export async function getProjectLocalRepoFileContent(input: {
   reposDir?: string | null;
   projectDtag: string;
   cloneUrl?: string | null;
+  defaultBranch?: string | null;
   path: string;
 }): Promise<string | null> {
   return invokeTauri<string | null>("get_project_local_repo_file_content", {
     reposDir: input.reposDir ?? null,
     projectDtag: input.projectDtag,
     cloneUrl: input.cloneUrl ?? null,
+    defaultBranch: input.defaultBranch ?? null,
     path: input.path,
   });
 }

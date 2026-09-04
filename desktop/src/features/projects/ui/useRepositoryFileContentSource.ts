@@ -51,6 +51,7 @@ export function buildRepositoryFileContentSource(
           reposDir,
           projectDtag: repository.dtag,
           cloneUrl: repository.cloneUrls[0] ?? null,
+          defaultBranch: activeBranch ?? repository.defaultBranch,
           path,
         }),
     } satisfies RepositoryFileContentSource;

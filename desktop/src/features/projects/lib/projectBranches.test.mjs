@@ -7,8 +7,25 @@ import {
   projectBranchManagementState,
   projectBranchNameError,
   projectBranchOptions,
+  projectBranchSource,
   resolveProjectDefaultBranch,
 } from "./projectBranches.ts";
+
+test("branch source follows local-only and remote-only selections", () => {
+  const remote = ["main", "published"];
+  const local = ["main", "unpublished"];
+  assert.equal(
+    projectBranchSource("remote", "unpublished", remote, local),
+    "local",
+  );
+  assert.equal(
+    projectBranchSource("local", "published", remote, local),
+    "remote",
+  );
+  assert.equal(projectBranchSource("local", "main", remote, local), "local");
+  assert.equal(projectBranchSource("remote", "main", remote, local), "remote");
+  assert.equal(projectBranchSource("local", "main", remote), "local");
+});
 
 test("normalizes plain and full branch refs", () => {
   assert.equal(normalizeProjectBranchName(" feature/demo "), "feature/demo");

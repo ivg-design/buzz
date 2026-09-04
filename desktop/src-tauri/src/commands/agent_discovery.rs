@@ -1026,8 +1026,8 @@ pub async fn discover_managed_agent_prereqs(
 mod relay_directory;
 #[cfg(test)]
 use relay_directory::advance_relay_cursor;
+pub(crate) use relay_directory::list_relay_agents_for_selection;
 pub use relay_directory::{list_relay_agents, revalidate_relay_agents};
-
 #[cfg(test)]
 mod tests {
     use super::*;

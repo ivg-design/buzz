@@ -48,6 +48,7 @@ mod team_repair;
 pub(crate) use team_repair::team_persona_key;
 mod teams;
 mod types;
+pub(crate) mod workspace_project;
 
 // Shared lock for tests that call `lock_path_mutex` or `lock_env_mutex`.
 // Both helpers delegate here so any two tests using either helper are mutually
@@ -111,7 +112,16 @@ pub(crate) use session_policy::{
 };
 pub use storage::*;
 pub use teams::*;
+
+/// Canonical Desktop-owned A2A grant document used by managed harnesses.
+pub(crate) fn a2a_grants_file_path() -> Option<std::path::PathBuf> {
+    nest_dir().map(|nest| nest.join("a2a").join("agent-job-grants.json"))
+}
 pub use types::*;
+pub(crate) use workspace_project::{
+    apply_workspace_project_env, load_workspace_project_for_relay,
+    save_workspace_project_for_relay, WorkspaceProject,
+};
 
 #[cfg(test)]
 pub(crate) use teams::delete_catalog_team_at;

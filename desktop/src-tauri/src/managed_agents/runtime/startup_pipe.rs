@@ -55,11 +55,20 @@ impl<'a> StartupPayload<'a> {
         if private_key.is_empty() || private_key.len() > 256 {
             return Err("managed agent private key has an invalid length".into());
         }
+        let explicit_json = nonempty_env("BUZZ_ACP_JOB_GRANTS_JSON").map(Zeroizing::new);
+        let explicit_file = path_env("BUZZ_ACP_JOB_GRANTS_FILE")?;
+        let desktop_json = if explicit_json.is_none() && explicit_file.is_none() {
+            Some(crate::commands::load_managed_agent_grants_json()?)
+        } else {
+            None
+        };
+        let (job_grants_json, job_grants_file) =
+            resolve_job_grant_sources(explicit_json, explicit_file, desktop_json)?;
         Ok(Self {
             private_key,
             auth_tag,
-            job_grants_json: nonempty_env("BUZZ_ACP_JOB_GRANTS_JSON").map(Zeroizing::new),
-            job_grants_file: path_env("BUZZ_ACP_JOB_GRANTS_FILE")?,
+            job_grants_json,
+            job_grants_file,
             job_ledger_dir: path_env("BUZZ_ACP_JOB_LEDGER_DIR")?,
             owner_github_login: nonempty_env("BUZZ_ACP_OWNER_GITHUB_LOGIN"),
             allow_insecure_loopback_jobs: nonempty_env("BUZZ_ACP_ALLOW_INSECURE_LOOPBACK_JOBS")
@@ -110,6 +119,22 @@ impl<'a> StartupPayload<'a> {
     }
 }
 
+fn resolve_job_grant_sources(
+    explicit_json: Option<Zeroizing<String>>,
+    explicit_file: Option<PathBuf>,
+    desktop_json: Option<Zeroizing<String>>,
+) -> Result<(Option<Zeroizing<String>>, Option<PathBuf>), String> {
+    match (explicit_json, explicit_file, desktop_json) {
+        (Some(_), Some(_), _) => {
+            Err("set only one of BUZZ_ACP_JOB_GRANTS_JSON or BUZZ_ACP_JOB_GRANTS_FILE".into())
+        }
+        (Some(json), None, _) => Ok((Some(json), None)),
+        (None, Some(file), _) => Ok((None, Some(file))),
+        (None, None, Some(json)) => Ok((Some(json), None)),
+        (None, None, None) => Ok((None, None)),
+    }
+}
+
 fn nonempty_env(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
@@ -152,6 +177,36 @@ mod tests {
         for name in STARTUP_ENV_KEYS {
             assert_eq!(changes.get(std::ffi::OsStr::new(name)), Some(&None));
         }
+    }
+
+    #[test]
+    fn authenticated_desktop_grants_are_inline_without_overriding_explicit_sources() {
+        let desktop = Zeroizing::new(r#"{"version":1,"grants":[]}"#.to_string());
+        let (json, file) =
+            resolve_job_grant_sources(None, None, Some(desktop)).expect("resolve desktop grants");
+        assert!(json.is_some());
+        assert!(file.is_none());
+
+        let explicit_json = Zeroizing::new(r#"{"version":1,"grants":[]}"#.to_string());
+        let (json, file) = resolve_job_grant_sources(Some(explicit_json), None, None)
+            .expect("resolve explicit inline grants");
+        assert!(json.is_some());
+        assert!(file.is_none());
+
+        let directory = tempfile::tempdir().expect("temporary grants directory");
+        assert_eq!(
+            resolve_job_grant_sources(None, Some(directory.path().join("external.json")), None)
+                .expect("resolve explicit file")
+                .1,
+            Some(directory.path().join("external.json"))
+        );
+    }
+
+    #[test]
+    fn ambiguous_external_grant_sources_fail_closed() {
+        let inline = Zeroizing::new(r#"{"version":1,"grants":[]}"#.to_string());
+        let file = PathBuf::from("external.json");
+        assert!(resolve_job_grant_sources(Some(inline), Some(file), None).is_err());
     }
 
     #[cfg(unix)]

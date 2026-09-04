@@ -241,15 +241,26 @@ pub fn build_managed_agent_summary(
 
     // The prospective side is computed only for a tracked pair: an unstamped
     // agent has nothing to compare against.
+    let workspace_project = pair_key
+        .as_ref()
+        .zip(pair_runtime)
+        .map(|(key, _)| super::load_workspace_project_for_relay(&key.relay_url))
+        .transpose()?
+        .flatten();
     let tracked_spawn = pair_key.as_ref().zip(pair_runtime).map(|(key, runtime)| {
-        let current = crate::managed_agents::spawn_snapshot::prospective_spawn_config_snapshot(
+        let current = crate::managed_agents::spawn_snapshot::prospective_spawn_config_snapshot_with_workspace_project(
             record,
             personas,
             teams,
             &key.relay_url,
             global_config,
             super::owner_only_access_build(),
-            super::acp_session_policy(app.state::<crate::app_state::AppState>().inner()),
+            crate::managed_agents::spawn_snapshot::ProspectiveWorkspacePolicy {
+                session_policy: super::acp_session_policy(
+                    app.state::<crate::app_state::AppState>().inner(),
+                ),
+                workspace_project: workspace_project.as_ref(),
+            },
         );
         (runtime, current)
     });
@@ -731,10 +742,17 @@ pub fn spawn_agent_child(
     command.env_remove("GIT_CONFIG_VALUE_1");
 
     // User env (descriptor.env): fully-layered floor→runtime→definition→global→persona→agent,
-    // reserved-key filtered. Written last so user-explicit values win over Buzz-set env.
+    // reserved-key filtered. This is the last generic user tier; dedicated
+    // Desktop policy and invocation state follow it below.
     for (key, value) in &descriptor.env {
         command.env(key, value);
     }
+    // Workspace policy is owner-selected and stored in the OS credential
+    // vault. Apply it after every user environment tier so a managed model
+    // cannot shadow the reviewed Project or revision through persona, global,
+    // or per-agent configuration.
+    let workspace_project = super::load_workspace_project_for_relay(&effective_relay_url)?;
+    super::apply_workspace_project_env(&mut command, workspace_project.as_ref())?;
     // Resolve once and stamp the same value onto the snapshot below.
     let acp_session_policy = super::apply_app_acp_session_policy_env(app, &mut command);
 
@@ -795,6 +813,7 @@ pub fn spawn_agent_child(
             provider: effective_provider.as_deref(),
             enforced_owner_only: super::owner_only_access_build(),
             session_policy: acp_session_policy,
+            workspace_project: workspace_project.as_ref(),
         },
     );
 

@@ -30,6 +30,8 @@ fn base() -> SpawnConfigSnapshot {
         parallelism: 1,
         effort_level: Some("high".into()),
         session_policy: "channel".into(),
+        workspace_project_channel: Some("50b0722b-76c2-4b6e-b6e2-1431d1f0ba65".into()),
+        workspace_project_revision: Some("a".repeat(40)),
     }
 }
 
@@ -74,6 +76,12 @@ fn mutations() -> Vec<Mutation> {
         ("parallelism", |s| s.parallelism = 8),
         ("effort_level", |s| s.effort_level = None),
         ("session_policy", |s| s.session_policy = "thread".into()),
+        ("workspace_project_channel", |s| {
+            s.workspace_project_channel = None
+        }),
+        ("workspace_project_revision", |s| {
+            s.workspace_project_revision = None
+        }),
     ]
 }
 

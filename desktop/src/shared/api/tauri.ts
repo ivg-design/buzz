@@ -380,8 +380,16 @@ export async function addChannelMembers(
 export async function removeChannelMember(
   channelId: string,
   pubkey: string,
+  expectedScope?: {
+    expectedRelayUrl?: string;
+    expectedSignerPubkey?: string;
+  },
 ): Promise<void> {
-  await invokeTauri("remove_channel_member", { channelId, pubkey });
+  await invokeTauri("remove_channel_member", {
+    channelId,
+    pubkey,
+    ...expectedScope,
+  });
 }
 
 export async function changeChannelMemberRole(

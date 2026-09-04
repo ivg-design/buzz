@@ -37,7 +37,7 @@ use super::{
     readiness::EffectiveHarnessDescriptor,
     runtime::{resolve_session_title, SESSION_TITLE_ENV_VAR},
     types::{AgentDefinition, ManagedAgentRecord, TeamRecord},
-    AcpSessionPolicy, GlobalAgentConfig,
+    AcpSessionPolicy, GlobalAgentConfig, WorkspaceProject,
 };
 
 pub(crate) mod diff;
@@ -81,6 +81,10 @@ pub(crate) struct SpawnConfigInputs<'a> {
     /// drives the existing restart-required path (the harness only reads
     /// `BUZZ_ACP_SESSION_POLICY` at launch).
     pub session_policy: AcpSessionPolicy,
+    /// Owner-selected, relay-scoped Project whose reviewed instructions are
+    /// applied to every managed session. This record is loaded from the OS
+    /// credential vault and cannot be supplied through user environment tiers.
+    pub workspace_project: Option<&'a WorkspaceProject>,
 }
 
 /// The effective spawn configuration of one managed-agent process.
@@ -152,6 +156,11 @@ pub(crate) struct SpawnConfigSnapshot {
     /// via layered env), so it must be captured explicitly rather than read back
     /// out of `env`.
     pub session_policy: String,
+    /// Dedicated policy fields written after every user environment tier.
+    /// Keeping them outside `env` makes owner-selection drift explicit while
+    /// avoiding duplicate or attacker-controlled snapshot representations.
+    pub workspace_project_channel: Option<String>,
+    pub workspace_project_revision: Option<String>,
 }
 
 /// The startup effort a spawn actually applied, read from the single effort key
@@ -191,6 +200,7 @@ impl SpawnConfigSnapshot {
             provider,
             enforced_owner_only,
             session_policy,
+            workspace_project,
         } = inputs;
         let (respond_to, respond_to_allowlist) =
             super::projected_access_with_policy(record, enforced_owner_only);
@@ -258,6 +268,10 @@ impl SpawnConfigSnapshot {
             // what launched regardless of which tier supplied the value.
             effort_level: effective_effort(descriptor),
             session_policy: session_policy.as_str().to_string(),
+            workspace_project_channel: workspace_project
+                .map(|project| project.home_channel.clone()),
+            workspace_project_revision: workspace_project
+                .map(|project| project.instruction_revision.clone()),
         }
     }
 
@@ -291,6 +305,7 @@ impl std::fmt::Debug for SpawnConfigSnapshot {
 /// Pure — no `AppHandle`, no disk, no keyring. This is the *prospective* side
 /// of the comparison; the stamped side is built at spawn from the values that
 /// actually fed the child's `Command`.
+#[cfg(test)]
 pub(crate) fn prospective_spawn_config_snapshot(
     record: &ManagedAgentRecord,
     personas: &[AgentDefinition],
@@ -300,6 +315,41 @@ pub(crate) fn prospective_spawn_config_snapshot(
     enforced_owner_only: bool,
     session_policy: AcpSessionPolicy,
 ) -> SpawnConfigSnapshot {
+    prospective_spawn_config_snapshot_with_workspace_project(
+        record,
+        personas,
+        teams,
+        workspace_relay,
+        global,
+        enforced_owner_only,
+        ProspectiveWorkspacePolicy {
+            session_policy,
+            workspace_project: None,
+        },
+    )
+}
+
+pub(crate) struct ProspectiveWorkspacePolicy<'a> {
+    pub session_policy: AcpSessionPolicy,
+    pub workspace_project: Option<&'a WorkspaceProject>,
+}
+
+/// Variant used by runtime drift checks after reading the relay-scoped record
+/// from the OS credential vault. The public pure helper above deliberately
+/// preserves the no-Project baseline used throughout existing unit tests.
+pub(crate) fn prospective_spawn_config_snapshot_with_workspace_project(
+    record: &ManagedAgentRecord,
+    personas: &[AgentDefinition],
+    teams: &[TeamRecord],
+    workspace_relay: &str,
+    global: &GlobalAgentConfig,
+    enforced_owner_only: bool,
+    policy: ProspectiveWorkspacePolicy<'_>,
+) -> SpawnConfigSnapshot {
+    let ProspectiveWorkspacePolicy {
+        session_policy,
+        workspace_project,
+    } = policy;
     // Prospective re-snapshot: apply the same `apply_persona_snapshot` the
     // start/restore paths run right before spawning, so this describes what a
     // restart would actually run. Idempotent, so a spawn-time stamp taken
@@ -350,6 +400,7 @@ pub(crate) fn prospective_spawn_config_snapshot(
         provider: provider.as_deref(),
         enforced_owner_only,
         session_policy,
+        workspace_project,
     })
 }
 

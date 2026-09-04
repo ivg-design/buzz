@@ -8538,6 +8538,14 @@ let mockGlobalAgentConfig: {
   model: string | null;
   preferred_runtime?: string | null;
 } | null = null;
+type MockWorkspaceProject = {
+  projectAddress: string;
+  homeChannel: string;
+  repository: string;
+  displayName: string;
+  instructionRevision: string;
+};
+const mockWorkspaceProjects = new Map<string, MockWorkspaceProject>();
 
 // Per-page get_nsec call counter for sequenced error testing.
 let nsecCallCount = 0;
@@ -11286,6 +11294,7 @@ export function maybeInstallE2eTauriMocks() {
   mockGlobalAgentConfig = config.mock?.globalAgentConfig
     ? { ...config.mock.globalAgentConfig }
     : null;
+  mockWorkspaceProjects.clear();
   resetMockRelayMembers(config);
   resetMockRelayAgents(config);
   resetMockManagedAgents(config);
@@ -14103,6 +14112,47 @@ export function maybeInstallE2eTauriMocks() {
             config?.mock?.globalConfigFailedRestartCount ?? 0,
         };
       }
+      case "get_workspace_project": {
+        const relayUrl = normalizeMockRelayUrl(getRelayWsUrl(activeConfig));
+        return {
+          relayUrl,
+          project: mockWorkspaceProjects.get(relayUrl) ?? null,
+          codexInstructionStatus: "blocked",
+          codexInstructionError:
+            "The managed Codex ACP adapter does not yet provide verified developerInstructions delivery.",
+        };
+      }
+      case "set_workspace_project": {
+        const args = (
+          payload as {
+            input: {
+              project: MockWorkspaceProject | null;
+              expectedRelayUrl: string;
+              expectedSignerPubkey: string;
+            };
+          }
+        ).input;
+        assertExpectedRelayScope(args.expectedRelayUrl, activeConfig);
+        assertExpectedSigner(args.expectedSignerPubkey, activeConfig);
+        const relayUrl = normalizeMockRelayUrl(args.expectedRelayUrl);
+        const previous = mockWorkspaceProjects.get(relayUrl) ?? null;
+        const changed =
+          JSON.stringify(previous) !== JSON.stringify(args.project);
+        if (args.project) mockWorkspaceProjects.set(relayUrl, args.project);
+        else mockWorkspaceProjects.delete(relayUrl);
+        return {
+          relayUrl,
+          project: args.project,
+          changed,
+          restartedCount: 0,
+          failedRestartCount: 0,
+          codexInstructionStatus: "blocked",
+          codexInstructionError:
+            "The managed Codex ACP adapter does not yet provide verified developerInstructions delivery.",
+        };
+      }
+      case "list_a2a_checkouts":
+        return [];
       case "get_baked_build_env": {
         const bakedEnvDelayMs = config?.mock?.bakedBuildEnvDelayMs ?? 0;
         if (bakedEnvDelayMs > 0) {

@@ -124,7 +124,7 @@ pub(crate) async fn list_relay_agents_for_state(
     list_relay_agents_for_selection(state, None, None).await
 }
 
-async fn list_relay_agents_for_selection(
+pub(crate) async fn list_relay_agents_for_selection(
     state: &AppState,
     requested_pubkeys: Option<&std::collections::HashSet<String>>,
     channel_id: Option<&str>,

@@ -12,6 +12,7 @@ import {
   SettingsOptionRow,
 } from "./SettingsOptionGroup";
 import { SettingsSectionHeader } from "./SettingsSectionHeader";
+import { A2aGrantsSettingsCard } from "@/features/agents/ui/A2aGrantsSettingsCard";
 
 export function AgentsSettingsPanel() {
   const automaticallyMentionAgents = useKeepMentionedAgentsPinned();
@@ -49,6 +50,7 @@ export function AgentsSettingsPanel() {
           </SettingsOptionRow>
         </SettingsOptionGroup>
         <PreventSleepSettingsCard />
+        <A2aGrantsSettingsCard />
         <HarnessesSettingsPanel />
         <AgentDefaultsSettingsCard />
       </SettingsOptionGroupList>

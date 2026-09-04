@@ -582,11 +582,20 @@ pub async fn add_channel_members(
 pub async fn remove_channel_member(
     channel_id: String,
     pubkey: String,
+    expected_relay_url: Option<String>,
+    expected_signer_pubkey: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let uuid = parse_channel_uuid(&channel_id)?;
+    let relay_base = relay_api_base_url_with_override(&state);
+    assert_expected_relay_scope(expected_relay_url.as_deref(), &relay_base)?;
+    let signing_keys = state.signing_keys()?;
+    assert_expected_signer(
+        expected_signer_pubkey.as_deref(),
+        &signing_keys.public_key().to_hex(),
+    )?;
     let builder = events::build_remove_member(uuid, &pubkey)?;
-    submit_event(builder, &state).await?;
+    submit_event_at_with_keys(builder, &state, &relay_base, &signing_keys).await?;
     Ok(())
 }
 

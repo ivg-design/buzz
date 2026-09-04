@@ -57,20 +57,37 @@ fn status_for_with(
     let metadata = super::known_acp_runtime(&command);
     let effective = resolve_effective_agent_env(record, personas, metadata, global);
     let local_setup = matches!(agent_readiness(&effective), AgentReadiness::Ready);
+    let (lifecycle, error) = runtime_status_truth(record, runtime);
     ManagedAgentRuntimeStatus {
         pubkey: key.pubkey.clone(),
         relay_url: key.relay_url.clone(),
         requested_relay_url,
         local_setup,
-        lifecycle: runtime
-            .map(|runtime| runtime.lifecycle.clone())
-            .unwrap_or(ManagedAgentRuntimeLifecycle::Stopped),
+        lifecycle,
         pid: runtime.map(|runtime| runtime.child.id()),
-        error: runtime.and_then(|runtime| runtime.error.clone()),
+        error,
         log_path: managed_agent_runtime_log_path(app, key)
             .ok()
             .map(|path| path.display().to_string()),
     }
+}
+
+fn runtime_status_truth(
+    record: &super::ManagedAgentRecord,
+    runtime: Option<&ManagedAgentPairRuntime>,
+) -> (ManagedAgentRuntimeLifecycle, Option<String>) {
+    match runtime {
+        Some(runtime) => (runtime.lifecycle.clone(), runtime.error.clone()),
+        None => match &record.last_error {
+            Some(error) => (ManagedAgentRuntimeLifecycle::Failed, Some(error.clone())),
+            None => (ManagedAgentRuntimeLifecycle::Stopped, None),
+        },
+    }
+}
+
+fn clear_runtime_error(record: &mut super::ManagedAgentRecord) {
+    record.last_error = None;
+    record.last_error_code = None;
 }
 
 fn emit_status(app: &AppHandle, status: &ManagedAgentRuntimeStatus) {
@@ -395,6 +412,7 @@ pub fn stop_managed_agent_runtime(
     record.runtime_pid = None;
     record.updated_at = crate::util::now_iso();
     record.last_stopped_at = Some(record.updated_at.clone());
+    clear_runtime_error(record);
     let status = status_for(&app, record, &key, None, None);
     drop(runtimes);
     save_managed_agents(&app, &records)?;
@@ -907,6 +925,31 @@ mod tests {
                 retired: Some(Some(17)),
             })
         );
+    }
+
+    #[test]
+    fn persisted_post_retire_error_remains_failed_without_runtime() {
+        let mut record = record_with_relay("wss://relay.example");
+        record.last_error = Some("replacement spawn failed".to_string());
+
+        let (lifecycle, error) = runtime_status_truth(&record, None);
+
+        assert_eq!(lifecycle, ManagedAgentRuntimeLifecycle::Failed);
+        assert_eq!(error.as_deref(), Some("replacement spawn failed"));
+    }
+
+    #[test]
+    fn explicit_stop_clears_persisted_runtime_failure() {
+        let mut record = record_with_relay("wss://relay.example");
+        record.last_error = Some("replacement spawn failed".to_string());
+        record.last_error_code = Some(17);
+
+        clear_runtime_error(&mut record);
+        let (lifecycle, error) = runtime_status_truth(&record, None);
+
+        assert_eq!(lifecycle, ManagedAgentRuntimeLifecycle::Stopped);
+        assert_eq!(error, None);
+        assert_eq!(record.last_error_code, None);
     }
 
     fn payload(

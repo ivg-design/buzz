@@ -1,5 +1,34 @@
 use crate::managed_agents::discovery::{clear_resolve_cache, resolve_command};
 
+#[test]
+fn external_windows_batch_shims_cannot_bypass_private_adapter_verification() {
+    use super::super::{is_claude_acp_command, is_codex_acp_command, resolve_command_uncached};
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    for (name, recognized) in [
+        ("codex-acp.bat", is_codex_acp_command as fn(&str) -> bool),
+        ("claude-agent-acp.bat", is_claude_acp_command),
+        ("claude-code-acp.bat", is_claude_acp_command),
+    ] {
+        let shim = temp.path().join(name);
+        std::fs::write(&shim, "@echo off\r\necho arbitrary\r\n").expect("write shim");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod shim");
+        }
+        let command = shim.to_str().expect("utf8 path");
+
+        assert!(recognized(command), "{name} must use the pinned resolver");
+        assert_eq!(
+            resolve_command_uncached(command),
+            None,
+            "an external {name} must not satisfy the private adapter contract"
+        );
+    }
+}
+
 /// A login-shell command lookup must treat its argument as pure data — a
 /// payload containing shell metacharacters must never execute.
 #[test]

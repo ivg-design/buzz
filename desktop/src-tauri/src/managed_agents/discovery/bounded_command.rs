@@ -7,11 +7,11 @@
 //! stall discovery; that stall is what left "Check again" spinning forever.
 
 use std::io::{ErrorKind, Read};
+use std::path::Path;
 use std::process::{ChildStderr, ChildStdout, Command, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::path::Path;
 use std::time::{Duration, Instant};
 
 /// Poll interval while waiting for the child to exit.

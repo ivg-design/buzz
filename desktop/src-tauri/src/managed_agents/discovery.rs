@@ -627,28 +627,22 @@ fn resolve_buzz_managed_command(command: &str) -> Option<PathBuf> {
         .find_map(|basename| buzz_managed_command_path(command, basename))
 }
 
+fn is_runtime_adapter_command(command: &str, runtime_id: &str) -> bool {
+    let identity = normalize_command_identity(command);
+    known_acp_runtime_exact(runtime_id).is_some_and(|runtime| {
+        runtime
+            .commands
+            .iter()
+            .any(|candidate| identity == normalize_command_identity(candidate))
+    })
+}
+
 fn is_codex_acp_command(command: &str) -> bool {
-    Path::new(command)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| matches!(name, "codex-acp" | "codex-acp.exe" | "codex-acp.cmd"))
+    is_runtime_adapter_command(command, "codex")
 }
 
 fn is_claude_acp_command(command: &str) -> bool {
-    Path::new(command)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| {
-            matches!(
-                name,
-                "claude-agent-acp"
-                    | "claude-agent-acp.exe"
-                    | "claude-agent-acp.cmd"
-                    | "claude-code-acp"
-                    | "claude-code-acp.exe"
-                    | "claude-code-acp.cmd"
-            )
-        })
+    is_runtime_adapter_command(command, "claude")
 }
 
 /// Resolve Codex only from Buzz's app-private adapter directory and require

@@ -2,6 +2,7 @@ use base64::Engine;
 use nostr::{Event, EventBuilder, JsonUtil, Kind, Tag};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use buzz_core::job::{build_job_tags, JobEvent};
@@ -33,7 +34,7 @@ pub struct TrustedRelay {
     pub(super) grants: super::GrantSet,
     pub(super) a2a_channel_id: Option<String>,
     pub(super) session_channel_id: Option<String>,
-    pub(super) session_thread_root_id: Option<String>,
+    pub(super) session_thread_root_id: RwLock<Option<String>>,
     pub(super) job_operation_id: Option<String>,
     pub(super) job_request_event_id: Option<String>,
     pub(super) session_working_directory: Option<std::path::PathBuf>,
@@ -78,7 +79,7 @@ impl TrustedRelay {
             grants: config.grants,
             a2a_channel_id: config.a2a_channel_id,
             session_channel_id: config.session_channel_id,
-            session_thread_root_id: config.session_thread_root_id,
+            session_thread_root_id: RwLock::new(config.session_thread_root_id),
             job_operation_id: config.job_operation_id,
             job_request_event_id: config.job_request_event_id,
             session_working_directory: config.session_working_directory,
@@ -212,8 +213,21 @@ impl TrustedRelay {
         })?;
         let channel = uuid::Uuid::parse_str(channel)
             .map_err(|_| "session channel binding is invalid".to_owned())?;
-        let thread = self
+        let event = self.build_session_chat_event(channel, content)?;
+        self.submit(event, PublishClass::Chat, cancellation).await
+    }
+
+    fn build_session_chat_event(
+        &self,
+        channel: uuid::Uuid,
+        content: &str,
+    ) -> Result<Event, String> {
+        let thread_root_id = self
             .session_thread_root_id
+            .read()
+            .map_err(|_| "session chat destination is unavailable".to_owned())?
+            .clone();
+        let thread = thread_root_id
             .as_deref()
             .map(|root| {
                 let event = nostr::EventId::parse(root)
@@ -224,8 +238,22 @@ impl TrustedRelay {
                 })
             })
             .transpose()?;
-        let event = self.build_chat_event(channel, content, thread.as_ref())?;
-        self.submit(event, PublishClass::Chat, cancellation).await
+        self.build_chat_event(channel, content, thread.as_ref())
+    }
+
+    /// Replace only the conversational reply destination for the next turn.
+    /// The immutable channel, signer, repository and A2A scope remain fixed.
+    pub(super) fn set_chat_thread_root_id(
+        &self,
+        thread_root_id: Option<&str>,
+    ) -> Result<(), String> {
+        validate_optional_hex("session thread root", thread_root_id)?;
+        let mut destination = self
+            .session_thread_root_id
+            .write()
+            .map_err(|_| "session chat destination is unavailable".to_owned())?;
+        *destination = thread_root_id.map(str::to_owned);
+        Ok(())
     }
 
     /// Fetch relay-hosted private media with a narrow Blossom read token.

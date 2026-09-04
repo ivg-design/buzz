@@ -322,6 +322,12 @@ impl TrustedSessionMcp {
 }
 
 impl TrustedSessionMcp {
+    /// Update the harness-owned reply destination before dispatching a turn.
+    /// This mutates no model-visible authority or A2A scope.
+    pub fn set_chat_thread_root_id(&self, thread_root_id: Option<&str>) -> Result<(), String> {
+        self.relay.set_chat_thread_root_id(thread_root_id)
+    }
+
     async fn begin_privileged_operation(
         &self,
         operation: ProjectGitOperation,

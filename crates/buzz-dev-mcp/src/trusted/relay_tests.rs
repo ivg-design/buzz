@@ -15,7 +15,7 @@ fn test_relay() -> TrustedRelay {
         grants: super::super::GrantSet::default(),
         a2a_channel_id: None,
         session_channel_id: None,
-        session_thread_root_id: None,
+        session_thread_root_id: std::sync::RwLock::new(None),
         job_operation_id: None,
         job_request_event_id: None,
         session_working_directory: None,
@@ -106,4 +106,65 @@ fn threaded_chat_uses_only_the_fixed_thread_reference() {
     assert!(!tags
         .iter()
         .any(|tag| tag.first().map(String::as_str) == Some("p")));
+}
+
+#[test]
+fn chat_thread_destination_can_be_set_replaced_and_cleared() {
+    let relay = test_relay();
+    let channel = uuid::Uuid::parse_str("3580ca9b-47b4-4af9-b22a-1068778f26c6").unwrap();
+    let first = "a".repeat(64);
+    let second = "b".repeat(64);
+
+    relay.set_chat_thread_root_id(Some(&first)).unwrap();
+    let first_event = relay
+        .build_session_chat_event(channel, "first")
+        .expect("first destination");
+    let first_refs = first_event
+        .tags
+        .iter()
+        .filter(|tag| tag.as_slice().first().map(String::as_str) == Some("e"))
+        .collect::<Vec<_>>();
+    assert!(!first_refs.is_empty());
+    assert!(first_refs
+        .iter()
+        .all(|tag| tag.as_slice().get(1) == Some(&first)));
+
+    relay.set_chat_thread_root_id(Some(&second)).unwrap();
+    let second_event = relay
+        .build_session_chat_event(channel, "second")
+        .expect("replacement destination");
+    let second_refs = second_event
+        .tags
+        .iter()
+        .filter(|tag| tag.as_slice().first().map(String::as_str) == Some("e"))
+        .collect::<Vec<_>>();
+    assert!(!second_refs.is_empty());
+    assert!(second_refs
+        .iter()
+        .all(|tag| tag.as_slice().get(1) == Some(&second)));
+
+    assert!(relay
+        .set_chat_thread_root_id(Some("not-an-event-id"))
+        .is_err());
+    let unchanged = relay
+        .build_session_chat_event(channel, "unchanged")
+        .expect("invalid update preserves destination");
+    let unchanged_refs = unchanged
+        .tags
+        .iter()
+        .filter(|tag| tag.as_slice().first().map(String::as_str) == Some("e"))
+        .collect::<Vec<_>>();
+    assert!(!unchanged_refs.is_empty());
+    assert!(unchanged_refs
+        .iter()
+        .all(|tag| tag.as_slice().get(1) == Some(&second)));
+
+    relay.set_chat_thread_root_id(None).unwrap();
+    let timeline = relay
+        .build_session_chat_event(channel, "timeline")
+        .expect("cleared destination");
+    assert!(!timeline
+        .tags
+        .iter()
+        .any(|tag| tag.as_slice().first().map(String::as_str) == Some("e")));
 }

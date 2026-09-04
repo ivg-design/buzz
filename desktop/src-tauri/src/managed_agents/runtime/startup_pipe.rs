@@ -212,3 +212,7 @@ mod tests {
         let _ = child.wait();
     }
 }
+
+#[cfg(test)]
+#[path = "startup_pipe_closed_relay_tests.rs"]
+mod closed_relay_tests;

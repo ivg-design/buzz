@@ -27,6 +27,26 @@ enum SpawnOutcome {
 }
 type AgentSpawnResult = (String, SpawnOutcome);
 
+fn revalidate_restore_candidates(
+    snapshots: &[super::ManagedAgentRecord],
+    current: &[super::ManagedAgentRecord],
+) -> Vec<super::ManagedAgentRecord> {
+    snapshots
+        .iter()
+        .filter_map(|snapshot| {
+            current
+                .iter()
+                .find(|record| record.pubkey.eq_ignore_ascii_case(&snapshot.pubkey))
+                .filter(|record| {
+                    record.updated_at == snapshot.updated_at
+                        && record.start_on_app_launch
+                        && record.backend == BackendKind::Local
+                })
+                .cloned()
+        })
+        .collect()
+}
+
 /// Backfill the pinned persona snapshot for pre-existing agents created before
 /// the record became the spawn source of truth. Runs once at launch, before
 /// `restore_managed_agents_on_launch` spawns anything, so no agent boots from an
@@ -302,10 +322,10 @@ pub async fn restore_managed_agents_on_launch(
         return Ok(());
     }
 
-    // Serialize spawning and runtime registration with shutdown cleanup. The
-    // shutdown flag is rechecked after taking the lock so shutdown either
-    // prevents this transition or waits until every child is tracked and can
-    // be terminated.
+    // Serialize spawning and runtime registration with shutdown cleanup. After
+    // the async bootstrap suspension window, also re-lock and reload the store:
+    // deleted, disabled, or edited snapshots must never reach spawn. Holding
+    // the store lock through Phase C binds that checked generation to its spawn.
     let restore_transition = state
         .managed_agent_runtime_transition
         .lock()
@@ -313,8 +333,16 @@ pub async fn restore_managed_agents_on_launch(
     if shutdown_started.load(Ordering::SeqCst) {
         return Ok(());
     }
+    let restore_store_guard = state
+        .managed_agents_store_lock
+        .lock()
+        .map_err(|error| error.to_string())?;
+    agents_to_start = revalidate_restore_candidates(&agents_to_start, &load_managed_agents(app)?);
+    if agents_to_start.is_empty() {
+        return Ok(());
+    }
 
-    // ── Phase B (transition lock held): resolve commands and spawn in parallel ──
+    // ── Phase B (transition + store locks held): resolve and spawn in parallel ──
     let spawn_results: Vec<AgentSpawnResult> = std::thread::scope(|scope| {
         let owner_hex_ref = owner_hex.as_deref();
         let handles: Vec<_> = agents_to_start
@@ -389,11 +417,7 @@ pub async fn restore_managed_agents_on_launch(
         return Ok(());
     }
 
-    // ── Phase C (re-acquire lock): write back PIDs and status to records ──
-    let _store_guard = state
-        .managed_agents_store_lock
-        .lock()
-        .map_err(|error| error.to_string())?;
+    // ── Phase C (same generation lock held): write back status to records ──
     let mut records = load_managed_agents(app)?;
     let mut runtimes = state
         .managed_agent_processes
@@ -492,7 +516,7 @@ pub async fn restore_managed_agents_on_launch(
 
     save_managed_agents(app, &records)?;
     drop(runtimes);
-    drop(_store_guard);
+    drop(restore_store_guard);
     drop(restore_transition);
 
     // ── Profile reconciliation (fire-and-forget) ────────────────────────────
@@ -567,8 +591,45 @@ pub(crate) fn spawn_pending_profile_reconciliations(app: &tauri::AppHandle, work
 
 #[cfg(test)]
 mod profile_reconcile_tests {
-    use super::profile_reconcile_completed;
+    use super::{profile_reconcile_completed, revalidate_restore_candidates};
     use crate::commands::ProfileReconcileOutcome;
+
+    fn restore_record(pubkey: &str, updated_at: &str) -> super::super::ManagedAgentRecord {
+        serde_json::from_value(serde_json::json!({
+            "pubkey": pubkey,
+            "name": "restore-test",
+            "relay_url": "wss://relay.example",
+            "acp_command": "buzz-acp",
+            "agent_command": "goose",
+            "agent_args": [],
+            "mcp_command": "",
+            "turn_timeout_seconds": 320,
+            "system_prompt": "",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": updated_at,
+            "last_started_at": null,
+            "last_stopped_at": null,
+            "last_exit_code": null,
+            "last_error": null
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn restore_drops_deleted_and_changed_snapshots_after_bootstrap() {
+        let unchanged = restore_record(&"aa".repeat(32), "generation-1");
+        let changed = restore_record(&"bb".repeat(32), "generation-1");
+        let deleted = restore_record(&"cc".repeat(32), "generation-1");
+        let mut changed_now = changed.clone();
+        changed_now.updated_at = "generation-2".into();
+
+        let result = revalidate_restore_candidates(
+            &[unchanged.clone(), changed, deleted],
+            &[unchanged.clone(), changed_now],
+        );
+
+        assert_eq!(result, [unchanged]);
+    }
 
     #[test]
     fn skipped_reconciliation_never_retires_pending_work() {

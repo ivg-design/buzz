@@ -485,6 +485,50 @@ pub fn spawn_agent_child(
     owner_hex: Option<&str>,
     replay_floor_unix: Option<u64>,
 ) -> Result<crate::managed_agents::ManagedAgentProcess, String> {
+    spawn_agent_child_inner(
+        app,
+        record,
+        relay_url,
+        lazy,
+        owner_hex,
+        replay_floor_unix,
+        None,
+    )
+}
+
+/// Restart-only spawn entrypoint. The caller resolves and verifies this exact
+/// harness descriptor while the old runtime is alive, then holds its generation
+/// lock through stop and spawn. Passing the owned descriptor prevents a mutable
+/// registry/default read from selecting a different adapter after the stop.
+pub(crate) fn spawn_agent_child_with_harness_descriptor(
+    app: &AppHandle,
+    record: &ManagedAgentRecord,
+    relay_url: &str,
+    lazy: bool,
+    owner_hex: Option<&str>,
+    replay_floor_unix: Option<u64>,
+    descriptor: crate::managed_agents::readiness::EffectiveHarnessDescriptor,
+) -> Result<crate::managed_agents::ManagedAgentProcess, String> {
+    spawn_agent_child_inner(
+        app,
+        record,
+        relay_url,
+        lazy,
+        owner_hex,
+        replay_floor_unix,
+        Some(descriptor),
+    )
+}
+
+fn spawn_agent_child_inner(
+    app: &AppHandle,
+    record: &ManagedAgentRecord,
+    relay_url: &str,
+    lazy: bool,
+    owner_hex: Option<&str>,
+    replay_floor_unix: Option<u64>,
+    prepared_descriptor: Option<crate::managed_agents::readiness::EffectiveHarnessDescriptor>,
+) -> Result<crate::managed_agents::ManagedAgentProcess, String> {
     if let Some(error) = spawn_key_refusal(record) {
         return Err(error);
     }
@@ -523,15 +567,23 @@ pub fn spawn_agent_child(
     // assembling values inline.
     // Like the orphan refusal above, this runs before any side effect so a refused
     // spawn leaves no trace.
-    let descriptor =
-        crate::managed_agents::resolve_effective_harness_descriptor(record, &personas, &global)
-            .map_err(|e| {
-                format!(
-                    "cannot spawn agent {}: {}",
-                    record.pubkey,
-                    crate::managed_agents::user_facing_harness_error(&e)
-                )
-            })?;
+    let descriptor = match prepared_descriptor {
+        Some(descriptor) => descriptor,
+        None => {
+            crate::managed_agents::resolve_effective_harness_descriptor(record, &personas, &global)
+                .map_err(|e| {
+                    format!(
+                        "cannot spawn agent {}: {}",
+                        record.pubkey,
+                        crate::managed_agents::user_facing_harness_error(&e)
+                    )
+                })?
+        }
+    };
+    // The earlier async preflight may have installed a different adapter if a
+    // record, persona, or global default changed while it awaited npm. Assert
+    // the exact descriptor resolved above before creating logs or processes.
+    crate::commands::assert_bundled_adapter_ready_for_spawn(&descriptor.command)?;
     let effective_command = &descriptor.command;
     let agent_args = &descriptor.args;
 

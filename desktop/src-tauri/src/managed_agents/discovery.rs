@@ -122,7 +122,14 @@ pub(crate) fn normalize_command_identity(command: &str) -> String {
             _ => character.to_ascii_lowercase(),
         })
         .collect::<String>();
-    let lower = lower.strip_suffix(".exe").unwrap_or(&lower).to_string();
+    // npm exposes global executables as `.cmd`/`.bat` shims on Windows. Treat
+    // those wrappers as the same runtime identity as the extensionless command
+    // so start-time adapter bootstrap cannot be bypassed by the resolved shim.
+    let lower = [".exe", ".cmd", ".bat"]
+        .into_iter()
+        .find_map(|suffix| lower.strip_suffix(suffix))
+        .unwrap_or(&lower)
+        .to_string();
 
     if let Some(suffix) = std::env::consts::EXE_SUFFIX.strip_prefix('.') {
         return lower

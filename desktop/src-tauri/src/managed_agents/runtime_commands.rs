@@ -6,10 +6,10 @@ use super::{
     agent_readiness, append_log_marker, current_instance_id, find_managed_agent_mut,
     load_global_agent_config, load_managed_agents, load_personas, managed_agent_runtime_log_path,
     process_is_running, record_agent_command, resolve_effective_agent_env, save_managed_agents,
-    spawn_agent_child, terminate_process, terminate_untracked_pair_runtime,
-    write_agent_runtime_receipt, AgentReadiness, BackendKind, ManagedAgentPairRuntime,
-    ManagedAgentRuntimeKey, ManagedAgentRuntimeLifecycle, ManagedAgentRuntimeReceipt,
-    ManagedAgentRuntimeStatus,
+    spawn_agent_child, spawn_agent_child_with_harness_descriptor, terminate_process,
+    terminate_untracked_pair_runtime, write_agent_runtime_receipt, AgentReadiness, BackendKind,
+    ManagedAgentPairRuntime, ManagedAgentRuntimeKey, ManagedAgentRuntimeLifecycle,
+    ManagedAgentRuntimeReceipt, ManagedAgentRuntimeStatus,
 };
 use crate::app_state::AppState;
 
@@ -408,18 +408,196 @@ pub async fn restart_managed_agent_runtime(
     relay_url: String,
     app: AppHandle,
 ) -> Result<ManagedAgentRuntimeStatus, String> {
-    let stop_pubkey = pubkey.clone();
-    let stop_relay = relay_url.clone();
-    let stop_app = app.clone();
-    tokio::task::spawn_blocking(move || {
-        stop_managed_agent_runtime(stop_pubkey, stop_relay, stop_app)
-    })
+    let prepare_pubkey = pubkey.clone();
+    let prepare_app = app.clone();
+    restart_after_adapter_prepared(
+        async move { ensure_runtime_record_adapter(&prepare_app, &prepare_pubkey).await },
+        async move {
+            tokio::task::spawn_blocking(move || {
+                restart_pair_after_final_adapter_validation(pubkey, relay_url, app)
+            })
+            .await
+            .map_err(|error| format!("runtime restart task panicked: {error}"))?
+        },
+    )
     .await
-    .map_err(|error| format!("runtime stop task panicked: {error}"))??;
-    ensure_runtime_record_adapter(&app, &pubkey).await?;
-    tokio::task::spawn_blocking(move || start_pair(pubkey, relay_url, true, None, app))
-        .await
-        .map_err(|error| format!("runtime start task panicked: {error}"))?
+}
+
+async fn restart_after_adapter_prepared<T>(
+    prepare: impl std::future::Future<Output = Result<(), String>>,
+    replace: impl std::future::Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    prepare.await?;
+    replace.await
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RestartSequenceError<R> {
+    BeforeRetire(String),
+    AfterRetire { error: String, retired: R },
+}
+
+fn restart_after_final_validation<D, R: Clone, T>(
+    validate: impl FnOnce() -> Result<D, String>,
+    retire: impl FnOnce() -> Result<R, String>,
+    spawn: impl FnOnce(D) -> Result<T, String>,
+) -> Result<(T, R), RestartSequenceError<R>> {
+    let descriptor = validate().map_err(RestartSequenceError::BeforeRetire)?;
+    let retired = retire().map_err(RestartSequenceError::BeforeRetire)?;
+    let replacement = spawn(descriptor).map_err(|error| RestartSequenceError::AfterRetire {
+        error,
+        retired: retired.clone(),
+    })?;
+    Ok((replacement, retired))
+}
+
+fn record_failed_restart_after_retire(
+    app: &AppHandle,
+    state: &AppState,
+    record: &mut super::ManagedAgentRecord,
+    key: &ManagedAgentRuntimeKey,
+    retired: Option<Option<i32>>,
+    error: &str,
+) -> ManagedAgentRuntimeStatus {
+    super::remove_agent_runtime_receipt(app, key);
+    state.clear_agent_session_cache(key);
+    let now = crate::util::now_iso();
+    record.runtime_pid = None;
+    record.updated_at = now.clone();
+    record.last_stopped_at = Some(now);
+    record.last_exit_code = retired.flatten();
+    record.last_error = Some(error.to_string());
+    status_for(app, record, key, None, None)
+}
+
+/// Bind and validate the final harness while the old pair is still alive, then
+/// stop and spawn serially under one transition/store generation lock. Adapter
+/// or config validation failures therefore preserve the live runtime without
+/// ever overlapping two harnesses that share an identity and subscriptions.
+fn restart_pair_after_final_adapter_validation(
+    pubkey: String,
+    relay_url: String,
+    app: AppHandle,
+) -> Result<ManagedAgentRuntimeStatus, String> {
+    let state = app.state::<AppState>();
+    let _transition = state
+        .managed_agent_runtime_transition
+        .lock()
+        .map_err(|error| error.to_string())?;
+    if state.shutdown_started.load(Ordering::Acquire) {
+        return Err("desktop shutdown has started".into());
+    }
+    let _store = state
+        .managed_agents_store_lock
+        .lock()
+        .map_err(|error| error.to_string())?;
+    let mut records = load_managed_agents(&app)?;
+    let record = find_managed_agent_mut(&mut records, &pubkey)?;
+    if record.backend != BackendKind::Local {
+        return Err("managed runtime pairs require a local agent".into());
+    }
+    let key = ManagedAgentRuntimeKey::new(pubkey, &relay_url)?;
+    let owner = state
+        .keys
+        .lock()
+        .ok()
+        .map(|keys| keys.public_key().to_hex());
+
+    let mut runtimes = state
+        .managed_agent_processes
+        .lock()
+        .map_err(|error| error.to_string())?;
+    let restart = restart_after_final_validation(
+        || {
+            let personas = load_personas(&app).unwrap_or_default();
+            let global = load_global_agent_config(&app).unwrap_or_default();
+            let descriptor = super::resolve_effective_harness_descriptor(
+                record, &personas, &global,
+            )
+            .map_err(|error| {
+                format!(
+                    "cannot restart agent {}: {}",
+                    record.pubkey,
+                    super::user_facing_harness_error(&error)
+                )
+            })?;
+            crate::commands::assert_bundled_adapter_ready_for_spawn(&descriptor.command)?;
+            Ok(descriptor)
+        },
+        || {
+            if let Some(mut old) = runtimes.remove(&key) {
+                let result = if process_is_running(old.child.id()) {
+                    terminate_process(old.child.id())
+                } else {
+                    Ok(())
+                }
+                .and_then(|()| old.child.wait().map_err(|error| error.to_string()));
+                return match result {
+                    Ok(status) => Ok(Some(status.code())),
+                    Err(error) => {
+                        runtimes.insert(key.clone(), old);
+                        Err(error)
+                    }
+                };
+            }
+            terminate_untracked_pair_runtime(&app, &key)?;
+            Ok(None)
+        },
+        |descriptor| {
+            spawn_agent_child_with_harness_descriptor(
+                &app,
+                record,
+                &key.relay_url,
+                true,
+                owner.as_deref(),
+                None,
+                descriptor,
+            )
+        },
+    );
+    let (mut replacement, old_exit) = match restart {
+        Ok(result) => result,
+        Err(RestartSequenceError::BeforeRetire(error)) => return Err(error),
+        Err(RestartSequenceError::AfterRetire { error, retired }) => {
+            let status =
+                record_failed_restart_after_retire(&app, &state, record, &key, retired, &error);
+            drop(runtimes);
+            save_managed_agents(&app, &records)?;
+            emit_status(&app, &status);
+            return Err(error);
+        }
+    };
+
+    let now = crate::util::now_iso();
+    let receipt = ManagedAgentRuntimeReceipt {
+        key: key.clone(),
+        pid: replacement.child.id(),
+        desktop_instance_id: current_instance_id(&app),
+        started_at: now.clone(),
+    };
+    if let Err(error) = write_agent_runtime_receipt(&app, &receipt) {
+        let _ = terminate_process(replacement.child.id());
+        let _ = replacement.child.wait();
+        let status =
+            record_failed_restart_after_retire(&app, &state, record, &key, old_exit, &error);
+        drop(runtimes);
+        save_managed_agents(&app, &records)?;
+        emit_status(&app, &status);
+        return Err(error);
+    }
+    state.clear_agent_session_cache(&key);
+    record.runtime_pid = None;
+    record.updated_at = now.clone();
+    record.last_started_at = Some(now);
+    record.last_stopped_at = None;
+    record.last_exit_code = old_exit.flatten();
+    record.last_error = None;
+    runtimes.insert(key.clone(), ManagedAgentPairRuntime::starting(replacement));
+    let status = status_for(&app, record, &key, runtimes.get(&key), None);
+    drop(runtimes);
+    save_managed_agents(&app, &records)?;
+    emit_status(&app, &status);
+    Ok(status)
 }
 
 /// Probe whether this agent can operate on `requested_relay_url`.
@@ -657,6 +835,78 @@ mod tests {
         }
 
         assert_async_command(list_managed_agent_runtimes);
+    }
+
+    #[tokio::test]
+    async fn restart_prepares_adapter_before_stopping_live_runtime() {
+        use std::sync::{Arc, Mutex};
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let result = restart_after_adapter_prepared(
+            {
+                let calls = Arc::clone(&calls);
+                async move {
+                    calls.lock().unwrap().push("prepare");
+                    Err("adapter install failed".to_string())
+                }
+            },
+            {
+                let calls = Arc::clone(&calls);
+                async move {
+                    calls.lock().unwrap().push("replace");
+                    Ok(())
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(result, Err("adapter install failed".to_string()));
+        assert_eq!(*calls.lock().unwrap(), ["prepare"]);
+    }
+
+    #[test]
+    fn final_config_failure_does_not_retire_or_spawn() {
+        use std::cell::Cell;
+
+        let retired = Cell::new(false);
+        let spawned = Cell::new(false);
+        let result = restart_after_final_validation(
+            || Err::<(), _>("final adapter is not ready".to_string()),
+            || {
+                retired.set(true);
+                Ok(())
+            },
+            |_| {
+                spawned.set(true);
+                Ok(())
+            },
+        );
+
+        assert_eq!(
+            result,
+            Err(RestartSequenceError::BeforeRetire(
+                "final adapter is not ready".to_string()
+            ))
+        );
+        assert!(!retired.get());
+        assert!(!spawned.get());
+    }
+
+    #[test]
+    fn post_retire_spawn_failure_carries_retirement_receipt() {
+        let result = restart_after_final_validation(
+            || Ok(()),
+            || Ok(Some(Some(17))),
+            |_| Err::<(), _>("replacement spawn failed".to_string()),
+        );
+
+        assert_eq!(
+            result,
+            Err(RestartSequenceError::AfterRetire {
+                error: "replacement spawn failed".to_string(),
+                retired: Some(Some(17)),
+            })
+        );
     }
 
     fn payload(

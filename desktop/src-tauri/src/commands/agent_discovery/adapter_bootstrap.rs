@@ -226,6 +226,34 @@ fn bundled_adapter_runtime_id(effective_command: &str) -> Option<&'static str> {
         .filter(|runtime_id| BUNDLED_RUNTIME_IDS.contains(runtime_id))
 }
 
+/// Last, synchronous safety check at the shared spawn boundary. The effective
+/// harness may change while an earlier asynchronous install is running; this
+/// assertion evaluates the exact descriptor the child will use and refuses an
+/// unprepared pinned adapter before any process or log side effect. It never
+/// installs or performs network I/O, so callers may hold transition/store locks.
+pub(crate) fn assert_bundled_adapter_ready_for_spawn(
+    effective_command: &str,
+) -> Result<(), String> {
+    assert_bundled_adapter_ready_with(effective_command, bundled_adapter_is_ready)
+}
+
+fn assert_bundled_adapter_ready_with(
+    effective_command: &str,
+    ready: impl FnOnce(&'static KnownAcpRuntime) -> bool,
+) -> Result<(), String> {
+    let Some(runtime_id) = bundled_adapter_runtime_id(effective_command) else {
+        return Ok(());
+    };
+    let runtime = crate::managed_agents::known_acp_runtime_exact(runtime_id)
+        .ok_or_else(|| format!("unknown bundled ACP runtime: {runtime_id}"))?;
+    if ready(runtime) {
+        return Ok(());
+    }
+    Err(format!(
+        "the pinned {runtime_id} ACP adapter is not ready for the final agent configuration; retry Start to prepare it"
+    ))
+}
+
 fn ensure_bundled_adapter_blocking(
     app: &tauri::AppHandle,
     runtime_id: &'static str,
@@ -355,5 +383,17 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn final_spawn_refuses_runtime_selected_during_async_preflight() {
+        assert!(assert_bundled_adapter_ready_with("goose", |_| {
+            panic!("non-bundled runtimes need no pinned-adapter assertion")
+        })
+        .is_ok());
+        let error = assert_bundled_adapter_ready_with("claude-agent-acp", |_| false)
+            .expect_err("an unprepared final runtime must not spawn");
+        assert!(error.contains("final agent configuration"));
+        assert!(error.contains("retry Start"));
     }
 }

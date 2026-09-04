@@ -107,6 +107,18 @@ fn codex_has_mcp_command() {
 }
 
 #[test]
+fn npm_windows_wrappers_resolve_to_pinned_runtimes() {
+    assert_eq!(
+        known_acp_runtime(r"C:\Tools\codex-acp.cmd").map(|r| r.id),
+        Some("codex")
+    );
+    assert_eq!(
+        known_acp_runtime(r"C:\Tools\claude-agent-acp.bat").map(|r| r.id),
+        Some("claude")
+    );
+}
+
+#[test]
 fn goose_has_no_mcp_hooks() {
     let p = known_acp_runtime("goose").expect("should resolve");
     assert!(!p.mcp_hooks);
@@ -588,9 +600,8 @@ fn name_matches_interpreter_rejects_node_prefix() {
 fn codex_spawn_without_verified_bundle_fails_and_strips_ambient_cli_paths() {
     let mut command = std::process::Command::new("buzz-acp");
     command.env("CODEX_PATH", "/tmp/ambient-codex");
-    let error =
-        super::configure_runtime_cli(&mut command, super::known_acp_runtime("codex-acp"))
-            .unwrap_err();
+    let error = super::configure_runtime_cli(&mut command, super::known_acp_runtime("codex-acp"))
+        .unwrap_err();
     assert!(error.contains("unavailable"), "{error}");
     assert_eq!(
         command

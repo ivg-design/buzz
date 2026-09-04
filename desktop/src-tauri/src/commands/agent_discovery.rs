@@ -10,7 +10,8 @@ mod forced_single_flight;
 mod post_install_verification;
 use adapter_bootstrap::{acquire_install_guard, install_adapter_if_needed};
 pub(crate) use adapter_bootstrap::{
-    ensure_record_bundled_adapter_for_start, ensure_records_bundled_adapters_for_start,
+    assert_bundled_adapter_ready_for_spawn, ensure_record_bundled_adapter_for_start,
+    ensure_records_bundled_adapters_for_start,
 };
 
 /// Returns the adapter install commands that `install_acp_runtime_blocking` would

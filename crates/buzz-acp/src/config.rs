@@ -116,7 +116,8 @@ impl std::fmt::Display for RespondTo {
 ///
 /// - `default` — agent's built-in behaviour (permission requests per tool call).
 /// - `acceptEdits` — auto-approve file edits, still ask for other tools.
-/// - `bypassPermissions` — skip the permission flow entirely.
+/// - `bypassPermissions` — unrestricted mode: Claude uses
+///   `bypassPermissions`; Codex uses `agent-full-access`.
 /// - `dontAsk` — never prompt; reject anything that would require permission.
 /// - `plan` — planning-only mode (no tool execution).
 #[derive(Debug, Clone, Copy, PartialEq, clap::ValueEnum)]
@@ -132,7 +133,7 @@ pub enum PermissionMode {
     /// Auto-approve file edits, still ask for other tools.
     #[value(alias = "acceptEdits")]
     AcceptEdits,
-    /// Skip the permission flow entirely.
+    /// Use the provider's unrestricted permission and sandbox mode.
     #[value(alias = "bypassPermissions")]
     BypassPermissions,
     /// Never prompt; reject anything that would require permission.
@@ -161,6 +162,21 @@ impl PermissionMode {
     /// therefore doesn't need to be explicitly set.
     pub fn is_default(&self) -> bool {
         matches!(self, Self::Default)
+    }
+
+    /// Provider-native ACP mode IDs that implement this saved preference.
+    /// Claude exposes `bypassPermissions`; Codex exposes the equivalent
+    /// `agent-full-access` mode (approval policy `never`, danger-full-access
+    /// sandbox). The adapter must advertise the selected ID before use.
+    pub fn provider_wire_modes(&self) -> &'static [&'static str] {
+        match self {
+            Self::Default => &[],
+            Self::Auto => &["auto"],
+            Self::AcceptEdits => &["acceptEdits"],
+            Self::BypassPermissions => &["bypassPermissions", "agent-full-access"],
+            Self::DontAsk => &["dontAsk"],
+            Self::Plan => &["plan"],
+        }
     }
 }
 
@@ -473,9 +489,9 @@ pub struct CliArgs {
     /// Permission mode for agents that support `session/set_config_option`
     /// with `configId: "mode"` (e.g. `claude-agent-acp`).
     ///
-    /// Defaults to `bypassPermissions` which skips the per-tool-call
-    /// permission flow. Set to `default` to restore the agent's built-in
-    /// behaviour.
+    /// Defaults to unrestricted execution (`bypassPermissions` for Claude,
+    /// `agent-full-access` for Codex). Set to `default` to restore the agent's
+    /// built-in behaviour.
     #[arg(
         long,
         env = "BUZZ_ACP_PERMISSION_MODE",
@@ -2745,6 +2761,15 @@ channels = "ALL"
         assert!(!PermissionMode::AcceptEdits.is_default());
         assert!(!PermissionMode::DontAsk.is_default());
         assert!(!PermissionMode::Plan.is_default());
+    }
+
+    #[test]
+    fn test_bypass_permission_mode_has_claude_and_codex_native_ids() {
+        assert_eq!(
+            PermissionMode::BypassPermissions.provider_wire_modes(),
+            &["bypassPermissions", "agent-full-access"]
+        );
+        assert!(PermissionMode::Default.provider_wire_modes().is_empty());
     }
 
     #[test]

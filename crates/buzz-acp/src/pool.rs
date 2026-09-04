@@ -1719,6 +1719,19 @@ async fn create_session_and_apply_model_at(
     let effort_snapshot = post_switch_snapshot.as_ref().unwrap_or(&resp.raw);
     let effort_outcome = apply_startup_effort(agent, effort_snapshot, &resp.session_id).await?;
 
+    // Resolve the saved autonomy preference to an adapter-native ACP mode.
+    // Claude calls unrestricted execution `bypassPermissions`; Codex calls
+    // the equivalent mode `agent-full-access`. Apply it to every managed
+    // session, including one-shot workers. Their typed MCP authorization,
+    // signer isolation, and immutable job ownership remain separate bounds.
+    let applied_permission_mode = match resolve_permission_mode(&ctx.permission_mode, &resp.raw)? {
+        Some(wire) => Some((
+            wire,
+            apply_permission_mode(&mut agent.acp, &resp.session_id, wire).await?,
+        )),
+        None => None,
+    };
+
     // Emit session config for desktop consumption (config bridge tier 1b).
     // Emitted AFTER desired_model resolution so the desktop caches the
     // post-switch state. modelOverridden reflects whether the switch actually
@@ -1732,20 +1745,37 @@ async fn create_session_and_apply_model_at(
     // value the session is actually running. A rejected effort or a model with
     // no `thought_level` option leaves the snapshot untouched.
     let config_options_for_cache = {
-        let mut opts = effort_snapshot
-            .get("configOptions")
+        let mut opts = applied_permission_mode
+            .as_ref()
+            .and_then(|(_, application)| application.response.get("configOptions"))
+            .or_else(|| effort_snapshot.get("configOptions"))
             .cloned()
             .unwrap_or(serde_json::Value::Null);
         if let Some(StartupEffortOutcome::Applied { config_id, value }) = &effort_outcome {
             patch_config_option_current_value(&mut opts, config_id, value);
         }
+        if let Some((wire, _)) = &applied_permission_mode {
+            patch_config_option_current_value(&mut opts, "mode", wire);
+        }
         opts
+    };
+    let modes_for_cache = {
+        let mut modes = applied_permission_mode
+            .as_ref()
+            .and_then(|(_, application)| application.response.get("modes"))
+            .or_else(|| resp.raw.get("modes"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        if let Some((wire, _)) = &applied_permission_mode {
+            patch_session_mode_current_value(&mut modes, wire);
+        }
+        modes
     };
     agent.acp.observe(
         "session_config_captured",
         serde_json::json!({
             "configOptions": config_options_for_cache,
-            "modes": resp.raw.get("modes").cloned().unwrap_or(serde_json::Value::Null),
+            "modes": modes_for_cache,
             // `models` must come from the SAME snapshot as configOptions — the
             // post-switch snapshot on a successful switch, session/new otherwise.
             // Taking it from `resp.raw` here would emit the target model's option
@@ -1755,19 +1785,19 @@ async fn create_session_and_apply_model_at(
             // than falling back to the pre-switch `resp.raw.models`.
             "models": effort_snapshot.get("models").cloned().unwrap_or(serde_json::Value::Null),
             "modelOverridden": agent.model_overridden && switch_succeeded,
+            "permissionMode": applied_permission_mode.as_ref().map(|(wire, application)| serde_json::json!({
+                "requested": wire,
+                "status": if application.independently_verified {
+                    "verified"
+                } else {
+                    "accepted_unverified"
+                },
+            })),
             // Pair identity for the desktop session-config cache, which is
             // keyed by (agent, relay) like the lifecycle frames.
             "relayUrl": ctx.relay_url,
         }),
     );
-
-    // Apply permission mode if not the agent's built-in default AND the agent
-    // advertises the requested mode in session/new. Agents that don't support
-    // the mode (e.g., goose crashes on unrecognized set_config_option values)
-    // are safely skipped — the harness auto-approves via handle_permission_request.
-    if should_apply_permission_mode(channel.scope, &ctx.permission_mode, &resp.raw) {
-        apply_permission_mode(&mut agent.acp, &resp.session_id, &ctx.permission_mode).await?;
-    }
 
     if let Some((scope, session)) = trusted_mcp {
         agent.state.trusted_mcp.insert(scope, session);
@@ -1820,14 +1850,30 @@ fn mcp_servers_for_scope(
     }
 }
 
-fn should_apply_permission_mode(
-    scope: Option<&SessionScope>,
+fn resolve_permission_mode(
     permission_mode: &PermissionMode,
     session_new: &serde_json::Value,
-) -> bool {
-    !scope.is_some_and(SessionScope::is_job)
-        && !permission_mode.is_default()
-        && agent_supports_mode(session_new, permission_mode.as_wire_str())
+) -> Result<Option<&'static str>, AcpError> {
+    if permission_mode.is_default() {
+        return Ok(None);
+    }
+    permission_mode
+        .provider_wire_modes()
+        .iter()
+        .copied()
+        .find(|wire| agent_supports_mode(session_new, wire))
+        .map(Some)
+        .ok_or_else(|| {
+            let available = advertised_agent_modes(session_new);
+            AcpError::Protocol(format!(
+                "configured permission mode {permission_mode} is unsupported by this agent; advertised modes: {}",
+                if available.is_empty() {
+                    "none".to_owned()
+                } else {
+                    available.join(", ")
+                }
+            ))
+        })
 }
 
 fn should_send_initial_message(source: &PromptSource, is_new_session: bool) -> bool {
@@ -2047,13 +2093,7 @@ fn patch_config_option_current_value(
     }
 }
 
-/// Set the session permission mode via `session/set_config_option`.
-///
-/// Non-fatal for most errors: logs and proceeds. The agent falls back
-/// to its default permission mode (`"default"`), which still works via
-/// Check if the agent's `session/new` response advertises a given mode ID
-/// in `result.modes.availableModes[].id`. Returns `false` if the modes
-/// field is absent or the mode isn't listed.
+/// Check if `session/new` advertised a provider-native mode ID.
 fn agent_supports_mode(session_new_result: &serde_json::Value, mode_wire: &str) -> bool {
     session_new_result
         .get("modes")
@@ -2067,16 +2107,67 @@ fn agent_supports_mode(session_new_result: &serde_json::Value, mode_wire: &str) 
         .unwrap_or(false)
 }
 
-/// per-tool auto-approval in `handle_permission_request`.
-///
-/// **Fatal exception:** if the agent process exits (e.g., goose crashes on
-/// unrecognized methods), returns `Err(AgentExited)` so the caller can respawn.
+fn advertised_agent_modes(session_new_result: &serde_json::Value) -> Vec<&str> {
+    session_new_result
+        .get("modes")
+        .and_then(|m| m.get("availableModes"))
+        .and_then(|modes| modes.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|mode| mode.get("id").and_then(|id| id.as_str()))
+        .collect()
+}
+
+#[derive(Debug)]
+struct PermissionModeApplication {
+    response: serde_json::Value,
+    independently_verified: bool,
+}
+
+/// Reject a successful mode RPC if the adapter explicitly reports a different
+/// effective mode. Some adapters return `{}` on success; that is an accepted
+/// ACP operation, but is recorded separately from an independently verified
+/// state echo.
+fn verify_permission_mode_response(
+    response: &serde_json::Value,
+    requested: &str,
+) -> Result<bool, AcpError> {
+    let mode_from_state = response
+        .pointer("/modes/currentModeId")
+        .and_then(serde_json::Value::as_str);
+    let mode_from_options = response
+        .get("configOptions")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|option| {
+            option.get("category").and_then(serde_json::Value::as_str) == Some("mode")
+                || option.get("configId").and_then(serde_json::Value::as_str) == Some("mode")
+                || option.get("id").and_then(serde_json::Value::as_str) == Some("mode")
+        })
+        .filter_map(|option| {
+            option
+                .get("currentValue")
+                .and_then(serde_json::Value::as_str)
+        });
+    let reported: Vec<&str> = mode_from_state
+        .into_iter()
+        .chain(mode_from_options)
+        .collect();
+    if let Some(actual) = reported.iter().copied().find(|actual| *actual != requested) {
+        return Err(AcpError::Protocol(format!(
+            "adapter accepted permission mode {requested:?} but reported effective mode {actual:?}"
+        )));
+    }
+    Ok(!reported.is_empty())
+}
+
+/// Set and require the provider-native permission mode for this session.
 async fn apply_permission_mode(
     acp: &mut AcpClient,
     session_id: &str,
-    mode: &PermissionMode,
-) -> Result<(), AcpError> {
-    let wire = mode.as_wire_str();
+    wire: &str,
+) -> Result<PermissionModeApplication, AcpError> {
     let result = tokio::time::timeout(PERMISSION_MODE_TIMEOUT, async {
         acp.session_set_config_option(session_id, "mode", wire)
             .await
@@ -2084,11 +2175,23 @@ async fn apply_permission_mode(
     .await;
 
     match result {
-        Ok(Ok(_)) => {
-            tracing::info!(
-                target: "pool::permission",
-                "applied permission mode {wire:?} on session {session_id}"
-            );
+        Ok(Ok(response)) => {
+            let independently_verified = verify_permission_mode_response(&response, wire)?;
+            if independently_verified {
+                tracing::info!(
+                    target: "pool::permission",
+                    "applied and verified permission mode {wire:?} on session {session_id}"
+                );
+            } else {
+                tracing::info!(
+                    target: "pool::permission",
+                    "adapter accepted permission mode {wire:?} on session {session_id} without echoing effective state"
+                );
+            }
+            Ok(PermissionModeApplication {
+                response,
+                independently_verified,
+            })
         }
         // Transport-class errors may have corrupted the stdio stream — propagate
         // so the caller can respawn the agent.
@@ -2101,14 +2204,16 @@ async fn apply_permission_mode(
                 target: "pool::permission",
                 "fatal error setting permission mode {wire:?}: {e}"
             );
-            return Err(e);
+            Err(e)
         }
-        // Application-level errors — agent is fine, just uses default permission mode.
+        // A rejected provider-native mode would silently restore the adapter's
+        // default approval/sandbox behavior, so fail session creation visibly.
         Ok(Err(e)) => {
-            tracing::warn!(
+            tracing::error!(
                 target: "pool::permission",
-                "failed to set permission mode {wire:?}: {e} — falling back to per-tool auto-approval"
+                "failed to set permission mode {wire:?}: {e}"
             );
+            Err(e)
         }
         Err(_) => {
             // Outer timeout fired — stream may be in unknown state.
@@ -2116,10 +2221,15 @@ async fn apply_permission_mode(
                 target: "pool::permission",
                 "permission mode set timed out ({PERMISSION_MODE_TIMEOUT:?}) — treating as fatal"
             );
-            return Err(AcpError::Timeout(PERMISSION_MODE_TIMEOUT));
+            Err(AcpError::Timeout(PERMISSION_MODE_TIMEOUT))
         }
     }
-    Ok(())
+}
+
+fn patch_session_mode_current_value(modes: &mut serde_json::Value, value: &str) {
+    if modes.is_object() {
+        modes["currentModeId"] = serde_json::Value::String(value.to_owned());
+    }
 }
 
 /// Prepend a legacy agent's standing context to a user-message body.
@@ -5805,9 +5915,8 @@ mod tests {
         );
     }
 
-    // MINOR (#2884): the permission-mode RPC is gated on agent_supports_mode.
-    // An advertised mode issues set_config_option; an absent one is skipped so
-    // the harness falls back to per-tool auto-approval. Pin both edges directly.
+    // Permission-mode selection is provider-aware and fail-closed: Claude and
+    // Codex use different native IDs for the requested unrestricted mode.
     #[test]
     fn agent_supports_mode_advertised_auto_is_true() {
         let session_new = json!({
@@ -5840,25 +5949,110 @@ mod tests {
     }
 
     #[test]
-    fn job_session_skips_global_permission_mode_even_when_advertised() {
-        let scope = SessionScope::Job {
-            channel_id: Uuid::new_v4(),
-            operation_id: Uuid::new_v4().to_string(),
-            request_event_id: "a".repeat(64),
-        };
+    fn unrestricted_mode_resolves_to_claude_native_id() {
         let session_new = json!({
-            "modes": {"availableModes": [{"id": "bypassPermissions"}]}
+            "modes": {"availableModes": [{"id": "default"}, {"id": "bypassPermissions"}]}
         });
-        assert!(!should_apply_permission_mode(
-            Some(&scope),
-            &PermissionMode::BypassPermissions,
-            &session_new,
-        ));
-        assert!(should_apply_permission_mode(
-            Some(&conv(Uuid::new_v4())),
-            &PermissionMode::BypassPermissions,
-            &session_new,
-        ));
+        assert_eq!(
+            resolve_permission_mode(&PermissionMode::BypassPermissions, &session_new).unwrap(),
+            Some("bypassPermissions")
+        );
+    }
+
+    #[test]
+    fn unrestricted_mode_resolves_to_codex_full_access_and_updates_capture() {
+        let session_new = json!({
+            "modes": {
+                "availableModes": [
+                    {"id": "read-only"},
+                    {"id": "agent"},
+                    {"id": "agent-full-access"}
+                ],
+                "currentModeId": "agent"
+            }
+        });
+        let resolved = resolve_permission_mode(&PermissionMode::BypassPermissions, &session_new)
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved, "agent-full-access");
+        let mut captured = session_new["modes"].clone();
+        patch_session_mode_current_value(&mut captured, resolved);
+        assert_eq!(captured["currentModeId"], "agent-full-access");
+    }
+
+    #[test]
+    fn unsupported_permission_mode_fails_session_creation_visibly() {
+        let session_new = json!({
+            "modes": {"availableModes": [{"id": "default"}, {"id": "agent"}]}
+        });
+        let error = resolve_permission_mode(&PermissionMode::BypassPermissions, &session_new)
+            .expect_err("unsupported mode must not silently fall back");
+        assert!(error
+            .to_string()
+            .contains("advertised modes: default, agent"));
+    }
+
+    async fn spawn_permission_mode_acp(reply: &str) -> AcpClient {
+        let script = format!(
+            r#"IFS= read -r _request
+printf '%s\n' '{{"jsonrpc":"2.0","id":0,{reply}}}'
+while IFS= read -r _line; do :; done"#
+        );
+        AcpClient::spawn("bash", &["-c".to_string(), script], &[], false)
+            .await
+            .expect("spawn permission-mode ACP script")
+    }
+
+    #[tokio::test]
+    async fn permission_mode_rpc_uses_codex_full_access_and_verifies_echo() {
+        let reply = r#""result":{"configOptions":[{"id":"mode","category":"mode","currentValue":"agent-full-access"}]}"#;
+        let mut acp = spawn_permission_mode_acp(reply).await;
+        let observer = observer::ObserverHandle::in_process();
+        acp.set_observer(Some(observer.clone()), 0);
+
+        let applied = apply_permission_mode(&mut acp, "sess-1", "agent-full-access")
+            .await
+            .expect("matching effective mode must be accepted");
+        assert!(applied.independently_verified);
+        let request = observer
+            .snapshot()
+            .into_iter()
+            .find(|event| {
+                event.kind == "acp_write" && event.payload["method"] == "session/set_config_option"
+            })
+            .expect("mode request was sent");
+        assert_eq!(request.payload["params"]["configId"], "mode");
+        assert_eq!(request.payload["params"]["value"], "agent-full-access");
+        acp.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn permission_mode_rpc_rejects_explicit_effective_mode_mismatch() {
+        let reply = r#""result":{"configOptions":[{"id":"mode","category":"mode","currentValue":"agent"}]}"#;
+        let mut acp = spawn_permission_mode_acp(reply).await;
+        let error = apply_permission_mode(&mut acp, "sess-1", "agent-full-access")
+            .await
+            .expect_err("an explicit adapter mismatch must fail session creation");
+        assert!(error
+            .to_string()
+            .contains("reported effective mode \"agent\""));
+        acp.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn permission_mode_rpc_rejection_is_fatal() {
+        let reply = r#""error":{"code":-32602,"message":"mode rejected"}"#;
+        let mut acp = spawn_permission_mode_acp(reply).await;
+        let error = apply_permission_mode(&mut acp, "sess-1", "agent-full-access")
+            .await
+            .expect_err("a rejected mode must not silently use adapter defaults");
+        assert!(error.to_string().contains("mode rejected"));
+        acp.shutdown().await;
+    }
+
+    #[test]
+    fn empty_mode_response_is_accepted_but_not_independently_verified() {
+        assert!(!verify_permission_mode_response(&json!({}), "bypassPermissions").unwrap());
     }
 
     #[test]

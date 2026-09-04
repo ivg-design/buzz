@@ -13,6 +13,17 @@ pub struct PromptProjectInfo {
     pub coordinate: String,
     pub default_repo_owner: Option<String>,
     pub default_repo_id: Option<String>,
+    /// Clone URLs asserted by the authoritative default repository event.
+    ///
+    /// These remain data until a local checkout resolver validates one against
+    /// the checkout's actual `origin`; they must never be treated as a path.
+    pub default_repo_clone_urls: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct AuthoritativeRepo {
+    maintainers: Vec<String>,
+    clone_urls: Vec<String>,
 }
 
 /// Resolve one listed project whose member repository authoritatively binds the channel.
@@ -41,16 +52,19 @@ pub fn pick_authoritative_project_home(
             .filter(|tag| tag.first().and_then(Value::as_str) == Some("a"))
             .filter_map(|tag| tag.get(1).and_then(Value::as_str))
             .filter_map(parse_repo_coord)
-            .find(|(owner, id)| {
-                repos
-                    .get(&(owner.clone(), id.clone()))
-                    .is_some_and(|maintainers| {
-                        owner.eq_ignore_ascii_case(signer)
-                            || maintainers.iter().any(|m| m.eq_ignore_ascii_case(signer))
-                    })
+            .find_map(|(owner, id)| {
+                repos.get(&(owner.clone(), id.clone())).and_then(|repo| {
+                    let authorized = owner.eq_ignore_ascii_case(signer)
+                        || repo
+                            .maintainers
+                            .iter()
+                            .any(|m| m.eq_ignore_ascii_case(signer));
+                    authorized.then(|| (owner, id, repo.clone()))
+                })
             })?;
         project.default_repo_owner = Some(authoritative_member.0);
         project.default_repo_id = Some(authoritative_member.1);
+        project.default_repo_clone_urls = authoritative_member.2.clone_urls;
         Some(project)
     });
     let home = matches.next()?;
@@ -60,7 +74,7 @@ pub fn pick_authoritative_project_home(
 fn authoritative_channel_repos(
     events: &[Value],
     channel_id: &str,
-) -> HashMap<(String, String), Vec<String>> {
+) -> HashMap<(String, String), AuthoritativeRepo> {
     events
         .iter()
         .filter_map(|event| {
@@ -81,7 +95,18 @@ fn authoritative_channel_repos(
             let maintainers = multi_tag_values(event, "maintainers")
                 .map(str::to_ascii_lowercase)
                 .collect();
-            Some(((owner, id.to_string()), maintainers))
+            let clone_urls = multi_tag_values(event, "clone")
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect();
+            Some((
+                (owner, id.to_string()),
+                AuthoritativeRepo {
+                    maintainers,
+                    clone_urls,
+                },
+            ))
         })
         .collect()
 }
@@ -144,6 +169,7 @@ fn parse_prompt_project(event: &Value) -> Option<PromptProjectInfo> {
         owner,
         default_repo_owner: None,
         default_repo_id: None,
+        default_repo_clone_urls: Vec::new(),
     })
 }
 
@@ -183,11 +209,27 @@ mod tests {
         let coord = format!("30617:{owner}:game");
         let home = pick_authoritative_project_home(
             &[project(&owner, "game", &coord)],
-            &[repo(&owner, "game", CHANNEL_ID, vec![])],
+            &[repo(
+                &owner,
+                "game",
+                CHANNEL_ID,
+                vec![json!([
+                    "clone",
+                    "https://github.com/example/game.git",
+                    "https://github.com/example/game"
+                ])],
+            )],
             CHANNEL_ID,
         )
         .unwrap();
         assert_eq!(home.default_repo_id.as_deref(), Some("game"));
+        assert_eq!(
+            home.default_repo_clone_urls,
+            vec![
+                "https://github.com/example/game.git",
+                "https://github.com/example/game"
+            ]
+        );
 
         assert!(pick_authoritative_project_home(
             &[project(&owner, "game", &coord)],

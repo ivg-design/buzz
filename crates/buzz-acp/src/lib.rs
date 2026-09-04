@@ -9,6 +9,7 @@ mod job_runtime;
 mod observer;
 mod pool;
 mod pool_lifecycle;
+mod project_preload;
 mod prompt_framing;
 mod prompt_project;
 mod queue;

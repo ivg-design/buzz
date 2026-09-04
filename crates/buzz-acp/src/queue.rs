@@ -6618,6 +6618,7 @@ mod tests {
                 coordinate: format!("30621:{owner}:space-invaders-3d"),
                 default_repo_owner: None,
                 default_repo_id: None,
+                default_repo_clone_urls: Vec::new(),
             }),
         };
         let mut s =
@@ -6655,6 +6656,7 @@ mod tests {
                 coordinate: format!("30621:{owner}:space-invaders-3d"),
                 default_repo_owner: Some(owner.clone()),
                 default_repo_id: Some("space-invaders-3d".into()),
+                default_repo_clone_urls: vec!["https://github.com/example/space-invaders-3d".into()],
             }),
         };
         let prompt = format_prompt(

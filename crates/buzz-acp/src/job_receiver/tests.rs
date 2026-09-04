@@ -134,6 +134,7 @@ pub(super) fn project(request: &JobRequest) -> PromptProjectInfo {
         coordinate: request.common.project.address.clone(),
         default_repo_owner: Some(request.common.sender_pubkey.clone()),
         default_repo_id: Some("nemo".into()),
+        default_repo_clone_urls: vec![request.common.repository.canonical.clone()],
     }
 }
 

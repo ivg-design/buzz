@@ -21,6 +21,7 @@
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -1286,13 +1287,14 @@ async fn create_session_and_apply_model(
     agent_core: Option<&str>,
     channel: NewSessionChannelContext<'_>,
 ) -> Result<String, AcpError> {
-    create_session_and_apply_model_at(agent, ctx, &ctx.cwd, agent_core, channel).await
+    create_session_and_apply_model_at(agent, ctx, &ctx.cwd, None, agent_core, channel).await
 }
 
 async fn create_session_and_apply_model_at(
     agent: &mut OwnedAgent,
     ctx: &PromptContext,
     working_directory: &str,
+    project_instructions: Option<&str>,
     agent_core: Option<&str>,
     channel: NewSessionChannelContext<'_>,
 ) -> Result<String, AcpError> {
@@ -1306,13 +1308,16 @@ async fn create_session_and_apply_model_at(
     let combined_system_prompt = with_canvas(
         with_huddle_instructions(
             with_core(
-                with_team(
-                    framed_system_prompt(
-                        working_directory,
-                        ctx.base_prompt.as_deref(),
-                        ctx.system_prompt.as_deref(),
+                with_project_instructions(
+                    with_team(
+                        framed_system_prompt(
+                            working_directory,
+                            ctx.base_prompt.as_deref(),
+                            ctx.system_prompt.as_deref(),
+                        ),
+                        ctx.team_instructions.as_deref(),
                     ),
-                    ctx.team_instructions.as_deref(),
+                    project_instructions,
                 ),
                 agent_core,
             ),
@@ -1981,6 +1986,48 @@ fn with_team(prompt: Option<String>, instructions: Option<&str>) -> Option<Strin
     }
 }
 
+/// Append repository-owned Project instructions after team instructions and
+/// before core memory.
+fn with_project_instructions(prompt: Option<String>, instructions: Option<&str>) -> Option<String> {
+    let instructions = instructions
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    match (prompt, instructions) {
+        (Some(prompt), Some(instructions)) => Some(format!(
+            "{prompt}\n\n{}",
+            crate::prompt_framing::semantic_section("project-instructions", instructions)
+        )),
+        (None, Some(instructions)) => Some(crate::prompt_framing::semantic_section(
+            "project-instructions",
+            instructions,
+        )),
+        (Some(prompt), None) => Some(prompt),
+        (None, None) => None,
+    }
+}
+
+/// Legacy agents receive standing context in the first user message. Preserve
+/// Project provenance in an explicit heading inside the existing team slot.
+fn legacy_team_with_project(
+    team_instructions: Option<&str>,
+    project_instructions: Option<&str>,
+) -> Option<String> {
+    let team = team_instructions
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let project = project_instructions
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    match (team, project) {
+        (Some(team), Some(project)) => {
+            Some(format!("{team}\n\n# Project Instructions\n\n{project}"))
+        }
+        (Some(team), None) => Some(team.to_string()),
+        (None, Some(project)) => Some(format!("# Project Instructions\n\n{project}")),
+        (None, None) => None,
+    }
+}
+
 /// Append the agent's core memory section onto the framed system prompt.
 ///
 /// Core already carries its own `<core-memory>` boundary from
@@ -2117,10 +2164,6 @@ pub async fn run_prompt_task(
         Some(b) => PromptSource::Channel(b.scope.clone()),
         None => PromptSource::Heartbeat,
     };
-    let session_working_directory = match (&source, job_working_directory.as_deref()) {
-        (PromptSource::Channel(scope), Some(path)) if scope.is_job() => path,
-        _ => &ctx.cwd,
-    };
     if ctx.trusted_mcp_factory.is_some() && agent.acp.http_mcp_supported() {
         if let PromptSource::Channel(scope) = &source {
             let required = ctx
@@ -2235,6 +2278,65 @@ pub async fn run_prompt_task(
         },
         PromptSource::Heartbeat => None,
     };
+
+    // For a Project session, select a local checkout only after its actual git
+    // origin matches the authoritative repository announcement. A repository
+    // may opt in to bounded skill preloading through .agents/buzz-preload.json.
+    // A present invalid manifest fails closed before ACP session creation.
+    let mut project_preload = None;
+    if let PromptSource::Channel(scope) = &source {
+        if !agent.state.sessions.contains_key(scope) {
+            if let Some(project) = resolved_channel_info
+                .as_ref()
+                .and_then(|info| info.project.as_ref())
+            {
+                let preferred_checkout = if scope.is_job() {
+                    job_working_directory.as_deref().map(Path::new)
+                } else {
+                    None
+                };
+                match crate::project_preload::resolve(
+                    Path::new(&ctx.cwd),
+                    project,
+                    preferred_checkout,
+                ) {
+                    Ok(preload) => project_preload = preload,
+                    Err(reason) => {
+                        tracing::warn!(
+                            channel_id = %scope.channel_id(),
+                            "project instruction preload failed closed: {reason}"
+                        );
+                        send_prompt_result(
+                            &result_tx,
+                            &turn_id,
+                            agent,
+                            source,
+                            PromptOutcome::ProjectContextIndeterminate(format!(
+                                "project instruction preload failed: {reason}"
+                            )),
+                            requeue_batch_if_queue(&ctx, batch),
+                        );
+                        return;
+                    }
+                }
+            }
+        }
+    }
+    let default_session_working_directory = match (&source, job_working_directory.as_deref()) {
+        (PromptSource::Channel(scope), Some(path)) if scope.is_job() => path,
+        _ => &ctx.cwd,
+    };
+    let project_working_directory = project_preload
+        .as_ref()
+        .map(|preload| preload.working_directory.to_string_lossy().into_owned());
+    let session_working_directory = project_working_directory
+        .as_deref()
+        .unwrap_or(default_session_working_directory);
+    let project_instructions = project_preload
+        .as_ref()
+        .and_then(|preload| preload.instructions.as_deref());
+    let legacy_team_instructions =
+        legacy_team_with_project(ctx.team_instructions.as_deref(), project_instructions);
 
     //
     // Core memory is delivered inside the system prompt the harness already
@@ -2378,6 +2480,7 @@ pub async fn run_prompt_task(
                     &mut agent,
                     &ctx,
                     session_working_directory,
+                    project_instructions,
                     agent_core.as_deref(),
                     NewSessionChannelContext {
                         huddle_instructions: huddle_instructions.as_deref(),
@@ -2520,7 +2623,7 @@ pub async fn run_prompt_task(
     let standing = crate::queue::StandingContext {
         base_prompt: ctx.base_prompt.as_deref(),
         system_prompt: ctx.system_prompt.as_deref(),
-        team_instructions: ctx.team_instructions.as_deref(),
+        team_instructions: legacy_team_instructions.as_deref(),
         agent_core: agent_core.as_deref(),
         huddle_instructions: huddle_instructions.as_deref(),
         agent_canvas: agent_canvas.as_deref(),
@@ -9364,6 +9467,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             coordinate: format!("30621:{}:last-known", "a".repeat(64)),
             default_repo_owner: None,
             default_repo_id: None,
+            default_repo_clone_urls: Vec::new(),
         };
         resolver.projects.write().unwrap().insert(
             id,
@@ -10009,6 +10113,7 @@ done"#
             &ctx,
             verified,
             None,
+            None,
             NewSessionChannelContext {
                 huddle_instructions: None,
                 canvas: None,
@@ -10025,6 +10130,120 @@ done"#
         assert_eq!(wire["params"]["cwd"], verified);
         let _ = std::fs::remove_file(capture);
         agent.acp.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn nemo_project_skill_enters_codex_and_claude_startup_prompts() {
+        const NEMO_SKILL_FIXTURE: &str = r#"---
+name: nemo-a2a
+description: Coordinate authenticated Nemo development work between Codex and Claude agents over Buzz.
+---
+
+# Nemo A2A
+
+Protocol version: `NEMO-A2A-1`
+
+Use `buzz_chat_send` for normal replies and `buzz_a2a_dispatch`,
+`buzz_a2a_inbox`, `buzz_a2a_status`, `buzz_a2a_cancel`, and
+`buzz_a2a_handoff` for typed coordination. A relay acknowledgement is storage,
+not acceptance. Never put credentials or host-local paths in a prompt."#;
+        let nemo_skill = std::env::var_os("BUZZ_ACP_TEST_NEMO_SKILL_PATH")
+            .map(std::path::PathBuf::from)
+            .map(std::fs::read_to_string)
+            .transpose()
+            .expect("read optional canonical Nemo skill fixture")
+            .unwrap_or_else(|| NEMO_SKILL_FIXTURE.to_string());
+        let harness = tempfile::TempDir::new().expect("harness fixture");
+        let checkout = harness.path().join("REPOS/nemo");
+        let skill_path = checkout.join(".agents/skills/nemo-a2a/SKILL.md");
+        std::fs::create_dir_all(skill_path.parent().expect("skill parent"))
+            .expect("checkout fixture");
+        std::fs::write(&skill_path, &nemo_skill).expect("skill fixture");
+        std::fs::write(
+            checkout.join(".agents/buzz-preload.json"),
+            r#"{"schema_version":"buzz.project-preload.v1","repository":"https://github.com/mysteropodes/nemo","skills":["nemo-a2a"]}"#,
+        )
+        .expect("manifest fixture");
+        for args in [
+            vec!["init", "--quiet"],
+            vec![
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/mysteropodes/nemo.git",
+            ],
+        ] {
+            assert!(std::process::Command::new("git")
+                .arg("-C")
+                .arg(&checkout)
+                .args(args)
+                .status()
+                .expect("git fixture command")
+                .success());
+        }
+        let project = PromptProjectInfo {
+            name: "Nemo".into(),
+            slug: "nemo".into(),
+            owner: "a".repeat(64),
+            coordinate: format!("30621:{}:nemo", "a".repeat(64)),
+            default_repo_owner: Some("a".repeat(64)),
+            default_repo_id: Some("nemo".into()),
+            default_repo_clone_urls: vec!["https://github.com/mysteropodes/nemo.git".into()],
+        };
+        let preload = crate::project_preload::resolve(harness.path(), &project, None)
+            .expect("Nemo preload resolution")
+            .expect("Nemo checkout");
+        let project_instructions = preload.instructions.expect("project instructions");
+        let checkout = preload.working_directory.to_string_lossy().into_owned();
+
+        for (agent_name, protocol_version, transport) in [
+            ("@agentclientprotocol/codex-acp", 2, "field"),
+            (CLAUDE_AGENT_ACP_NAME, 1, "claude-meta"),
+        ] {
+            let (acp, capture) = scripted_agent(Some(true)).await;
+            let mut agent = owned(acp);
+            agent.agent_name = agent_name.into();
+            agent.protocol_version = protocol_version;
+            let ctx = tests::make_prompt_context_no_owner();
+            create_session_and_apply_model_at(
+                &mut agent,
+                &ctx,
+                &checkout,
+                Some(&project_instructions),
+                None,
+                NewSessionChannelContext {
+                    huddle_instructions: None,
+                    canvas: None,
+                    name: Some("Nemo"),
+                    scope: None,
+                    channel_type: Some("stream"),
+                },
+            )
+            .await
+            .expect("Nemo project session creation");
+
+            let wire: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&capture).expect("captured session/new"))
+                    .expect("session/new JSON");
+            assert_eq!(wire["params"]["cwd"], checkout);
+            let startup_prompt = match transport {
+                "field" => wire["params"]["systemPrompt"]
+                    .as_str()
+                    .expect("Codex systemPrompt"),
+                "claude-meta" => wire["params"]["_meta"]["systemPrompt"]["append"]
+                    .as_str()
+                    .expect("Claude systemPrompt append"),
+                _ => unreachable!(),
+            };
+            assert!(startup_prompt.contains(nemo_skill.trim()));
+            assert!(startup_prompt.contains("<project-instructions>"));
+            assert!(startup_prompt.contains("NEMO-A2A-1"));
+            assert!(startup_prompt.contains("buzz_a2a_dispatch"));
+            assert!(startup_prompt.contains("relay acknowledgement"));
+
+            let _ = std::fs::remove_file(capture);
+            agent.acp.shutdown().await;
+        }
     }
 
     #[tokio::test]

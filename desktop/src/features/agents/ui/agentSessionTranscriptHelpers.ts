@@ -20,7 +20,7 @@ export function extractPromptText(payload: Record<string, unknown>): string {
 }
 
 const SEMANTIC_PROMPT_SECTION_START =
-  /^\s*<(?:workspace|base|system|team-instructions|core-memory|huddle-instructions|channel-canvas|context|thread-context|conversation-context|buzz-event|buzz-events|what-you-were-working-on|new-message-arrived-while-you-were-working|previous-request-interrupted-before-completion|new-request-supersedes-previous)(?:\s[^>]*)?>/;
+  /^\s*<(?:workspace|base|system|team-instructions|project-instructions|core-memory|huddle-instructions|channel-canvas|context|thread-context|conversation-context|buzz-event|buzz-events|what-you-were-working-on|new-message-arrived-while-you-were-working|previous-request-interrupted-before-completion|new-request-supersedes-previous)(?:\s[^>]*)?>/;
 
 /**
  * Parse ACP prompt blocks without losing the connector-facing slash-command
@@ -331,6 +331,7 @@ function parseSemanticStandingSections(
     base: "Base",
     system: "System",
     "team-instructions": "Team Instructions",
+    "project-instructions": "Project Instructions",
     "core-memory": "Core Memory",
     "huddle-instructions": "Huddle Instructions",
     "channel-canvas": "Channel Canvas",
@@ -361,6 +362,7 @@ function splitSemanticStandingPrefix(text: string): {
     "base",
     "system",
     "team-instructions",
+    "project-instructions",
     "core-memory",
     "huddle-instructions",
     "channel-canvas",
@@ -370,6 +372,7 @@ function splitSemanticStandingPrefix(text: string): {
     base: "Base",
     system: "System",
     "team-instructions": "Team Instructions",
+    "project-instructions": "Project Instructions",
     "core-memory": "Core Memory",
     "huddle-instructions": "Huddle Instructions",
     "channel-canvas": "Channel Canvas",

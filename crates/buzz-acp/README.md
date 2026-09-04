@@ -52,6 +52,28 @@ By default, the harness discovers only channels the agent is a **member** of (`G
 
 **Private channels** require explicit membership. The relay doesn't yet have a REST/event API for managing channel members — this is a known gap. For now, use `create_channel` via the Buzz CLI to create new channels (the creator is automatically a member).
 
+### Project repository skills
+
+Project channels can preload repository-owned instructions for every managed agent. The
+authoritative Project repository event must include an HTTPS GitHub `clone` URL, and its
+checkout must exist under the harness `REPOS/` directory with an exactly matching Git
+`origin`. The repository opts in with `.agents/buzz-preload.json`:
+
+```json
+{
+  "schema_version": "buzz.project-preload.v1",
+  "repository": "https://github.com/example/project",
+  "skills": ["project-workflow"]
+}
+```
+
+Each declared skill resolves only to a bounded, regular, non-symlink
+`.agents/skills/<name>/SKILL.md` file inside that checkout. Buzz starts the Project session in
+the verified checkout and adds the complete skill to the standing instructions through Codex's
+`systemPrompt`, Claude's `_meta.systemPrompt.append`, or the legacy first-message fallback. A
+wrong origin is ignored; an invalid present manifest fails closed. Restart a managed agent to
+replace existing sessions after changing the manifest. There is no per-agent preload setting.
+
 ## Quick Start (goose)
 
 ```bash

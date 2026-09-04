@@ -923,19 +923,47 @@ fn git_run_with_timeout(root: &Path, args: &[&str], timeout: Duration) -> Option
         .env("GIT_ATTR_NOSYSTEM", "1")
         .env("GIT_ASKPASS", system_false())
         .env("SSH_ASKPASS", system_false());
-    let output = crate::bounded_command::output_with_limits(
+    #[cfg(windows)]
+    apply_windows_runtime_environment(&mut command)?;
+    let output = match crate::bounded_command::output_with_limits(
         command,
         crate::bounded_command::Limits {
             timeout,
             stdout_bytes: MAX_GIT_OUTPUT_BYTES,
             stderr_bytes: MAX_GIT_OUTPUT_BYTES,
         },
-    )
-    .ok()?;
+    ) {
+        Ok(output) => output,
+        Err(_error) => {
+            #[cfg(test)]
+            eprintln!("bounded Git command failed before exit: {_error:?}");
+            return None;
+        }
+    };
     if !output.status.success() {
+        #[cfg(test)]
+        eprintln!(
+            "bounded Git command exited unsuccessfully: {:?}",
+            output.status.code()
+        );
         return None;
     }
     Some(output.stdout)
+}
+
+#[cfg(windows)]
+fn apply_windows_runtime_environment(command: &mut Command) -> Option<()> {
+    let system_root = PathBuf::from(std::env::var_os("SystemRoot")?);
+    if !system_root.is_absolute() || !system_root.is_dir() {
+        return None;
+    }
+    command.env("SystemRoot", system_root);
+
+    let temporary = std::env::temp_dir();
+    if temporary.is_absolute() && temporary.is_dir() {
+        command.env("TEMP", &temporary).env("TMP", temporary);
+    }
+    Some(())
 }
 
 fn checkout_config_is_safe(root: &Path) -> Option<()> {

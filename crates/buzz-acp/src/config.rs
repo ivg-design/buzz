@@ -511,6 +511,17 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_TEAM_INSTRUCTIONS")]
     pub team_instructions: Option<String>,
 
+    /// Project home channel whose repository instructions apply to every
+    /// session in this Buzz workspace, including DMs and ordinary channels.
+    /// Project membership and A2A grants remain separate authorization gates.
+    #[arg(long, env = "BUZZ_ACP_WORKSPACE_PROJECT_CHANNEL")]
+    pub workspace_project_channel: Option<Uuid>,
+
+    /// Exact reviewed Git commit containing the workspace Project's preload
+    /// manifest and skills. Required with --workspace-project-channel.
+    #[arg(long, env = "BUZZ_ACP_WORKSPACE_PROJECT_REVISION")]
+    pub workspace_project_revision: Option<String>,
+
     /// Publish encrypted ACP observer frames over the relay.
     #[arg(long, env = "BUZZ_ACP_RELAY_OBSERVER", default_value_t = false)]
     pub relay_observer: bool,
@@ -569,6 +580,12 @@ pub struct Config {
     pub system_prompt: Option<String>,
     /// Team-owned instructions layered separately from the agent system prompt.
     pub team_instructions: Option<String>,
+    /// Owner-selected workspace Project used for repository instruction preload
+    /// in every session. This carries policy only; it grants no Project, Git,
+    /// channel, or A2A authority.
+    pub workspace_project_channel: Option<Uuid>,
+    /// Exact reviewed Git commit used to load immutable workspace instructions.
+    pub workspace_project_revision: Option<String>,
     pub initial_message: Option<String>,
     pub subscribe_mode: SubscribeMode,
     pub dedup_mode: DedupMode,
@@ -1173,6 +1190,30 @@ impl Config {
 
         validate_multiple_event_handling(args.multiple_event_handling, args.dedup)?;
 
+        let workspace_project_revision = match (
+            args.workspace_project_channel,
+            args.workspace_project_revision,
+        ) {
+            (None, None) => None,
+            (Some(_), Some(revision)) if valid_workspace_revision(&revision) => Some(revision),
+            (Some(_), Some(_)) => {
+                return Err(ConfigError::ConfigFile(
+                        "workspace_project_revision must be an exact lowercase 40- or 64-character Git commit ID"
+                            .into(),
+                    ));
+            }
+            (Some(_), None) => {
+                return Err(ConfigError::ConfigFile(
+                    "workspace_project_channel requires workspace_project_revision".into(),
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(ConfigError::ConfigFile(
+                    "workspace_project_revision requires workspace_project_channel".into(),
+                ));
+            }
+        };
+
         let config = Config {
             keys,
             relay_url: args.relay_url,
@@ -1192,6 +1233,8 @@ impl Config {
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(str::to_string),
+            workspace_project_channel: args.workspace_project_channel,
+            workspace_project_revision,
             initial_message: args.initial_message,
             subscribe_mode: args.subscribe,
             dedup_mode: args.dedup,
@@ -1248,8 +1291,15 @@ impl Config {
             modes.sort();
             format!(" allowed_respond_to=[{}]", modes.join(","))
         };
+        let workspace_project = match (
+            self.workspace_project_channel,
+            self.workspace_project_revision.as_deref(),
+        ) {
+            (Some(channel), Some(revision)) => format!("{channel}@{revision}"),
+            _ => "(channel-scoped)".into(),
+        };
         format!(
-            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} session_policy={} reply_placement={} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
+            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} session_policy={} reply_placement={} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} workspace_project={} model={} permission_mode={} {}{}",
             self.relay_url,
             self.keys.public_key().to_hex(),
             self.agent_command,
@@ -1270,12 +1320,20 @@ impl Config {
             self.presence_enabled,
             self.typing_enabled,
             self.memory_enabled,
+            workspace_project,
             self.model.as_deref().unwrap_or("(agent default)"),
             self.permission_mode,
             respond_to_detail,
             allowed_respond_to_detail,
         )
     }
+}
+
+fn valid_workspace_revision(value: &str) -> bool {
+    matches!(value.len(), 40 | 64)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1584,6 +1642,8 @@ mod tests {
             heartbeat_prompt: None,
             system_prompt: None,
             team_instructions: None,
+            workspace_project_channel: None,
+            workspace_project_revision: None,
             initial_message: None,
             subscribe_mode: mode,
             dedup_mode: DedupMode::Queue,
@@ -1654,6 +1714,101 @@ mod tests {
             assert!(kinds.contains(&buzz_core::kind::KIND_STREAM_MESSAGE));
             assert!(kinds.contains(&buzz_core::kind::KIND_WORKFLOW_APPROVAL_REQUESTED));
             assert!(kinds.contains(&buzz_core::kind::KIND_STREAM_REMINDER));
+        }
+    }
+
+    #[test]
+    fn parses_workspace_project_channel() {
+        let key = "0".repeat(64);
+        let channel = Uuid::new_v4();
+        let revision = "a".repeat(40);
+        let args = CliArgs::parse_from([
+            "buzz-acp",
+            "--private-key",
+            &key,
+            "--workspace-project-channel",
+            &channel.to_string(),
+            "--workspace-project-revision",
+            &revision,
+        ]);
+        assert_eq!(args.workspace_project_channel, Some(channel));
+        assert_eq!(
+            args.workspace_project_revision.as_deref(),
+            Some(revision.as_str())
+        );
+    }
+
+    #[test]
+    fn workspace_project_requires_channel_and_reviewed_revision_together() {
+        let channel = Uuid::new_v4().to_string();
+        let revision = "a".repeat(40);
+
+        let only_channel = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--workspace-project-channel",
+            &channel,
+        ])
+        .unwrap();
+        assert!(Config::from_args(only_channel)
+            .unwrap_err()
+            .to_string()
+            .contains("requires workspace_project_revision"));
+
+        let only_revision = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--workspace-project-revision",
+            &revision,
+        ])
+        .unwrap();
+        assert!(Config::from_args(only_revision)
+            .unwrap_err()
+            .to_string()
+            .contains("requires workspace_project_channel"));
+
+        let paired = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--workspace-project-channel",
+            &channel,
+            "--workspace-project-revision",
+            &revision,
+        ])
+        .unwrap();
+        let config = Config::from_args(paired).expect("valid workspace Project source");
+        assert_eq!(
+            config.workspace_project_revision.as_deref(),
+            Some(revision.as_str())
+        );
+        assert!(config.summary().contains(&format!("{channel}@{revision}")));
+    }
+
+    #[test]
+    fn workspace_project_rejects_unreviewable_revision_forms() {
+        let channel = Uuid::new_v4().to_string();
+        for invalid in [
+            "a".repeat(39),
+            "A".repeat(40),
+            format!("{}g", "a".repeat(39)),
+        ] {
+            let args = CliArgs::try_parse_from([
+                "buzz-acp",
+                "--private-key",
+                TEST_PRIVATE_KEY,
+                "--workspace-project-channel",
+                &channel,
+                "--workspace-project-revision",
+                &invalid,
+            ])
+            .unwrap();
+            assert!(Config::from_args(args)
+                .unwrap_err()
+                .to_string()
+                .contains("exact lowercase"));
         }
     }
 

@@ -1,6 +1,8 @@
 #![deny(unsafe_code)]
 
 mod acp;
+#[cfg_attr(windows, allow(unsafe_code))]
+mod bounded_command;
 mod config;
 mod engram_fetch;
 mod filter;
@@ -3024,6 +3026,8 @@ async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
         system_prompt: config.system_prompt.clone(),
         session_title: config.session_title.clone(),
         team_instructions: config.team_instructions.clone(),
+        workspace_project_channel: config.workspace_project_channel,
+        workspace_project_revision: config.workspace_project_revision.clone(),
         base_prompt: if config.no_base_prompt {
             None
         } else {
@@ -9595,6 +9599,8 @@ mod build_mcp_servers_tests {
             heartbeat_prompt: None,
             system_prompt: None,
             team_instructions: None,
+            workspace_project_channel: None,
+            workspace_project_revision: None,
             initial_message: None,
             subscribe_mode: config::SubscribeMode::All,
             dedup_mode: config::DedupMode::Queue,
@@ -9834,6 +9840,8 @@ mod error_outcome_emission_tests {
             heartbeat_prompt: None,
             system_prompt: None,
             team_instructions: None,
+            workspace_project_channel: None,
+            workspace_project_revision: None,
             initial_message: None,
             subscribe_mode: config::SubscribeMode::All,
             dedup_mode: config::DedupMode::Queue,

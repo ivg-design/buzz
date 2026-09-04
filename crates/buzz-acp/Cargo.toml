@@ -79,7 +79,10 @@ evalexpr = { workspace = true }
 # Process-group kill (safe wrapper around killpg) — Unix-only; kill_process_group
 # has a #[cfg(not(unix))] fallback in acp.rs.
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", default-features = false, features = ["signal", "process"] }
+nix = { version = "0.31", default-features = false, features = ["fs", "signal", "process"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

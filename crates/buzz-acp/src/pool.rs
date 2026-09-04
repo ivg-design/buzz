@@ -21,7 +21,7 @@
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -114,6 +114,19 @@ pub struct ChannelDeliveryState {
     pub delivered_event_ids: HashSet<String>,
 }
 
+/// Immutable workspace policy identity bound to one live provider session.
+///
+/// The relay can republish a Project home while the harness is running.  A
+/// provider session created for the old Project must never continue under the
+/// new Project's authority without being recreated and receiving the newly
+/// pinned instructions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkspaceInstructionBinding {
+    home_channel: Uuid,
+    project: PromptProjectInfo,
+    revision: String,
+}
+
 /// Per-channel session IDs, turn counters, and delivery state.
 ///
 /// Separated from `OwnedAgent` so the state machine is testable without
@@ -143,6 +156,10 @@ pub struct SessionState {
     /// Per-scope successful-delivery state. Created with the ACP session and
     /// cleared atomically with every invalidation path.
     pub deliveries: HashMap<SessionScope, ChannelDeliveryState>,
+    /// Workspace Project/revision used when each provider session was created.
+    workspace_instruction_bindings: HashMap<SessionScope, WorkspaceInstructionBinding>,
+    /// Workspace Project/revision used when the heartbeat session was created.
+    heartbeat_workspace_instruction_binding: Option<WorkspaceInstructionBinding>,
     /// Harness-owned trusted MCP capability for each live provider session.
     /// Removing an entry cancels its loopback listener and invalidates its
     /// bearer token.
@@ -160,6 +177,7 @@ impl SessionState {
                 self.heartbeat_session = None;
                 self.heartbeat_turn_count = 0;
                 self.heartbeat_standing_context_sent = false;
+                self.heartbeat_workspace_instruction_binding = None;
             }
         }
     }
@@ -171,6 +189,7 @@ impl SessionState {
         self.core_sections.remove(scope);
         self.canvas_sections.remove(scope);
         self.deliveries.remove(scope);
+        self.workspace_instruction_bindings.remove(scope);
         self.trusted_mcp.remove(scope);
         self.sessions.remove(scope).is_some()
     }
@@ -186,6 +205,7 @@ impl SessionState {
             .chain(self.core_sections.keys())
             .chain(self.canvas_sections.keys())
             .chain(self.deliveries.keys())
+            .chain(self.workspace_instruction_bindings.keys())
             .chain(self.trusted_mcp.keys())
             .filter(|s| s.channel_id() == *channel_id)
             .cloned()
@@ -211,6 +231,8 @@ impl SessionState {
         self.core_sections.clear();
         self.canvas_sections.clear();
         self.deliveries.clear();
+        self.workspace_instruction_bindings.clear();
+        self.heartbeat_workspace_instruction_binding = None;
         self.trusted_mcp.clear();
     }
 
@@ -239,6 +261,7 @@ impl SessionState {
             || self.core_sections.keys().any(matches)
             || self.canvas_sections.keys().any(matches)
             || self.deliveries.keys().any(matches)
+            || self.workspace_instruction_bindings.keys().any(matches)
             || self.trusted_mcp.keys().any(matches)
     }
 }
@@ -769,6 +792,27 @@ impl ChannelInfoResolver {
         }
         Ok(fetched)
     }
+
+    /// Fetch the workspace Project directly from the relay without accepting
+    /// cached or stale authority. Workspace instructions are privileged and
+    /// apply beyond the Project home, so every provider turn must confirm that
+    /// the selected home still resolves to the same signed Project/repository.
+    async fn lookup_project_strict(
+        &self,
+        channel_id: Uuid,
+    ) -> Result<Option<PromptProjectInfo>, ProjectLookupError> {
+        let fetched = fetch_project_home_for_channel_strict(channel_id, &self.rest_client).await?;
+        if let Ok(mut cache) = self.projects.write() {
+            cache.insert(
+                channel_id,
+                CachedProjectInfo {
+                    fetched_at: std::time::Instant::now(),
+                    value: fetched.clone(),
+                },
+            );
+        }
+        Ok(fetched)
+    }
 }
 
 pub struct PromptContext {
@@ -791,6 +835,12 @@ pub struct PromptContext {
     /// ID prefix. Never part of the prompt.
     pub session_title: Option<String>,
     pub team_instructions: Option<String>,
+    /// Owner-selected Project whose repository instructions apply throughout
+    /// this Buzz workspace. This is a prompt source, never an authorization
+    /// substitute for channel membership or an A2A checkout grant.
+    pub workspace_project_channel: Option<Uuid>,
+    /// Exact reviewed commit containing the immutable workspace preload.
+    pub workspace_project_revision: Option<String>,
     pub heartbeat_prompt: Option<String>,
     /// Base instructions with the configured policy's Session Model appended,
     /// assembled once and shared by modern and legacy ACP standing context.
@@ -826,6 +876,62 @@ pub struct PromptContext {
     /// the desktop keys per (agent, relay) pair, e.g. `session_config_captured`,
     /// mirroring the `managed_agent_runtime_lifecycle` frames.
     pub relay_url: String,
+}
+
+/// Select the repository instruction source for a new provider session.
+///
+/// With no workspace Project configured, preserve the legacy behavior: only a
+/// Project home channel receives that Project's instructions. Once the owner
+/// selects a workspace Project, its instructions apply in every conversation,
+/// DM, ordinary channel, and heartbeat. Entering a different Project home is
+/// rejected rather than silently mixing two repositories' system policy.
+async fn resolve_workspace_prompt_project(
+    ctx: &PromptContext,
+    source: &PromptSource,
+    current: Option<&PromptChannelInfo>,
+) -> Result<Option<PromptProjectInfo>, ProjectLookupError> {
+    let current_project = current.and_then(|info| info.project.as_ref());
+    let Some(workspace_home) = ctx.workspace_project_channel else {
+        return Ok(current_project.cloned());
+    };
+
+    if let PromptSource::Channel(scope) = source {
+        if current_project.is_some() && scope.channel_id() != workspace_home {
+            return Err(ProjectLookupError(format!(
+                "channel {} belongs to a different Project than configured workspace home {}",
+                scope.channel_id(),
+                workspace_home
+            )));
+        }
+        if scope.channel_id() != workspace_home {
+            let (current, workspace) = tokio::join!(
+                ctx.channel_info.lookup_project_strict(scope.channel_id()),
+                ctx.channel_info.lookup_project_strict(workspace_home)
+            );
+            if current?.is_some() {
+                return Err(ProjectLookupError(format!(
+                    "channel {} belongs to a different Project than configured workspace home {}",
+                    scope.channel_id(),
+                    workspace_home
+                )));
+            }
+            return workspace?.map(Some).ok_or_else(|| {
+                ProjectLookupError(format!(
+                    "configured workspace home {workspace_home} has no authoritative Project"
+                ))
+            });
+        }
+    }
+
+    ctx.channel_info
+        .lookup_project_strict(workspace_home)
+        .await?
+        .map(Some)
+        .ok_or_else(|| {
+            ProjectLookupError(format!(
+                "configured workspace home {workspace_home} has no authoritative Project"
+            ))
+        })
 }
 
 impl AgentPool {
@@ -1281,6 +1387,7 @@ struct NewSessionChannelContext<'a> {
     channel_type: Option<&'a str>,
 }
 
+#[cfg(test)]
 async fn create_session_and_apply_model(
     agent: &mut OwnedAgent,
     ctx: &PromptContext,
@@ -2279,45 +2386,171 @@ pub async fn run_prompt_task(
         PromptSource::Heartbeat => None,
     };
 
-    // For a Project session, select a local checkout only after its actual git
-    // origin matches the authoritative repository announcement. A repository
-    // may opt in to bounded skill preloading through .agents/buzz-preload.json.
-    // A present invalid manifest fails closed before ACP session creation.
+    // Resolve Project scope on every turn, including turns in an existing ACP
+    // session. A channel can be rebound to a different Project after its
+    // session was created; continuing that old Nemo-scoped session would mix
+    // two repositories' policy. Blob loading remains new-session-only below.
+    // This is policy context only: membership, job admission, and checkout
+    // grants remain independently enforced.
+    let workspace_prompt_project = match resolve_workspace_prompt_project(
+        &ctx,
+        &source,
+        resolved_channel_info.as_ref(),
+    )
+    .await
+    {
+        Ok(project) => project,
+        Err(error) => {
+            tracing::warn!(
+                source = %prompt_label(&source),
+                "workspace project context is indeterminate; requeueing before ACP delivery: {}",
+                error.0
+            );
+            send_prompt_result(
+                &result_tx,
+                &turn_id,
+                agent,
+                source,
+                PromptOutcome::ProjectContextIndeterminate(error.0),
+                requeue_batch_if_queue(&ctx, batch),
+            );
+            return;
+        }
+    };
+
+    // Bind each provider session to the exact workspace Project metadata and
+    // reviewed revision that supplied its developer instructions.  Project
+    // events are replaceable; continuing a session after a home is rebound
+    // would retain the old privileged policy in a newly authoritative context.
+    let workspace_instruction_binding = match ctx.workspace_project_channel {
+        Some(home_channel) => {
+            let Some(project) = workspace_prompt_project.as_ref() else {
+                send_prompt_result(
+                    &result_tx,
+                    &turn_id,
+                    agent,
+                    source,
+                    PromptOutcome::ProjectContextIndeterminate(
+                        "workspace Project resolved without authoritative metadata".into(),
+                    ),
+                    requeue_batch_if_queue(&ctx, batch),
+                );
+                return;
+            };
+            let Some(revision) = ctx
+                .workspace_project_revision
+                .as_deref()
+                .map(str::trim)
+                .filter(|revision| !revision.is_empty())
+            else {
+                send_prompt_result(
+                    &result_tx,
+                    &turn_id,
+                    agent,
+                    source,
+                    PromptOutcome::ProjectContextIndeterminate(
+                        "workspace Project has no reviewed instruction revision".into(),
+                    ),
+                    requeue_batch_if_queue(&ctx, batch),
+                );
+                return;
+            };
+            Some(WorkspaceInstructionBinding {
+                home_channel,
+                project: project.clone(),
+                revision: revision.to_string(),
+            })
+        }
+        None => None,
+    };
+
+    // Select repository instructions only when creating a provider session.
+    // Without a configured workspace Project this preserves the original
+    // Project-home-only behavior. With one configured, the same verified
+    // checkout and complete instruction package apply to every session,
+    // including DMs and heartbeats.
     let mut project_preload = None;
-    if let PromptSource::Channel(scope) = &source {
-        if !agent.state.sessions.contains_key(scope) {
-            if let Some(project) = resolved_channel_info
-                .as_ref()
-                .and_then(|info| info.project.as_ref())
-            {
-                let preferred_checkout = if scope.is_job() {
+    let creating_session = match &source {
+        PromptSource::Channel(scope) => !agent.state.sessions.contains_key(scope),
+        PromptSource::Heartbeat => agent.state.heartbeat_session.is_none(),
+    };
+    if !creating_session {
+        let session_binding = match &source {
+            PromptSource::Channel(scope) => agent.state.workspace_instruction_bindings.get(scope),
+            PromptSource::Heartbeat => agent.state.heartbeat_workspace_instruction_binding.as_ref(),
+        };
+        if session_binding != workspace_instruction_binding.as_ref() {
+            tracing::warn!(
+                source = %prompt_label(&source),
+                "workspace Project binding changed; refusing to reuse provider session"
+            );
+            send_prompt_result(
+                &result_tx,
+                &turn_id,
+                agent,
+                source,
+                PromptOutcome::ProjectContextIndeterminate(
+                    "workspace Project binding changed; restart or recreate the provider session"
+                        .into(),
+                ),
+                requeue_batch_if_queue(&ctx, batch),
+            );
+            return;
+        }
+    }
+    if creating_session {
+        if let Some(project) = workspace_prompt_project.as_ref() {
+            let preferred_checkout = match &source {
+                PromptSource::Channel(scope) if scope.is_job() => {
                     job_working_directory.as_deref().map(Path::new)
-                } else {
-                    None
-                };
-                match crate::project_preload::resolve(
-                    Path::new(&ctx.cwd),
-                    project,
-                    preferred_checkout,
-                ) {
-                    Ok(preload) => project_preload = preload,
-                    Err(reason) => {
-                        tracing::warn!(
-                            channel_id = %scope.channel_id(),
-                            "project instruction preload failed closed: {reason}"
-                        );
+                }
+                _ => None,
+            };
+            let instruction_revision = if ctx.workspace_project_channel.is_some() {
+                match ctx.workspace_project_revision.as_deref() {
+                    Some(revision) => Some(revision),
+                    None => {
                         send_prompt_result(
                             &result_tx,
                             &turn_id,
                             agent,
                             source,
-                            PromptOutcome::ProjectContextIndeterminate(format!(
-                                "project instruction preload failed: {reason}"
-                            )),
+                            PromptOutcome::ProjectContextIndeterminate(
+                                "workspace Project has no reviewed instruction revision".into(),
+                            ),
                             requeue_batch_if_queue(&ctx, batch),
                         );
                         return;
                     }
+                }
+            } else {
+                None
+            };
+            match crate::project_preload::resolve_async(
+                PathBuf::from(&ctx.cwd),
+                project.clone(),
+                preferred_checkout.map(Path::to_path_buf),
+                instruction_revision.map(str::to_string),
+            )
+            .await
+            {
+                Ok(preload) => project_preload = preload,
+                Err(reason) => {
+                    tracing::warn!(
+                        source = %prompt_label(&source),
+                        "project instruction preload failed closed: {reason}"
+                    );
+                    send_prompt_result(
+                        &result_tx,
+                        &turn_id,
+                        agent,
+                        source,
+                        PromptOutcome::ProjectContextIndeterminate(format!(
+                            "project instruction preload failed: {reason}"
+                        )),
+                        requeue_batch_if_queue(&ctx, batch),
+                    );
+                    return;
                 }
             }
         }
@@ -2499,6 +2732,12 @@ pub async fn run_prompt_task(
                             scope.telemetry_label()
                         );
                         agent.state.sessions.insert(scope.clone(), sid.clone());
+                        if let Some(binding) = workspace_instruction_binding.clone() {
+                            agent
+                                .state
+                                .workspace_instruction_bindings
+                                .insert(scope.clone(), binding);
+                        }
                         agent
                             .state
                             .deliveries
@@ -2544,9 +2783,11 @@ pub async fn run_prompt_task(
             if let Some(sid) = &agent.state.heartbeat_session {
                 (sid.clone(), false)
             } else {
-                match create_session_and_apply_model(
+                match create_session_and_apply_model_at(
                     &mut agent,
                     &ctx,
+                    session_working_directory,
+                    project_instructions,
                     None,
                     NewSessionChannelContext {
                         huddle_instructions: None,
@@ -2565,6 +2806,8 @@ pub async fn run_prompt_task(
                             agent.index
                         );
                         agent.state.heartbeat_session = Some(sid.clone());
+                        agent.state.heartbeat_workspace_instruction_binding =
+                            workspace_instruction_binding.clone();
                         // Seed a zero usage baseline: buzz-acp spawned this session.
                         agent.acp.notify_session_spawned(&sid);
                         (sid, true)
@@ -2810,8 +3053,9 @@ pub async fn run_prompt_task(
         // Heartbeats create their session before this point, so a Goose method-not-found
         // probe has already selected the correct framing for this process.
         //
-        // Only the first heartbeat of a session carries `<base>`; later ticks
-        // reuse the same session, so the agent already has it.
+        // Only the first heartbeat of a legacy session carries its standing
+        // context; later ticks reuse the same session. Modern adapters already
+        // received the same context as a system prompt at session/new.
         let text = if standing_context_sent {
             text
         } else {
@@ -2821,10 +3065,7 @@ pub async fn run_prompt_task(
                 } else {
                     1
                 },
-                &crate::queue::StandingContext {
-                    base_prompt: ctx.base_prompt.as_deref(),
-                    ..Default::default()
-                },
+                &standing,
                 &text,
             )
         };
@@ -2942,7 +3183,7 @@ pub async fn run_prompt_task(
     let prompt_bytes: usize = prompt_blocks.iter().map(|block| block.len()).sum();
     let has_standing_context = match &source {
         PromptSource::Channel(_) => !standing.sections().is_empty(),
-        PromptSource::Heartbeat => ctx.base_prompt.is_some(),
+        PromptSource::Heartbeat => !standing.sections().is_empty(),
     };
     let standing_context_included =
         !agent.has_system_prompt_support() && !standing_context_sent && has_standing_context;
@@ -3531,6 +3772,51 @@ pub(crate) async fn fetch_project_home_for_channel(
     Ok(pick_authoritative_project_home(
         &projects,
         &repos,
+        &channel_id.to_string(),
+    ))
+}
+
+/// Resolve a workspace Project with one fresh, bounded query per required
+/// event kind.  Unlike the general channel-context resolver, this path never
+/// falls back to cached authority. The two independent requests run together,
+/// keeping the fail-closed delay to one context-fetch timeout.
+async fn fetch_project_home_for_channel_strict(
+    channel_id: Uuid,
+    rest: &RestClient,
+) -> Result<Option<PromptProjectInfo>, ProjectLookupError> {
+    let channel = channel_id.to_string();
+    let project_filter = serde_json::json!({
+        "kinds": [buzz_core::kind::KIND_PROJECT],
+        "#buzz-channel": [channel],
+    });
+    let repo_filter = serde_json::json!({
+        "kinds": [buzz_core::kind::KIND_GIT_REPO_ANNOUNCEMENT],
+        "#buzz-channel": [channel_id.to_string()],
+    });
+
+    async fn query_once(
+        channel_id: Uuid,
+        rest: &RestClient,
+        filter: serde_json::Value,
+    ) -> Result<Vec<serde_json::Value>, ProjectLookupError> {
+        match timeout(CONTEXT_FETCH_TIMEOUT, rest.query_raw_all(filter)).await {
+            Ok(Ok(events)) => Ok(events),
+            Ok(Err(error)) => Err(ProjectLookupError(format!(
+                "strict workspace Project query failed for {channel_id}: {error}"
+            ))),
+            Err(_) => Err(ProjectLookupError(format!(
+                "strict workspace Project query timed out for {channel_id}"
+            ))),
+        }
+    }
+
+    let (projects, repos) = tokio::join!(
+        query_once(channel_id, rest, project_filter),
+        query_once(channel_id, rest, repo_filter)
+    );
+    Ok(pick_authoritative_project_home(
+        &projects?,
+        &repos?,
         &channel_id.to_string(),
     ))
 }
@@ -5483,12 +5769,18 @@ mod tests {
     }
 
     #[test]
-    fn test_heartbeat_standing_block_is_base_only() {
-        // A heartbeat has no channel, so core and canvas are absent by
-        // construction — and it has never carried the persona. Pin that the
-        // shared helper does not start handing heartbeats [Agent Instructions].
-        let composed = prepend_standing_for_legacy(1, &base_only(Some("be helpful")), "tick");
-        assert_eq!(composed, "<base>\nbe helpful\n</base>\n\ntick");
+    fn test_heartbeat_standing_block_includes_workspace_instructions() {
+        let standing = crate::queue::StandingContext {
+            base_prompt: Some("be helpful"),
+            system_prompt: Some("agent persona"),
+            team_instructions: Some("NEMO-A2A-1 workspace policy"),
+            ..Default::default()
+        };
+        let composed = prepend_standing_for_legacy(1, &standing, "tick");
+        assert!(composed.contains("<base>\nbe helpful\n</base>"));
+        assert!(composed.contains("<system>\nagent persona\n</system>"));
+        assert!(composed.contains("NEMO-A2A-1 workspace policy"));
+        assert!(composed.ends_with("tick"));
     }
 
     #[test]
@@ -8880,6 +9172,8 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             system_prompt: None,
             session_title: None,
             team_instructions: None,
+            workspace_project_channel: None,
+            workspace_project_revision: None,
             heartbeat_prompt: None,
             base_prompt: None,
             cwd: ".".to_string(),
@@ -9914,6 +10208,8 @@ mod trusted_mcp_session_tests {
     use crate::acp::AcpClient;
     use crate::trusted_mcp::TrustedMcpFactory;
     use buzz_dev_mcp::HarnessTrustedIdentity;
+    use nostr::{EventBuilder, Keys, Kind};
+    use serde_json::json;
 
     async fn scripted_agent(http_capability: Option<bool>) -> (AcpClient, std::path::PathBuf) {
         let capture =
@@ -9954,6 +10250,36 @@ done"#
         (acp, capture)
     }
 
+    async fn scripted_turn_agent() -> (AcpClient, std::path::PathBuf) {
+        let capture =
+            std::env::temp_dir().join(format!("buzz-acp-heartbeat-{}.ndjson", Uuid::new_v4()));
+        let script = r#"count=0
+while IFS= read -r line; do
+  count=$((count + 1))
+  printf '%s\n' "$line" >> "$CAPTURE_FILE"
+  if [ "$count" -eq 1 ]; then
+    printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"agentCapabilities":{},"agentInfo":{"name":"adapter-test","version":"1"}}}'
+  elif [ "$count" -eq 2 ]; then
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"sessionId":"heartbeat-session"}}'
+  else
+    printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$((count - 1)),\"result\":{\"stopReason\":\"end_turn\"}}"
+  fi
+done"#;
+        let mut acp = AcpClient::spawn(
+            "bash",
+            &["-c".into(), script.into()],
+            &[(
+                "CAPTURE_FILE".into(),
+                capture.to_string_lossy().into_owned(),
+            )],
+            false,
+        )
+        .await
+        .expect("spawn scripted heartbeat ACP");
+        acp.initialize().await.expect("initialize heartbeat ACP");
+        (acp, capture)
+    }
+
     fn owned(acp: AcpClient) -> OwnedAgent {
         OwnedAgent {
             index: 0,
@@ -9969,6 +10295,166 @@ done"#
             goose_system_prompt_supported: None,
             protocol_version: 2,
         }
+    }
+
+    fn heartbeat_workspace_fixture() -> (tempfile::TempDir, PromptProjectInfo, String) {
+        let harness = tempfile::TempDir::new().expect("heartbeat workspace fixture");
+        let checkout = harness.path().join("REPOS/nemo");
+        let skill = checkout.join(".agents/skills/nemo-a2a/SKILL.md");
+        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        std::fs::write(
+            &skill,
+            "---\nname: nemo-a2a\ndescription: Coordinate Nemo agents.\n---\n\nNEMO-A2A-1\nbuzz_chat_send buzz_a2a_dispatch buzz_a2a_inbox buzz_a2a_status buzz_a2a_cancel buzz_a2a_handoff\nEND-NEMO-SKILL\n",
+        )
+        .unwrap();
+        std::fs::write(
+            checkout.join(".agents/buzz-preload.json"),
+            r#"{"schema_version":"buzz.project-preload.v1","repository":"https://github.com/mysteropodes/nemo","skills":["nemo-a2a"]}"#,
+        )
+        .unwrap();
+        for args in [
+            vec!["init", "--quiet"],
+            vec![
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/mysteropodes/nemo.git",
+            ],
+            vec!["add", ".agents"],
+            vec![
+                "-c",
+                "user.name=Buzz Test",
+                "-c",
+                "user.email=buzz-test@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "fixture",
+            ],
+        ] {
+            assert!(std::process::Command::new("git")
+                .arg("-C")
+                .arg(&checkout)
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
+        }
+        let revision = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&checkout)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let revision = String::from_utf8(revision.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        let project = PromptProjectInfo {
+            name: "Nemo".into(),
+            slug: "nemo".into(),
+            owner: "a".repeat(64),
+            coordinate: format!("30621:{}:nemo", "a".repeat(64)),
+            default_repo_owner: Some("a".repeat(64)),
+            default_repo_id: Some("nemo".into()),
+            default_repo_clone_urls: vec!["https://github.com/mysteropodes/nemo.git".into()],
+        };
+        (harness, project, revision)
+    }
+
+    async fn workspace_project_relay(
+        channel_id: Uuid,
+        project: &PromptProjectInfo,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        workspace_projects_relay(vec![(channel_id, project.clone())]).await
+    }
+
+    async fn workspace_projects_relay(
+        projects: Vec<(Uuid, PromptProjectInfo)>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind workspace Project fixture relay");
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let bodies = projects
+            .into_iter()
+            .map(|(channel_id, project)| {
+                let repo_owner = project
+                    .default_repo_owner
+                    .as_deref()
+                    .expect("fixture repository owner");
+                let repo_id = project
+                    .default_repo_id
+                    .as_deref()
+                    .expect("fixture repository id");
+                let repo_coordinate = format!("30617:{repo_owner}:{repo_id}");
+                let project_event = json!({
+                    "id": "1".repeat(64),
+                    "created_at": 1,
+                    "kind": buzz_core::kind::KIND_PROJECT,
+                    "pubkey": project.owner,
+                    "tags": [
+                        ["d", project.slug],
+                        ["name", project.name],
+                        ["buzz-channel", channel_id.to_string()],
+                        ["a", repo_coordinate]
+                    ]
+                });
+                let mut repo_tags = vec![
+                    json!(["d", repo_id]),
+                    json!(["buzz-channel", channel_id.to_string()]),
+                ];
+                if !project.default_repo_clone_urls.is_empty() {
+                    let mut clone_tag = vec![json!("clone")];
+                    clone_tag.extend(project.default_repo_clone_urls.iter().map(|url| json!(url)));
+                    repo_tags.push(serde_json::Value::Array(clone_tag));
+                }
+                let repo_event = json!({
+                    "id": "2".repeat(64),
+                    "created_at": 1,
+                    "kind": buzz_core::kind::KIND_GIT_REPO_ANNOUNCEMENT,
+                    "pubkey": repo_owner,
+                    "tags": repo_tags
+                });
+                (
+                    channel_id.to_string(),
+                    serde_json::to_string(&vec![project_event]).unwrap(),
+                    serde_json::to_string(&vec![repo_event]).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let bodies = bodies.clone();
+                tokio::spawn(async move {
+                    let mut request = vec![0_u8; 16 * 1024];
+                    let Ok(read) = socket.read(&mut request).await else {
+                        return;
+                    };
+                    let request = String::from_utf8_lossy(&request[..read]);
+                    let body = bodies
+                        .iter()
+                        .find(|(channel, _, _)| request.contains(channel))
+                        .map(|(_, project, repo)| {
+                            if request.contains(&buzz_core::kind::KIND_PROJECT.to_string()) {
+                                project.clone()
+                            } else {
+                                repo.clone()
+                            }
+                        })
+                        .unwrap_or_else(|| "[]".into());
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        (base_url, server)
     }
 
     fn factory(keys: &nostr::Keys) -> TrustedMcpFactory {
@@ -10098,6 +10584,86 @@ done"#
     }
 
     #[tokio::test]
+    async fn fresh_legacy_heartbeat_delivers_complete_pinned_workspace_skill_once() {
+        let (harness, project, revision) = heartbeat_workspace_fixture();
+        let workspace_home = Uuid::new_v4();
+        let (relay_base_url, relay_server) =
+            workspace_project_relay(workspace_home, &project).await;
+        let (acp, capture) = scripted_turn_agent().await;
+        let mut agent = owned(acp);
+        agent.agent_name = "@agentclientprotocol/codex-acp".into();
+        agent.protocol_version = 1;
+
+        let mut ctx = tests::make_prompt_context_no_owner();
+        ctx.cwd = harness.path().to_string_lossy().into_owned();
+        ctx.base_prompt = Some("base policy".into());
+        ctx.system_prompt = Some("agent persona".into());
+        ctx.team_instructions = Some("team policy".into());
+        ctx.workspace_project_channel = Some(workspace_home);
+        ctx.workspace_project_revision = Some(revision);
+        ctx.channel_info = ChannelInfoResolver::new(
+            HashMap::new(),
+            RestClient {
+                http: reqwest::Client::new(),
+                base_url: relay_base_url,
+                keys: ctx.agent_keys.clone(),
+                auth_tag_json: None,
+            },
+        );
+        ctx.channel_info.projects.write().unwrap().insert(
+            workspace_home,
+            CachedProjectInfo {
+                fetched_at: std::time::Instant::now(),
+                value: Some(project),
+            },
+        );
+        let ctx = Arc::new(ctx);
+        let (result_tx, mut result_rx) = mpsc::unbounded_channel();
+
+        for turn in 1..=2 {
+            run_prompt_task(
+                agent,
+                None,
+                Some(format!("heartbeat-{turn}")),
+                Arc::clone(&ctx),
+                result_tx.clone(),
+                None,
+                PromptExecution::new(None, format!("heartbeat-turn-{turn}")),
+            )
+            .await;
+            let result = result_rx.recv().await.expect("heartbeat result");
+            assert!(matches!(
+                result.outcome,
+                PromptOutcome::Ok(StopReason::EndTurn)
+            ));
+            agent = result.agent;
+        }
+        agent.acp.shutdown().await;
+
+        let requests = std::fs::read_to_string(&capture).unwrap();
+        std::fs::remove_file(&capture).unwrap();
+        let requests = requests
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let prompts = requests
+            .iter()
+            .filter(|request| request["method"] == "session/prompt")
+            .map(|request| request["params"]["prompt"][0]["text"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(prompts.len(), 2);
+        assert!(prompts[0].contains("<base>\nbase policy\n</base>"));
+        assert!(prompts[0].contains("<system>\nagent persona\n</system>"));
+        assert!(prompts[0].contains("# Project Instructions"));
+        assert!(prompts[0].contains("NEMO-A2A-1"));
+        assert!(prompts[0].contains("buzz_a2a_handoff"));
+        assert!(prompts[0].contains("END-NEMO-SKILL"));
+        assert!(prompts[0].ends_with("heartbeat-1"));
+        assert_eq!(prompts[1], "heartbeat-2");
+        relay_server.abort();
+    }
+
+    #[tokio::test]
     async fn job_session_new_uses_receiver_verified_working_directory() {
         let (acp, capture) = scripted_agent(Some(true)).await;
         let mut agent = owned(acp);
@@ -10133,7 +10699,7 @@ done"#
     }
 
     #[tokio::test]
-    async fn nemo_project_skill_enters_codex_and_claude_startup_prompts() {
+    async fn nemo_workspace_skill_enters_codex_and_claude_dm_startup_prompts() {
         const NEMO_SKILL_FIXTURE: &str = r#"---
 name: nemo-a2a
 description: Coordinate authenticated Nemo development work between Codex and Claude agents over Buzz.
@@ -10190,9 +10756,122 @@ not acceptance. Never put credentials or host-local paths in a prompt."#;
             default_repo_id: Some("nemo".into()),
             default_repo_clone_urls: vec!["https://github.com/mysteropodes/nemo.git".into()],
         };
-        let preload = crate::project_preload::resolve(harness.path(), &project, None)
-            .expect("Nemo preload resolution")
-            .expect("Nemo checkout");
+        let workspace_home = Uuid::new_v4();
+        let dm_channel = Uuid::new_v4();
+        let (relay_base_url, relay_server) =
+            workspace_project_relay(workspace_home, &project).await;
+        let mut prompt_context = tests::make_prompt_context_no_owner();
+        prompt_context.workspace_project_channel = Some(workspace_home);
+        prompt_context.channel_info = ChannelInfoResolver::new(
+            HashMap::new(),
+            RestClient {
+                http: reqwest::Client::new(),
+                base_url: relay_base_url,
+                keys: prompt_context.agent_keys.clone(),
+                auth_tag_json: None,
+            },
+        );
+        let instruction_revision = {
+            assert!(std::process::Command::new("git")
+                .arg("-C")
+                .arg(&checkout)
+                .args([
+                    "-c",
+                    "user.name=Buzz Test",
+                    "-c",
+                    "user.email=buzz-test@example.invalid",
+                    "add",
+                    ".agents",
+                ])
+                .status()
+                .expect("git add fixture")
+                .success());
+            assert!(std::process::Command::new("git")
+                .arg("-C")
+                .arg(&checkout)
+                .args([
+                    "-c",
+                    "user.name=Buzz Test",
+                    "-c",
+                    "user.email=buzz-test@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "fixture",
+                ])
+                .status()
+                .expect("git commit fixture")
+                .success());
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&checkout)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .expect("git revision fixture");
+            String::from_utf8(output.stdout)
+                .expect("UTF-8 revision")
+                .trim()
+                .to_string()
+        };
+        prompt_context.workspace_project_revision = Some(instruction_revision.clone());
+        prompt_context
+            .channel_info
+            .projects
+            .write()
+            .unwrap()
+            .insert(
+                workspace_home,
+                CachedProjectInfo {
+                    fetched_at: std::time::Instant::now(),
+                    value: Some(project.clone()),
+                },
+            );
+        let source = PromptSource::Channel(SessionScope::Conversation {
+            channel_id: dm_channel,
+        });
+        let dm_info = PromptChannelInfo {
+            name: "Direct message".into(),
+            channel_type: "dm".into(),
+            description: None,
+            project: None,
+        };
+        let selected_project =
+            resolve_workspace_prompt_project(&prompt_context, &source, Some(&dm_info))
+                .await
+                .expect("workspace project selection")
+                .expect("workspace Project applies outside its home channel");
+        assert_eq!(selected_project, project);
+        let ordinary_project = resolve_workspace_prompt_project(
+            &prompt_context,
+            &PromptSource::Channel(SessionScope::Conversation {
+                channel_id: Uuid::new_v4(),
+            }),
+            Some(&PromptChannelInfo {
+                name: "General".into(),
+                channel_type: "stream".into(),
+                description: None,
+                project: None,
+            }),
+        )
+        .await
+        .expect("ordinary channel selection")
+        .expect("workspace Project applies to ordinary channels");
+        assert_eq!(ordinary_project, project);
+        let heartbeat_project =
+            resolve_workspace_prompt_project(&prompt_context, &PromptSource::Heartbeat, None)
+                .await
+                .expect("heartbeat selection")
+                .expect("workspace Project applies to heartbeats");
+        assert_eq!(heartbeat_project, project);
+
+        let preload = crate::project_preload::resolve(
+            harness.path(),
+            &selected_project,
+            None,
+            Some(&instruction_revision),
+        )
+        .expect("Nemo preload resolution")
+        .expect("Nemo checkout");
         let project_instructions = preload.instructions.expect("project instructions");
         let checkout = preload.working_directory.to_string_lossy().into_owned();
 
@@ -10204,19 +10883,18 @@ not acceptance. Never put credentials or host-local paths in a prompt."#;
             let mut agent = owned(acp);
             agent.agent_name = agent_name.into();
             agent.protocol_version = protocol_version;
-            let ctx = tests::make_prompt_context_no_owner();
             create_session_and_apply_model_at(
                 &mut agent,
-                &ctx,
+                &prompt_context,
                 &checkout,
                 Some(&project_instructions),
                 None,
                 NewSessionChannelContext {
                     huddle_instructions: None,
                     canvas: None,
-                    name: Some("Nemo"),
+                    name: None,
                     scope: None,
-                    channel_type: Some("stream"),
+                    channel_type: Some("dm"),
                 },
             )
             .await
@@ -10244,6 +10922,242 @@ not acceptance. Never put credentials or host-local paths in a prompt."#;
             let _ = std::fs::remove_file(capture);
             agent.acp.shutdown().await;
         }
+        relay_server.abort();
+    }
+
+    #[tokio::test]
+    async fn workspace_project_rejects_a_different_project_home() {
+        let workspace_home = Uuid::new_v4();
+        let other_home = Uuid::new_v4();
+        let mut ctx = tests::make_prompt_context_no_owner();
+        ctx.workspace_project_channel = Some(workspace_home);
+        ctx.workspace_project_revision = Some("a".repeat(40));
+        let other = PromptProjectInfo {
+            name: "Other".into(),
+            slug: "other".into(),
+            owner: "b".repeat(64),
+            coordinate: format!("30621:{}:other", "b".repeat(64)),
+            default_repo_owner: None,
+            default_repo_id: None,
+            default_repo_clone_urls: Vec::new(),
+        };
+        let current = PromptChannelInfo {
+            name: "Other".into(),
+            channel_type: "stream".into(),
+            description: None,
+            project: Some(other),
+        };
+        let error = resolve_workspace_prompt_project(
+            &ctx,
+            &PromptSource::Channel(SessionScope::Conversation {
+                channel_id: other_home,
+            }),
+            Some(&current),
+        )
+        .await
+        .expect_err("a different Project must not inherit workspace policy");
+        assert!(error.0.contains("different Project"));
+    }
+
+    #[tokio::test]
+    async fn strict_workspace_scope_rejects_a_new_project_despite_cached_absence() {
+        let workspace_home = Uuid::new_v4();
+        let current_channel = Uuid::new_v4();
+        let owner = "a".repeat(64);
+        let workspace = PromptProjectInfo {
+            name: "Nemo".into(),
+            slug: "nemo".into(),
+            owner: owner.clone(),
+            coordinate: format!("30621:{owner}:nemo"),
+            default_repo_owner: Some(owner.clone()),
+            default_repo_id: Some("nemo".into()),
+            default_repo_clone_urls: vec!["https://github.com/mysteropodes/nemo.git".into()],
+        };
+        let other = PromptProjectInfo {
+            name: "Other".into(),
+            slug: "other".into(),
+            owner: owner.clone(),
+            coordinate: format!("30621:{owner}:other"),
+            default_repo_owner: Some(owner),
+            default_repo_id: Some("other".into()),
+            default_repo_clone_urls: vec!["https://github.com/mysteropodes/other.git".into()],
+        };
+        let (base_url, relay_server) = workspace_projects_relay(vec![
+            (workspace_home, workspace),
+            (current_channel, other.clone()),
+        ])
+        .await;
+        let mut ctx = tests::make_prompt_context_no_owner();
+        ctx.workspace_project_channel = Some(workspace_home);
+        ctx.workspace_project_revision = Some("a".repeat(40));
+        ctx.channel_info = ChannelInfoResolver::new(
+            HashMap::new(),
+            RestClient {
+                http: reqwest::Client::new(),
+                base_url,
+                keys: ctx.agent_keys.clone(),
+                auth_tag_json: None,
+            },
+        );
+        ctx.channel_info.projects.write().unwrap().insert(
+            current_channel,
+            CachedProjectInfo {
+                fetched_at: std::time::Instant::now(),
+                value: None,
+            },
+        );
+        let current = PromptChannelInfo {
+            name: "General".into(),
+            channel_type: "stream".into(),
+            description: None,
+            project: None,
+        };
+        let error = resolve_workspace_prompt_project(
+            &ctx,
+            &PromptSource::Channel(SessionScope::Conversation {
+                channel_id: current_channel,
+            }),
+            Some(&current),
+        )
+        .await
+        .expect_err("fresh Project authority must override cached absence");
+        assert!(error.0.contains("different Project"));
+        assert_eq!(
+            ctx.channel_info
+                .projects
+                .read()
+                .unwrap()
+                .get(&current_channel)
+                .and_then(|cached| cached.value.clone()),
+            Some(other)
+        );
+        relay_server.abort();
+    }
+
+    #[tokio::test]
+    async fn rebound_workspace_project_never_reaches_existing_acp_session() {
+        let workspace_home = Uuid::new_v4();
+        let channel_id = Uuid::new_v4();
+        let scope = SessionScope::Conversation { channel_id };
+        let owner = "a".repeat(64);
+        let replacement = PromptProjectInfo {
+            name: "Replacement".into(),
+            slug: "replacement".into(),
+            owner: owner.clone(),
+            coordinate: format!("30621:{owner}:replacement"),
+            default_repo_owner: Some(owner.clone()),
+            default_repo_id: Some("replacement".into()),
+            default_repo_clone_urls: vec!["https://github.com/mysteropodes/replacement.git".into()],
+        };
+        let original = PromptProjectInfo {
+            name: "Nemo".into(),
+            slug: "nemo".into(),
+            owner: owner.clone(),
+            coordinate: format!("30621:{owner}:nemo"),
+            default_repo_owner: Some(owner),
+            default_repo_id: Some("nemo".into()),
+            default_repo_clone_urls: vec!["https://github.com/mysteropodes/nemo.git".into()],
+        };
+        let revision = "a".repeat(40);
+        let (relay_base_url, relay_server) =
+            workspace_project_relay(workspace_home, &replacement).await;
+
+        let capture = std::env::temp_dir().join(format!(
+            "buzz-acp-workspace-rebind-wire-{}.ndjson",
+            Uuid::new_v4()
+        ));
+        let script =
+            "while IFS= read -r line; do printf '%s\\n' \"$line\" >> \"$CAPTURE_FILE\"; done";
+        let acp = AcpClient::spawn(
+            "bash",
+            &["-c".into(), script.into()],
+            &[(
+                "CAPTURE_FILE".into(),
+                capture.to_string_lossy().into_owned(),
+            )],
+            false,
+        )
+        .await
+        .expect("spawn workspace rebind wire capture");
+        let mut agent = owned(acp);
+        agent
+            .state
+            .sessions
+            .insert(scope.clone(), "existing-session".into());
+        agent
+            .state
+            .deliveries
+            .insert(scope.clone(), ChannelDeliveryState::default());
+        agent.state.workspace_instruction_bindings.insert(
+            scope.clone(),
+            WorkspaceInstructionBinding {
+                home_channel: workspace_home,
+                project: original,
+                revision: revision.clone(),
+            },
+        );
+
+        let event = EventBuilder::new(Kind::Custom(9), "continue existing session")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let event_id = event.id.to_hex();
+        let batch = FlushBatch {
+            channel_id,
+            scope,
+            events: vec![crate::queue::BatchEvent {
+                event,
+                prompt_tag: "test".into(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+
+        let mut ctx = tests::make_prompt_context_no_owner();
+        ctx.dedup_mode = DedupMode::Queue;
+        ctx.workspace_project_channel = Some(workspace_home);
+        ctx.workspace_project_revision = Some(revision);
+        ctx.channel_info = ChannelInfoResolver::new(
+            HashMap::from([(
+                channel_id,
+                crate::relay::ChannelInfo {
+                    name: "general".into(),
+                    channel_type: "stream".into(),
+                    description: None,
+                },
+            )]),
+            RestClient {
+                http: reqwest::Client::new(),
+                base_url: relay_base_url,
+                keys: ctx.agent_keys.clone(),
+                auth_tag_json: None,
+            },
+        );
+        let (result_tx, mut result_rx) = mpsc::unbounded_channel();
+        run_prompt_task(
+            agent,
+            Some(batch),
+            None,
+            Arc::new(ctx),
+            result_tx,
+            None,
+            PromptExecution::new(None, "workspace-rebind-turn".into()),
+        )
+        .await;
+
+        let mut result = result_rx.recv().await.expect("workspace rebind result");
+        assert!(matches!(
+            result.outcome,
+            PromptOutcome::ProjectContextIndeterminate(_)
+        ));
+        let retry = result.batch.take().expect("rebound turn must be requeued");
+        assert_eq!(retry.events[0].event.id.to_hex(), event_id);
+        result.agent.acp.shutdown().await;
+        relay_server.abort();
+        assert!(
+            !capture.exists(),
+            "a rebound workspace Project must not reach session/prompt on the old session"
+        );
     }
 
     #[tokio::test]

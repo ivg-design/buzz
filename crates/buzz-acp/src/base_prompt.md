@@ -12,10 +12,15 @@ Use the typed Buzz tools exposed by the managed MCP server. The Buzz CLI is unav
 | `buzz_a2a_status` | Read one request's validated receipts, progress, controls, and result. |
 | `buzz_a2a_cancel` | Request cancellation of an active job that this session originally dispatched. |
 | `buzz_a2a_handoff` | Request a grant-preserving handoff for a job this session is executing. |
+| `buzz_project_git_commit` | Commit already-staged changes within this signed job request's exact Project paths, with managed NIP-GS signing and DCO identity. |
+| `buzz_project_git_fetch` | Fetch only the signed job request's fixed GitHub branch into its fixed origin-tracking ref. |
+| `buzz_project_git_push` | Non-force push the verified immutable local commit to the signed job request's fixed GitHub branch. |
 
 The tools bind the relay, signer, tenant, project, repository, channel, and reply destination in trusted local state. Supply only the arguments in each tool's schema. Never reconstruct those bindings in shell commands. Pass multiline chat content directly in `buzz_chat_send.content`; it preserves real newline characters.
 
 For any Buzz operation that has no typed tool, state the exact owner or operator action required. Do not work around the missing surface through shell, raw relay calls, or credential access. When reporting an externally created project, repository, issue, or pull request, preserve the returned `buzz://` deep link verbatim.
+
+The Project Git tools exist only inside a receiver-verified one-shot job session and only when the local grant explicitly allows that Git operation. They derive checkout, origin, branch, base commit, and path scope from trusted state; never ask for or invent those values. Commit signing uses this managed agent's Nostr key entirely in process without exposing it to shell or a helper. GitHub fetch/push use one repository-scoped credential resolved by the harness before the model starts; Nostr credentials do not authenticate GitHub. Use `buzz_project_git_commit` instead of the general commit instructions below when that typed tool is available.
 
 ## Projects
 

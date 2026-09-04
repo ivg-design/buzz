@@ -7,7 +7,7 @@ const DEFAULT_LIMIT: usize = 2000;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ReadFileParams {
-    /// File path (absolute or relative to workdir).
+    /// Checkout-relative file path. Absolute and tilde paths are rejected.
     pub path: String,
     /// 0-based line offset to start reading from. Defaults to 0.
     #[serde(default)]
@@ -15,7 +15,7 @@ pub struct ReadFileParams {
     /// Maximum number of lines to return. Defaults to 2000.
     #[serde(default)]
     pub limit: Option<usize>,
-    /// Workspace root for relative path resolution. Defaults to server cwd.
+    /// Checkout-relative directory for path resolution. Defaults to checkout root.
     #[serde(default)]
     pub workdir: Option<String>,
 }
@@ -86,7 +86,7 @@ mod tests {
             path: "basic.txt".into(),
             offset: None,
             limit: None,
-            workdir: Some(dir.path().display().to_string()),
+            workdir: None,
         };
         let out = run(&state, p).expect("ok");
         assert!(out.contains("lines 1-5 of 5"), "out: {out}");
@@ -112,7 +112,7 @@ mod tests {
             path: "ten.txt".into(),
             offset: Some(3),
             limit: Some(2),
-            workdir: Some(dir.path().display().to_string()),
+            workdir: None,
         };
         let out = run(&state, p).expect("ok");
         assert!(out.contains("lines 4-5 of 10"), "out: {out}");
@@ -134,14 +134,14 @@ mod tests {
             path: "empty.txt".into(),
             offset: None,
             limit: None,
-            workdir: Some(dir.path().display().to_string()),
+            workdir: None,
         };
         let out = run(&state, p).expect("ok");
         assert!(out.contains("is empty (0 lines)"), "out: {out}");
     }
 
     #[test]
-    fn read_allows_absolute_path() {
+    fn read_rejects_absolute_path_outside_checkout() {
         let dir = tempdir().expect("tempdir");
         // A real file in a SECOND tempdir, genuinely outside the workspace
         // root — proves absolute paths beyond workdir resolve, without a
@@ -155,13 +155,10 @@ mod tests {
             path: target.display().to_string(),
             offset: None,
             limit: None,
-            workdir: Some(dir.path().display().to_string()),
+            workdir: None,
         };
-        let out = run(&state, p).expect("ok");
-        assert!(
-            out.contains("localhost"),
-            "expected out-of-workspace file content, got: {out}"
-        );
+        let error = run(&state, p).expect_err("outside path must fail");
+        assert!(format!("{error:?}").contains("must be relative"));
     }
 
     #[test]
@@ -175,7 +172,7 @@ mod tests {
             path: "big.bin".into(),
             offset: None,
             limit: None,
-            workdir: Some(dir.path().display().to_string()),
+            workdir: None,
         };
         let err = run(&state, p).unwrap_err();
         let msg = format!("{err:?}");
@@ -192,7 +189,7 @@ mod tests {
             path: "short.txt".into(),
             offset: Some(100),
             limit: None,
-            workdir: Some(dir.path().display().to_string()),
+            workdir: None,
         };
         let out = run(&state, p).expect("ok");
         assert!(out.contains("no lines in range"), "out: {out}");
@@ -209,7 +206,7 @@ mod tests {
             path: "some.txt".into(),
             offset: None,
             limit: Some(0),
-            workdir: Some(dir.path().display().to_string()),
+            workdir: None,
         };
         let out = run(&state, p).expect("ok");
         assert!(out.contains("no lines in range"), "out: {out}");
@@ -225,7 +222,7 @@ mod tests {
             path: "notrail.txt".into(),
             offset: None,
             limit: None,
-            workdir: Some(dir.path().display().to_string()),
+            workdir: None,
         };
         let out = run(&state, p).expect("ok");
         assert!(out.contains("lines 1-3 of 3"), "out: {out}");

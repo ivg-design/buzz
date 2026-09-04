@@ -515,6 +515,10 @@ pub fn spawn_agent_child(
     let effective_command = &descriptor.command;
     let agent_args = &descriptor.args;
 
+    let resolved_acp_command = resolve_command(&record.acp_command)
+        .ok_or_else(|| missing_command_message(&record.acp_command, "ACP harness command"))?;
+    let resolved_acp_command = startup_pipe::trusted_harness_path(&resolved_acp_command)?;
+
     let log_path = super::managed_agent_runtime_log_path(app, &runtime_key)?;
     append_log_marker(
         &log_path,
@@ -530,8 +534,6 @@ pub fn spawn_agent_child(
     let stderr = stdout
         .try_clone()
         .map_err(|error| format!("failed to clone log handle: {error}"))?;
-    let resolved_acp_command = resolve_command(&record.acp_command)
-        .ok_or_else(|| missing_command_message(&record.acp_command, "ACP harness command"))?;
     let effective_mcp_command = known_acp_runtime(effective_command)
         .and_then(|r| r.mcp_command)
         .unwrap_or("");
@@ -840,8 +842,13 @@ pub fn spawn_agent_child(
             record.name
         )
     })?;
+    if let Err(error) = startup_pipe::verify_spawned_harness(&child, &resolved_acp_command) {
+        let _ = process::terminate_process(child.id());
+        let _ = child.wait();
+        return Err(error);
+    }
     if let Err(error) = startup_payload.deliver(&mut child) {
-        let _ = child.kill();
+        let _ = process::terminate_process(child.id());
         let _ = child.wait();
         return Err(error);
     }

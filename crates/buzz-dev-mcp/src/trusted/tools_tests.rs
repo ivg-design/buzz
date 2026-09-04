@@ -1,3 +1,4 @@
+use super::super::{ProjectGitCommitParams, ProjectGitParams};
 use super::*;
 
 #[test]
@@ -63,6 +64,44 @@ fn dispatch_rejects_authority_fields_outside_the_typed_surface() {
     }
 }
 
+#[test]
+fn project_git_schemas_expose_no_checkout_or_transport_authority() {
+    assert!(serde_json::from_value::<ProjectGitParams>(serde_json::json!({})).is_ok());
+    assert!(
+        serde_json::from_value::<ProjectGitCommitParams>(serde_json::json!({
+            "message": "bounded change"
+        }))
+        .is_ok()
+    );
+    for forbidden in [
+        "root",
+        "path",
+        "paths",
+        "repository",
+        "remote",
+        "url",
+        "branch",
+        "refspec",
+        "force",
+        "credential_helper",
+        "signing_key",
+    ] {
+        let mut empty = serde_json::json!({});
+        empty[forbidden] = serde_json::json!("attacker-controlled");
+        assert!(
+            serde_json::from_value::<ProjectGitParams>(empty).is_err(),
+            "empty Project Git schema accepted {forbidden}"
+        );
+
+        let mut commit = serde_json::json!({"message": "bounded change"});
+        commit[forbidden] = serde_json::json!("attacker-controlled");
+        assert!(
+            serde_json::from_value::<ProjectGitCommitParams>(commit).is_err(),
+            "Project Git commit schema accepted {forbidden}"
+        );
+    }
+}
+
 fn job_bound_relay() -> Arc<TrustedRelay> {
     let keys = nostr::Keys::generate();
     Arc::new(
@@ -78,6 +117,8 @@ fn job_bound_relay() -> Arc<TrustedRelay> {
             session_thread_root_id: None,
             job_operation_id: Some("a580ca9b-47b4-4af9-b22a-1068778f26c6".into()),
             job_request_event_id: Some("a".repeat(64)),
+            session_working_directory: None,
+            github_credentials: Default::default(),
             allow_insecure_loopback: true,
         })
         .expect("test relay"),

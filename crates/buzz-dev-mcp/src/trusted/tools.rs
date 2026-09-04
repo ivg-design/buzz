@@ -157,52 +157,53 @@ pub async fn cancel(
     publish_result(result)
 }
 
-pub async fn handoff(
+pub(super) async fn prepare_handoff(
     relay: &Arc<TrustedRelay>,
     params: A2aHandoffParams,
     cancellation: CancellationToken,
-) -> CallToolResult {
-    let result = async {
-        let events = relay
-            .query_job_events(Some(&params.request_event_id), 100, &cancellation)
-            .await?;
-        let chain = JobChain::parse(events, &params.request_event_id)?;
-        chain.ensure_recipient(relay)?;
-        chain.ensure_active()?;
-        ensure_bound_job_session(relay, &chain.request.common, &params.request_event_id)?;
-        let target_grant = relay.grants.outbound(
-            &params.handoff_to,
-            &chain.request.capability,
-            &chain.request.common.repository.paths,
-            &params.worktree_id,
-        )?;
-        if target_grant.repository != chain.request.common.repository.canonical
-            || target_grant.project_address != chain.request.common.project.address
-            || target_grant.home_channel != chain.request.common.project.home_channel
-            || target_grant.branch != chain.request.common.repository.branch
-            || params.worktree_id != chain.request.common.repository.worktree_id
-        {
-            return Err("handoff must preserve the original repository checkout scope".into());
-        }
-        let mut common = chain.request.common.clone();
-        common.sender_pubkey = relay.signer_pubkey();
-        common.recipient_pubkey = chain.request.common.sender_pubkey.clone();
-        let control = JobControl {
-            followup: JobFollowup {
-                common,
-                request_event_id: params.request_event_id,
-                prior_event_id: chain.prior_event_id(),
-            },
-            action: JobControlAction::Handoff,
-            reason: params.reason,
-            handoff_to: Some(params.handoff_to),
-        };
-        relay
-            .publish_job(JobEvent::Control(control), &cancellation)
-            .await
+) -> Result<nostr::Event, String> {
+    let events = relay
+        .query_job_events(Some(&params.request_event_id), 100, &cancellation)
+        .await?;
+    let chain = JobChain::parse(events, &params.request_event_id)?;
+    chain.ensure_recipient(relay)?;
+    chain.ensure_active()?;
+    ensure_bound_job_session(relay, &chain.request.common, &params.request_event_id)?;
+    let target_grant = relay.grants.outbound(
+        &params.handoff_to,
+        &chain.request.capability,
+        &chain.request.common.repository.paths,
+        &params.worktree_id,
+    )?;
+    if target_grant.repository != chain.request.common.repository.canonical
+        || target_grant.project_address != chain.request.common.project.address
+        || target_grant.home_channel != chain.request.common.project.home_channel
+        || target_grant.branch != chain.request.common.repository.branch
+        || params.worktree_id != chain.request.common.repository.worktree_id
+    {
+        return Err("handoff must preserve the original repository checkout scope".into());
     }
-    .await;
-    match result {
+    let mut common = chain.request.common.clone();
+    common.sender_pubkey = relay.signer_pubkey();
+    common.recipient_pubkey = chain.request.common.sender_pubkey.clone();
+    relay.prepare_job_event(JobEvent::Control(JobControl {
+        followup: JobFollowup {
+            common,
+            request_event_id: params.request_event_id,
+            prior_event_id: chain.prior_event_id(),
+        },
+        action: JobControlAction::Handoff,
+        reason: params.reason,
+        handoff_to: Some(params.handoff_to),
+    }))
+}
+
+pub(super) async fn publish_prepared_handoff(
+    relay: &Arc<TrustedRelay>,
+    event: nostr::Event,
+    cancellation: CancellationToken,
+) -> CallToolResult {
+    match relay.publish_prepared_job_event(event, &cancellation).await {
         Ok(event) => json_result(&serde_json::json!({
             "event_id": event.event_id,
             "accepted": event.accepted,

@@ -141,6 +141,12 @@ impl JobEmitter {
         &self.scope_digest
     }
 
+    /// Whether a relay-confirmed terminal has already closed this lifecycle.
+    pub async fn is_terminal(&self) -> Result<bool, EmitError> {
+        let (_, _, terminal) = self.lifecycle.snapshot().await?;
+        Ok(terminal)
+    }
+
     pub async fn progress(
         &self,
         status: JobProgressStatus,
@@ -383,6 +389,7 @@ mod tests {
                 if result.capabilities == ["rust"]
                     && result.followup.prior_event_id.as_deref() == Some(progress_id.as_str())
         ));
+        assert!(emitter.is_terminal().await.expect("terminal snapshot"));
         server.abort();
         std::fs::remove_dir_all(root).ok();
     }

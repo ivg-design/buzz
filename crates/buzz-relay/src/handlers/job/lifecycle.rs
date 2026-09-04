@@ -1,6 +1,64 @@
-use buzz_core::job::{JobClaimStatus, JobControlAction, JobEvent};
+use buzz_core::job::{JobClaimStatus, JobControlAction, JobErrorOutcome, JobEvent};
 
 use super::gate::JobAuthError;
+
+pub(super) const MEMBERSHIP_REVOKED_CODE: &str = "membership_revoked";
+pub(super) const MEMBERSHIP_REVOKED_MESSAGE: &str =
+    "Project channel authorization was revoked while the worker was active";
+
+/// Recognize the one terminal audit shape that may reach locked validation
+/// after its signer has lost Project membership. The fixed message prevents
+/// this exception from becoming a former member's arbitrary write channel.
+pub(super) fn is_membership_revoked_terminal(job: &JobEvent) -> bool {
+    matches!(
+        job,
+        JobEvent::Error(error)
+            if error.outcome == JobErrorOutcome::Indeterminate
+                && !error.retryable
+                && error.code == MEMBERSHIP_REVOKED_CODE
+                && error.message == MEMBERSHIP_REVOKED_MESSAGE
+    )
+}
+
+/// Bind the revocation audit to the exact worker that had already accepted
+/// this request and to the current worker-authored execution chain.
+pub(super) fn validate_membership_revoked_predecessor(
+    current: &JobEvent,
+    prior: &JobEvent,
+    request: &JobEvent,
+) -> Result<(), JobAuthError> {
+    if !is_membership_revoked_terminal(current) {
+        return Err(JobAuthError::Invalid(
+            "former-member exception requires the exact membership_revoked terminal".into(),
+        ));
+    }
+    let JobEvent::Request(root) = request else {
+        return Err(JobAuthError::Invalid(
+            "membership_revoked request root is not kind 43001".into(),
+        ));
+    };
+    let worker = &root.common.recipient_pubkey;
+    let requester = &root.common.sender_pubkey;
+    if current.common().sender_pubkey != *worker
+        || current.common().recipient_pubkey != *requester
+        || prior.common().sender_pubkey != *worker
+        || prior.common().recipient_pubkey != *requester
+    {
+        return Err(JobAuthError::Restricted(
+            "membership_revoked terminal must be authored by the originally accepted worker".into(),
+        ));
+    }
+    if !matches!(
+        prior,
+        JobEvent::Accepted(body) if body.claim.status == JobClaimStatus::Accepted
+    ) && !matches!(prior, JobEvent::Progress(_))
+    {
+        return Err(JobAuthError::Invalid(
+            "membership_revoked terminal must close an accepted worker chain".into(),
+        ));
+    }
+    Ok(())
+}
 
 pub(super) fn validate_transition(
     current: &JobEvent,
@@ -100,7 +158,7 @@ pub(super) fn validate_predecessor(
         JobEvent::Accepted(body) if body.claim.status == JobClaimStatus::Declined => Err(
             JobAuthError::Invalid("declined receipt must not carry prior_event_id".into()),
         ),
-        JobEvent::Progress(_) | JobEvent::Result(_) | JobEvent::Error(_) => match prior {
+        JobEvent::Progress(_) | JobEvent::Result(_) => match prior {
             JobEvent::Accepted(prior_body)
                 if prior_body.claim.status == JobClaimStatus::Accepted =>
             {
@@ -109,6 +167,30 @@ pub(super) fn validate_predecessor(
             JobEvent::Progress(_) => Ok(()),
             _ => Err(JobAuthError::Invalid(
                 "job lifecycle event must follow an accepted receipt or progress event".into(),
+            )),
+        },
+        JobEvent::Error(error) => match prior {
+            JobEvent::Accepted(prior_body)
+                if prior_body.claim.status == JobClaimStatus::Accepted =>
+            {
+                Ok(())
+            }
+            JobEvent::Progress(_) => Ok(()),
+            JobEvent::Control(control)
+                if control.action == JobControlAction::Cancel
+                    && error.outcome == JobErrorOutcome::Indeterminate
+                    && !error.retryable =>
+            {
+                Ok(())
+            }
+            JobEvent::Control(control) if control.action == JobControlAction::Cancel => Err(
+                JobAuthError::Invalid(
+                    "only a non-retryable indeterminate error may follow requester cancel".into(),
+                ),
+            ),
+            _ => Err(JobAuthError::Invalid(
+                "job lifecycle error must follow an accepted receipt, progress, or requester cancel event"
+                    .into(),
             )),
         },
         JobEvent::Control(control) => match (control.action, prior) {

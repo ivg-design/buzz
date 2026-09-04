@@ -1,6 +1,8 @@
 use std::collections::{BTreeSet, HashSet};
+use std::io::Read as _;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use buzz_core::job::JobRequest;
 use serde::Deserialize;
@@ -10,6 +12,9 @@ use uuid::Uuid;
 const MAX_GRANTS: usize = 128;
 const MAX_CAPABILITIES_PER_GRANT: usize = 64;
 const MAX_PATH_PREFIXES_PER_GRANT: usize = 128;
+const MAX_GRANT_DOCUMENT_BYTES: u64 = 768 * 1024;
+const MAX_GIT_OUTPUT_BYTES: u64 = 64 * 1024;
+const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Error)]
 pub enum GrantError {
@@ -36,6 +41,8 @@ struct JobGrant {
     repository: String,
     requester_pubkeys: Vec<String>,
     capabilities: Vec<String>,
+    #[serde(default)]
+    git_operations: Vec<String>,
     path_prefixes: Vec<String>,
     base_sha: String,
     branch: String,
@@ -47,6 +54,14 @@ struct JobGrant {
 pub struct GrantMatch {
     pub capabilities: Vec<String>,
     pub checkout_root: PathBuf,
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparedJobSources {
+    pub grants_json: Option<String>,
+    pub grant_source_file: Option<PathBuf>,
+    pub ledger_root: Option<PathBuf>,
+    pub protected_ledger_root: Option<PathBuf>,
 }
 
 /// Local, operator-controlled capabilities for accepting signed job requests.
@@ -61,18 +76,27 @@ impl GrantSet {
         grants_json: Option<String>,
         grants_file: Option<std::path::PathBuf>,
     ) -> Result<Self, GrantError> {
-        if let Some(raw) = grants_json {
-            return Self::from_json(&raw);
-        }
-        let path = grants_file.unwrap_or_else(|| cwd.join(".buzz/agent-job-grants.json"));
-        match std::fs::read_to_string(path) {
-            Ok(raw) => Self::from_json(&raw),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(error) => Err(error.into()),
+        match (grants_json, grants_file) {
+            (Some(_), Some(_)) => Err(GrantError::Invalid(
+                "grant JSON and grant file are mutually exclusive".into(),
+            )),
+            (Some(raw), None) => Self::from_json(&raw),
+            (None, Some(path)) => {
+                let (_, raw) = read_secure_grant_file(cwd, &path)?;
+                Self::from_json(&raw)
+            }
+            // There is deliberately no checkout-local fallback. An absent
+            // operator-controlled source means there are no grants.
+            (None, None) => Ok(Self::default()),
         }
     }
 
     pub fn from_json(raw: &str) -> Result<Self, GrantError> {
+        if raw.len() as u64 > MAX_GRANT_DOCUMENT_BYTES {
+            return Err(GrantError::Invalid(format!(
+                "grant document exceeds {MAX_GRANT_DOCUMENT_BYTES} bytes"
+            )));
+        }
         let mut document: GrantDocument = serde_json::from_str(raw)?;
         if document.version != 1 {
             return Err(GrantError::Invalid("version must be 1".into()));
@@ -96,6 +120,10 @@ impl GrantSet {
 
     pub fn capabilities_for(&self, request: &JobRequest) -> Option<Vec<String>> {
         Some(self.matching_grant(request)?.capabilities.clone())
+    }
+
+    pub fn git_operations_for(&self, request: &JobRequest) -> Option<Vec<String>> {
+        Some(self.matching_grant(request)?.git_operations.clone())
     }
 
     pub fn authorize_request(&self, request: &JobRequest) -> Option<GrantMatch> {
@@ -126,6 +154,12 @@ impl GrantSet {
             .any(|grant| grant.home_channel == channel_id.to_string())
     }
 
+    pub(super) fn checkout_roots(&self) -> impl Iterator<Item = &Path> {
+        self.grants
+            .iter()
+            .map(|grant| grant.checkout_root.as_path())
+    }
+
     fn matching_grant(&self, request: &JobRequest) -> Option<&JobGrant> {
         let mut matches = self.grants.iter().filter(|grant| {
             grant.project_address == request.common.project.address
@@ -152,6 +186,260 @@ impl GrantSet {
         let matched = matches.next()?;
         matches.next().is_none().then_some(matched)
     }
+}
+
+pub(crate) fn prepare_job_sources(
+    cwd: &Path,
+    grants_json: Option<String>,
+    grants_file: Option<PathBuf>,
+    ledger_root: Option<PathBuf>,
+) -> Result<PreparedJobSources, GrantError> {
+    let (grants_json, grant_source_file) = match (grants_json, grants_file) {
+        (Some(_), Some(_)) => {
+            return Err(GrantError::Invalid(
+                "grant JSON and grant file are mutually exclusive".into(),
+            ));
+        }
+        (Some(raw), None) => (Some(raw), None),
+        (None, Some(path)) => {
+            let (canonical, raw) = read_secure_grant_file(cwd, &path)?;
+            (Some(raw), Some(canonical))
+        }
+        (None, None) => (None, None),
+    };
+    let grants = match grants_json.as_deref() {
+        Some(raw) => GrantSet::from_json(raw)?,
+        None => GrantSet::default(),
+    };
+    if let Some(source) = grant_source_file.as_deref() {
+        reject_model_controlled_path(cwd, source, grants.checkout_roots())?;
+    }
+    let (ledger_root, protected_ledger_root) = match ledger_root {
+        Some(root) => {
+            let root = prepare_private_ledger_root(cwd, &root, grants.checkout_roots())?;
+            (Some(root.clone()), Some(root))
+        }
+        None if grants.is_empty() => (None, None),
+        None => {
+            let base = super::default_ledger_base()?;
+            let base = prepare_private_ledger_root(cwd, &base, grants.checkout_roots())?;
+            (None, Some(base))
+        }
+    };
+    Ok(PreparedJobSources {
+        grants_json,
+        grant_source_file,
+        ledger_root,
+        protected_ledger_root,
+    })
+}
+
+pub(super) fn prepare_private_ledger_root<'a>(
+    cwd: &Path,
+    requested: &Path,
+    checkout_roots: impl Iterator<Item = &'a Path>,
+) -> Result<PathBuf, GrantError> {
+    if !requested.is_absolute()
+        || requested
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return Err(GrantError::Invalid(
+            "job ledger root must be a normalized absolute path".into(),
+        ));
+    }
+    let canonical = canonicalize_for_private_directory(requested)?;
+    reject_model_controlled_path(cwd, &canonical, checkout_roots)?;
+    secure_private_directory(&canonical)?;
+    Ok(canonical)
+}
+
+fn canonicalize_for_private_directory(path: &Path) -> Result<PathBuf, GrantError> {
+    let mut existing = path;
+    let mut suffix = Vec::new();
+    loop {
+        match std::fs::symlink_metadata(existing) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    return Err(GrantError::Invalid(
+                        "job ledger root must not contain symbolic links".into(),
+                    ));
+                }
+                if !metadata.is_dir() {
+                    return Err(GrantError::Invalid(
+                        "job ledger root parent must be a directory".into(),
+                    ));
+                }
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let name = existing.file_name().ok_or_else(|| {
+                    GrantError::Invalid("job ledger root has no existing ancestor".into())
+                })?;
+                suffix.push(name.to_os_string());
+                existing = existing.parent().ok_or_else(|| {
+                    GrantError::Invalid("job ledger root has no existing ancestor".into())
+                })?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    reject_symlink_components(existing)?;
+    let mut canonical = existing.canonicalize()?;
+    for component in suffix.into_iter().rev() {
+        canonical.push(component);
+    }
+    Ok(canonical)
+}
+
+fn reject_model_controlled_path<'a>(
+    cwd: &Path,
+    candidate: &Path,
+    checkout_roots: impl Iterator<Item = &'a Path>,
+) -> Result<(), GrantError> {
+    let cwd = cwd.canonicalize().map_err(|_| {
+        GrantError::Invalid("working directory must be an existing canonical path".into())
+    })?;
+    if candidate.starts_with(&cwd)
+        || checkout_roots
+            .filter_map(|root| root.canonicalize().ok())
+            .any(|root| candidate.starts_with(root))
+    {
+        return Err(GrantError::Invalid(
+            "grant and ledger paths must be outside every model-controlled checkout".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn secure_private_directory(path: &Path) -> Result<(), GrantError> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    std::fs::create_dir_all(path)?;
+    reject_symlink_components(path)?;
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(GrantError::Invalid(
+            "job ledger root must be a real directory".into(),
+        ));
+    }
+    if metadata.uid() != nix::unistd::geteuid().as_raw() {
+        return Err(GrantError::Invalid(
+            "job ledger root must be owned by the current operator".into(),
+        ));
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    let secured = std::fs::symlink_metadata(path)?;
+    if secured.permissions().mode() & 0o077 != 0 {
+        return Err(GrantError::Invalid(
+            "job ledger root could not be restricted to its owner".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn secure_private_directory(_path: &Path) -> Result<(), GrantError> {
+    Err(GrantError::Invalid(
+        "job ledgers are disabled until this platform has owner-only ACL validation".into(),
+    ))
+}
+
+/// Read an operator grant document exactly once before any model-controlled
+/// process exists. The returned canonical path is retained only so generic MCP
+/// tools can deny access to the source; all authorization uses the returned
+/// immutable in-memory bytes.
+pub(super) fn read_secure_grant_file(
+    cwd: &Path,
+    path: &Path,
+) -> Result<(PathBuf, String), GrantError> {
+    if !path.is_absolute() {
+        return Err(GrantError::Invalid(
+            "grant file must be an absolute path outside the checkout".into(),
+        ));
+    }
+    let cwd = cwd.canonicalize().map_err(|_| {
+        GrantError::Invalid("working directory must be an existing canonical path".into())
+    })?;
+    reject_symlink_components(path)?;
+    let canonical = path.canonicalize().map_err(|error| {
+        GrantError::Invalid(format!(
+            "grant file must be an existing regular file: {error}"
+        ))
+    })?;
+    if canonical.starts_with(&cwd) {
+        return Err(GrantError::Invalid(
+            "grant file must be outside the model-controlled checkout".into(),
+        ));
+    }
+
+    let mut file = open_private_grant_file(&canonical)?;
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take(MAX_GRANT_DOCUMENT_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_GRANT_DOCUMENT_BYTES {
+        return Err(GrantError::Invalid(format!(
+            "grant document exceeds {MAX_GRANT_DOCUMENT_BYTES} bytes"
+        )));
+    }
+    let raw = String::from_utf8(bytes)
+        .map_err(|_| GrantError::Invalid("grant document must be UTF-8 JSON".into()))?;
+    Ok((canonical, raw))
+}
+
+#[cfg(unix)]
+fn open_private_grant_file(path: &Path) -> Result<std::fs::File, GrantError> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(GrantError::Invalid(
+            "grant file must be a regular file".into(),
+        ));
+    }
+    if metadata.uid() != nix::unistd::geteuid().as_raw() {
+        return Err(GrantError::Invalid(
+            "grant file must be owned by the current operator".into(),
+        ));
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err(GrantError::Invalid(
+            "grant file permissions must not grant group or other access".into(),
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_private_grant_file(_path: &Path) -> Result<std::fs::File, GrantError> {
+    Err(GrantError::Invalid(
+        "grant files are disabled until this platform has owner-only ACL validation; use secure inline grant JSON"
+            .into(),
+    ))
+}
+
+fn reject_symlink_components(path: &Path) -> Result<(), GrantError> {
+    let mut cursor = PathBuf::new();
+    for component in path.components() {
+        cursor.push(component.as_os_str());
+        match std::fs::symlink_metadata(&cursor) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(GrantError::Invalid(
+                    "grant file path must not contain symbolic links".into(),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
 }
 
 fn validate_grant(grant: &mut JobGrant) -> Result<(), GrantError> {
@@ -211,6 +499,16 @@ fn validate_grant(grant: &mut JobGrant) -> Result<(), GrantError> {
             ));
         }
     }
+    let mut git_operations = HashSet::new();
+    for operation in &grant.git_operations {
+        if !matches!(operation.as_str(), "commit" | "fetch" | "push")
+            || !git_operations.insert(operation)
+        {
+            return Err(GrantError::Invalid(
+                "git_operations must contain unique commit, fetch, or push entries".into(),
+            ));
+        }
+    }
     if !valid_sha(&grant.base_sha) {
         return Err(GrantError::Invalid(
             "base_sha must be 40 or 64 lowercase hexadecimal characters".into(),
@@ -256,6 +554,7 @@ fn valid_sha(value: &str) -> bool {
 
 fn checkout_matches(grant: &JobGrant, request: &JobRequest) -> Option<PathBuf> {
     let root = grant.checkout_root.canonicalize().ok()?;
+    checkout_config_is_safe(&root)?;
     let top = git_output(&root, &["rev-parse", "--show-toplevel"])?;
     if Path::new(&top).canonicalize().ok()? != root {
         return None;
@@ -270,25 +569,194 @@ fn checkout_matches(grant: &JobGrant, request: &JobRequest) -> Option<PathBuf> {
 }
 
 fn git_output(root: &Path, args: &[&str]) -> Option<String> {
-    let mut command = Command::new("git");
+    let mut command = Command::new(system_git()?);
     command
         .arg("-C")
         .arg(root)
         .args(args)
         .env_clear()
-        .env(
-            "PATH",
-            std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()),
-        )
+        .env("PATH", system_path())
         .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_CONFIG_NOSYSTEM", "1");
-    let output = command.output().ok()?;
-    if !output.status.success() || !output.stderr.is_empty() {
+        .env("GCM_INTERACTIVE", "never")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", null_device())
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("GIT_ATTR_NOSYSTEM", "1")
+        .env("GIT_ASKPASS", system_false())
+        .env("SSH_ASKPASS", system_false())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = command.spawn().ok()?;
+    let stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout
+            .take(MAX_GIT_OUTPUT_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .ok()
+            .map(|_| bytes)
+    });
+    let deadline = Instant::now() + GIT_COMMAND_TIMEOUT;
+    let status = loop {
+        match child.try_wait().ok()? {
+            Some(status) => break status,
+            None if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                return None;
+            }
+        }
+    };
+    let bytes = reader.join().ok()??;
+    if !status.success() || bytes.len() as u64 > MAX_GIT_OUTPUT_BYTES {
         return None;
     }
-    let value = String::from_utf8(output.stdout).ok()?;
+    let value = String::from_utf8(bytes).ok()?;
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_owned())
+}
+
+fn checkout_config_is_safe(root: &Path) -> Option<()> {
+    let local = git_output(
+        root,
+        &[
+            "config",
+            "--local",
+            "--no-includes",
+            "--name-only",
+            "--null",
+            "--list",
+        ],
+    )?;
+    let keys = parse_config_keys(&local)?;
+    if keys.iter().any(|key| dangerous_local_config_key(key)) {
+        return None;
+    }
+    if keys.iter().any(|key| key == "extensions.worktreeconfig") {
+        let worktree = git_output(
+            root,
+            &[
+                "config",
+                "--worktree",
+                "--no-includes",
+                "--name-only",
+                "--null",
+                "--list",
+            ],
+        )?;
+        if parse_config_keys(&worktree)?
+            .iter()
+            .any(|key| dangerous_local_config_key(key))
+        {
+            return None;
+        }
+    }
+    Some(())
+}
+
+fn parse_config_keys(output: &str) -> Option<Vec<String>> {
+    let keys = output
+        .split('\0')
+        .filter(|value| !value.is_empty())
+        .map(|value| value.trim().to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    keys.iter()
+        .all(|key| !key.is_empty() && key.bytes().all(|byte| byte.is_ascii_graphic()))
+        .then_some(keys)
+}
+
+fn dangerous_local_config_key(key: &str) -> bool {
+    const EXACT: &[&str] = &[
+        "core.alternaterefscommand",
+        "core.askpass",
+        "core.attributesfile",
+        "core.editor",
+        "core.fsmonitor",
+        "core.gitproxy",
+        "core.hookspath",
+        "core.pager",
+        "core.sshcommand",
+        "core.worktree",
+        "credential.helper",
+        "credential.usehttppath",
+        "gpg.format",
+        "sequence.editor",
+        "user.signingkey",
+    ];
+    EXACT.contains(&key)
+        || (key.starts_with("remote.")
+            && !matches!(key, "remote.origin.url" | "remote.origin.fetch"))
+        || (key.starts_with("branch.") && !key.ends_with(".remote") && !key.ends_with(".merge"))
+        || [
+            "credential.",
+            "diff.",
+            "filter.",
+            "gpg.",
+            "http.",
+            "https.",
+            "include.",
+            "includeif.",
+            "merge.",
+            "protocol.",
+            "submodule.",
+            "url.",
+        ]
+        .iter()
+        .any(|prefix| key.starts_with(prefix))
+        || matches!(
+            key,
+            "commit.gpgsign" | "tag.gpgsign" | "format.signoff" | "format.signingkey"
+        )
+}
+
+#[cfg(unix)]
+fn system_git() -> Option<&'static Path> {
+    [Path::new("/usr/bin/git"), Path::new("/bin/git")]
+        .into_iter()
+        .find(|path| path.is_file())
+}
+
+#[cfg(not(unix))]
+fn system_git() -> Option<&'static Path> {
+    // Fail closed until Windows has a trusted, installation-root anchored Git
+    // resolver. In particular, never search the checkout or ambient PATH.
+    None
+}
+
+#[cfg(unix)]
+fn system_path() -> &'static str {
+    "/usr/bin:/bin"
+}
+
+#[cfg(not(unix))]
+fn system_path() -> &'static str {
+    ""
+}
+
+#[cfg(unix)]
+fn null_device() -> &'static str {
+    "/dev/null"
+}
+
+#[cfg(not(unix))]
+fn null_device() -> &'static str {
+    "NUL"
+}
+
+#[cfg(unix)]
+fn system_false() -> &'static str {
+    "/usr/bin/false"
+}
+
+#[cfg(not(unix))]
+fn system_false() -> &'static str {
+    ""
 }
 
 fn canonical_git_origin(value: &str) -> Option<String> {
@@ -367,6 +835,25 @@ mod tests {
     use super::*;
     use buzz_core::job::{JobCommon, JobProject, JobRepository, JobSponsor, JOB_SCHEMA_VERSION};
 
+    fn grant_json(checkout: &Path) -> String {
+        serde_json::json!({
+            "version": 1,
+            "grants": [{
+                "project_address": format!("30621:{}:nemo", "a".repeat(64)),
+                "home_channel": "3580ca9b-47b4-4af9-b22a-1068778f26c6",
+                "repository": "https://github.com/mysteropodes/nemo",
+                "requester_pubkeys": ["c".repeat(64)],
+                "capabilities": ["rust"],
+                "path_prefixes": ["crates"],
+                "base_sha": "b".repeat(40),
+                "branch": "codex/a2a",
+                "worktree_id": "a2a",
+                "checkout_root": checkout,
+            }]
+        })
+        .to_string()
+    }
+
     fn request() -> JobRequest {
         JobRequest {
             common: JobCommon {
@@ -435,10 +922,142 @@ mod tests {
     }
 
     #[test]
+    fn absent_grants_do_not_fall_back_to_checkout_files() {
+        let checkout = tempfile::tempdir().expect("checkout");
+        std::fs::create_dir(checkout.path().join(".buzz")).expect("buzz dir");
+        std::fs::write(
+            checkout.path().join(".buzz/agent-job-grants.json"),
+            grant_json(checkout.path()),
+        )
+        .expect("legacy grant file");
+
+        assert!(GrantSet::load_from(checkout.path(), None, None)
+            .expect("no grants")
+            .is_empty());
+    }
+
+    #[test]
+    fn inline_and_file_grant_sources_are_rejected_as_ambiguous() {
+        let checkout = tempfile::tempdir().expect("checkout");
+        let error = GrantSet::load_from(
+            checkout.path(),
+            Some(grant_json(checkout.path())),
+            Some(PathBuf::from("/operator/grants.json")),
+        )
+        .expect_err("ambiguous grant sources must fail");
+        assert!(error.to_string().contains("mutually exclusive"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secure_grant_file_is_loaded_once_outside_checkout() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let checkout = tempfile::tempdir().expect("checkout");
+        let operator = tempfile::tempdir().expect("operator state");
+        let path = operator
+            .path()
+            .canonicalize()
+            .expect("canonical operator state")
+            .join("grants.json");
+        let original = grant_json(checkout.path());
+        std::fs::write(&path, &original).expect("grant file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("private grant file");
+        let ledger = operator
+            .path()
+            .canonicalize()
+            .expect("canonical operator state")
+            .join("ledger");
+
+        let prepared = prepare_job_sources(
+            checkout.path(),
+            None,
+            Some(path.clone()),
+            Some(ledger.clone()),
+        )
+        .expect("secure source");
+        std::fs::write(&path, "not-json").expect("mutate source after capture");
+        assert_eq!(prepared.grants_json.as_deref(), Some(original.as_str()));
+        assert_eq!(prepared.grant_source_file.as_deref(), Some(path.as_path()));
+        assert_eq!(prepared.ledger_root.as_deref(), Some(ledger.as_path()));
+        assert_eq!(
+            prepared.protected_ledger_root.as_deref(),
+            Some(ledger.as_path())
+        );
+        assert!(
+            !GrantSet::from_json(prepared.grants_json.as_deref().unwrap())
+                .expect("captured grants")
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn insecure_checkout_local_and_symlinked_grant_files_fail_closed() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        let checkout = tempfile::tempdir().expect("checkout");
+        let inside = checkout.path().join("grants.json");
+        std::fs::write(&inside, grant_json(checkout.path())).expect("inside grant");
+        std::fs::set_permissions(&inside, std::fs::Permissions::from_mode(0o600))
+            .expect("private inside grant");
+        assert!(read_secure_grant_file(checkout.path(), &inside).is_err());
+
+        let operator = tempfile::tempdir().expect("operator state");
+        let operator = operator.path().canonicalize().expect("canonical operator");
+        let target = operator.join("target.json");
+        std::fs::write(&target, grant_json(checkout.path())).expect("target grant");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))
+            .expect("private target grant");
+        let link = operator.join("linked.json");
+        symlink(&target, &link).expect("grant symlink");
+        assert!(read_secure_grant_file(checkout.path(), &link).is_err());
+
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644))
+            .expect("loose target mode");
+        assert!(read_secure_grant_file(checkout.path(), &target).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ledger_root_is_private_and_cannot_live_in_a_granted_checkout() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let workspace = tempfile::tempdir().expect("model workspace");
+        let checkout = tempfile::tempdir().expect("checkout");
+        let inside = checkout.path().join(".buzz/ledger");
+        assert!(prepare_private_ledger_root(
+            workspace.path(),
+            &inside,
+            std::iter::once(checkout.path())
+        )
+        .is_err());
+
+        let operator = tempfile::tempdir().expect("operator state");
+        let outside = operator
+            .path()
+            .canonicalize()
+            .expect("canonical operator")
+            .join("private/ledger");
+        let prepared = prepare_private_ledger_root(
+            workspace.path(),
+            &outside,
+            std::iter::once(checkout.path()),
+        )
+        .expect("private ledger");
+        assert_eq!(prepared, outside);
+        assert_eq!(
+            std::fs::metadata(prepared).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    #[test]
     fn exact_tuple_capability_and_path_are_required() {
         let checkout = tempfile::tempdir().expect("checkout");
         let raw = format!(
-            r#"{{"version":1,"grants":[{{"project_address":"30621:{}:nemo","home_channel":"3580ca9b-47b4-4af9-b22a-1068778f26c6","repository":"https://github.com/mysteropodes/nemo","requester_pubkeys":["{}"],"capabilities":["rust"],"path_prefixes":["crates"],"base_sha":"{}","branch":"codex/a2a","worktree_id":"a2a","checkout_root":{}}}]}}"#,
+            r#"{{"version":1,"grants":[{{"project_address":"30621:{}:nemo","home_channel":"3580ca9b-47b4-4af9-b22a-1068778f26c6","repository":"https://github.com/mysteropodes/nemo","requester_pubkeys":["{}"],"capabilities":["rust"],"git_operations":["commit"],"path_prefixes":["crates"],"base_sha":"{}","branch":"codex/a2a","worktree_id":"a2a","checkout_root":{}}}]}}"#,
             "a".repeat(64),
             "c".repeat(64),
             "b".repeat(40),
@@ -447,6 +1066,10 @@ mod tests {
         let grants = GrantSet::from_json(&raw).expect("valid grants");
         let mut candidate = request();
         assert!(grants.capabilities_for(&candidate).is_some());
+        assert_eq!(
+            grants.git_operations_for(&candidate),
+            Some(vec!["commit".into()])
+        );
         candidate.common.repository.canonical = "https://github.com/block/buzz".into();
         assert!(grants.capabilities_for(&candidate).is_none());
         candidate.common.repository.canonical = "https://github.com/mysteropodes/nemo".into();
@@ -558,5 +1181,57 @@ mod tests {
             "https://github.com/mysteropodes/other.git",
         ]);
         assert!(grants.authorize_request(&candidate).is_none());
+    }
+
+    #[test]
+    fn dangerous_local_git_configuration_is_rejected() {
+        let checkout = initialized_checkout();
+        let head = git_output(checkout.path(), &["rev-parse", "HEAD"]).unwrap();
+        let mut candidate = request();
+        candidate.common.repository.base_sha = head;
+        let raw = serde_json::json!({
+            "version": 1,
+            "grants": [{
+                "project_address": candidate.common.project.address.clone(),
+                "home_channel": candidate.common.project.home_channel.clone(),
+                "repository": candidate.common.repository.canonical.clone(),
+                "requester_pubkeys": [candidate.common.sender_pubkey.clone()],
+                "capabilities": [candidate.capability.clone()],
+                "path_prefixes": ["crates"],
+                "base_sha": candidate.common.repository.base_sha.clone(),
+                "branch": "codex/a2a",
+                "worktree_id": "a2a",
+                "checkout_root": checkout.path(),
+            }]
+        });
+        let grants = GrantSet::from_json(&raw.to_string()).expect("valid checkout grant");
+        assert!(grants.authorize_request(&candidate).is_some());
+
+        let run = |args: &[&str]| {
+            assert!(Command::new(system_git().expect("system git"))
+                .arg("-C")
+                .arg(checkout.path())
+                .args(args)
+                .status()
+                .expect("git config mutation")
+                .success());
+        };
+        run(&["config", "--local", "credential.helper", "!/tmp/steal"]);
+        assert!(grants.authorize_request(&candidate).is_none());
+        run(&["config", "--local", "--unset", "credential.helper"]);
+        run(&[
+            "remote",
+            "add",
+            "attacker",
+            "https://github.com/attacker/other.git",
+        ]);
+        assert!(grants.authorize_request(&candidate).is_none());
+    }
+
+    #[test]
+    fn admission_git_is_absolute_and_does_not_search_the_checkout() {
+        let git = system_git().expect("supported Unix test host has system Git");
+        assert!(git.is_absolute());
+        assert!(!git.starts_with(std::env::current_dir().expect("cwd")));
     }
 }

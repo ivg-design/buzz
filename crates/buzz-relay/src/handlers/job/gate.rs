@@ -12,15 +12,18 @@ use buzz_db::EventQuery;
 use crate::state::AppState;
 
 use super::authority::{
-    require_channel_member_locked, require_current_relay_membership,
-    require_current_relay_membership_locked, require_registered_agent,
-    require_registered_agent_locked, validate_superseding_request,
+    require_channel_member_locked, require_channel_nonmember_locked,
+    require_current_relay_membership, require_current_relay_membership_locked,
+    require_registered_agent, require_registered_agent_locked, validate_superseding_request,
 };
 use super::history::validate_operation_history;
-use super::lifecycle::{requires_predecessor, validate_predecessor, validate_transition};
+use super::lifecycle::{
+    is_membership_revoked_terminal, requires_predecessor, validate_membership_revoked_predecessor,
+    validate_predecessor, validate_transition,
+};
 use super::project::{
-    load_job_event_locked, validate_project_binding, validate_project_binding_locked,
-    validate_sponsor, validate_sponsor_locked,
+    load_job_event_locked, resolve_repository_link_locked, validate_project_binding,
+    validate_project_binding_locked, validate_sponsor, validate_sponsor_locked,
 };
 
 /// Job validation failure classified for the ingest transport.
@@ -77,6 +80,9 @@ pub async fn validate_job_event(
 ) -> Result<ValidatedJob, JobAuthError> {
     let job = JobEvent::parse(event).map_err(|error| JobAuthError::Invalid(error.to_string()))?;
     let common = job.common();
+    // This shape is only a candidate until the locked request/predecessor
+    // checks below prove it is the accepted worker closing its active chain.
+    let membership_revoked_terminal = is_membership_revoked_terminal(&job);
     let lock_domains = match &job {
         JobEvent::Request(_) => vec![
             format!(
@@ -131,20 +137,22 @@ pub async fn validate_job_event(
         .home_channel
         .parse()
         .map_err(|_| JobAuthError::Invalid("project.home_channel must be a UUID".into()))?;
-    match state
-        .is_member_cached(tenant.community(), channel_id, &actor.to_bytes())
-        .await
-    {
-        Ok(true) => {}
-        Ok(false) => {
-            return Err(JobAuthError::Restricted(
-                "job signer must be a direct member of the project home channel".into(),
-            ))
-        }
-        Err(error) => {
-            return Err(JobAuthError::Internal(format!(
-                "checking job signer channel membership: {error}"
-            )))
+    if !membership_revoked_terminal {
+        match state
+            .is_member_cached(tenant.community(), channel_id, &actor.to_bytes())
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(JobAuthError::Restricted(
+                    "job signer must be a direct member of the project home channel".into(),
+                ))
+            }
+            Err(error) => {
+                return Err(JobAuthError::Internal(format!(
+                    "checking job signer channel membership: {error}"
+                )))
+            }
         }
     }
     let recipient = PublicKey::parse(&common.recipient_pubkey)
@@ -192,10 +200,19 @@ pub async fn validate_job_event(
     // owner rebinding, and Project replacement therefore cannot commit between
     // validation and storage.
     require_current_relay_membership_locked(tenant, &mut lock, &actor, "job signer").await?;
-    require_channel_member_locked(tenant, &mut lock, channel_id, &actor, "job signer").await?;
+    if !membership_revoked_terminal {
+        require_channel_member_locked(tenant, &mut lock, channel_id, &actor, "job signer").await?;
+    }
     require_channel_member_locked(tenant, &mut lock, channel_id, &recipient, "job recipient")
         .await?;
-    let _project = validate_project_binding_locked(tenant, &mut lock, &job).await?;
+    let project = validate_project_binding_locked(tenant, &mut lock, &job).await?;
+    // Every transition, including the receiver's privileged-operation marker,
+    // re-resolves and locks the current Project -> repository announcement.
+    // This makes the marker itself the authorization linearization point;
+    // a repository rebind cannot commit between preflight and marker storage.
+    let _repository =
+        resolve_repository_link_locked(tenant, &mut lock, &project, &common.repository.canonical)
+            .await?;
     validate_sponsor_locked(tenant, &mut lock, &job).await?;
     if matches!(job, JobEvent::Request(_)) {
         require_registered_agent_locked(tenant, &mut lock, &recipient, "job recipient").await?;
@@ -249,14 +266,25 @@ pub async fn validate_job_event(
             "stored job requester",
         )
         .await?;
-        require_channel_member_locked(
-            tenant,
-            &mut lock,
-            channel_id,
-            &worker,
-            "stored job recipient",
-        )
-        .await?;
+        if membership_revoked_terminal {
+            require_channel_nonmember_locked(
+                tenant,
+                &mut lock,
+                channel_id,
+                &worker,
+                "stored job recipient",
+            )
+            .await?;
+        } else {
+            require_channel_member_locked(
+                tenant,
+                &mut lock,
+                channel_id,
+                &worker,
+                "stored job recipient",
+            )
+            .await?;
+        }
         validate_sponsor_locked(tenant, &mut lock, &request).await?;
         validate_transition(&job, &request)?;
         validate_claim_digest(&job, &request)?;
@@ -265,6 +293,9 @@ pub async fn validate_job_event(
             let prior =
                 load_job_event_locked(tenant, &mut lock, prior_id, "prior_event_id").await?;
             validate_predecessor(&job, &prior, request_id)?;
+            if membership_revoked_terminal {
+                validate_membership_revoked_predecessor(&job, &prior, &request)?;
+            }
         } else if requires_predecessor(&job) {
             return Err(JobAuthError::Invalid(
                 "this job transition requires prior_event_id".into(),

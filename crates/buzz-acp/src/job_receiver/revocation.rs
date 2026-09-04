@@ -1,10 +1,12 @@
-use buzz_core::job::{JobControlAction, JobEvent};
+use buzz_core::job::JobEvent;
 use uuid::Uuid;
 
+use super::ledger::ReceiptKind;
 use super::{JobEmitter, JobReceiver, ReceiverError};
 
-/// Freeze one deterministic terminal for every nonterminal claim whose
-/// Project channel authorization has just been revoked.
+/// Freeze one deterministic terminal for every accepted, nonterminal claim
+/// whose Project channel authorization has just been revoked. A claim revoked
+/// before Accepted is durably suppressed at Processed instead.
 pub(super) async fn terminate_channel(
     receiver: &JobReceiver,
     channel_id: Uuid,
@@ -24,12 +26,53 @@ pub(super) async fn terminate_channel(
             continue;
         }
         let lifecycle = receiver.ledger.lifecycle_store(&claim);
-        lifecycle.initialize(claim.accepted.id.to_hex()).await?;
-        let (_, pending, terminal) = lifecycle.snapshot().await?;
-        if terminal {
+        if !lifecycle.exists() {
+            let accepted_acked = receiver
+                .ledger
+                .receipt_acked(&claim, ReceiptKind::Accepted)
+                .await?;
+            if !accepted_acked {
+                // There is no protocol-valid worker terminal before Accepted:
+                // Error/Result require Accepted or Progress, and Cancelled
+                // requires a requester Cancel. Persist Processed as the local
+                // lifecycle root so receipt retry can never manufacture the
+                // frozen Accepted after channel authority has been revoked.
+                lifecycle.initialize(claim.processed.id.to_hex()).await?;
+                terminated += 1;
+                continue;
+            }
+            lifecycle.initialize(claim.accepted.id.to_hex()).await?;
+        }
+        let snapshot = lifecycle.privilege_snapshot().await?;
+        if snapshot.terminal {
             continue;
         }
+        if snapshot.accepted_event_id == claim.processed.id.to_hex()
+            && snapshot.cancel_event_id.is_none()
+        {
+            // A prior pre-Accept revocation already suppressed this claim.
+            continue;
+        }
+        let prompt_started = receiver.ledger.prompt_started(&claim).await?;
+        if !prompt_started {
+            super::git_receipt_journal::initialize_for_unstarted_lifecycle(
+                &lifecycle,
+                &receiver.tenant.community_id,
+                &receiver.agent_pubkey,
+                &claim,
+            )
+            .map_err(|error| ReceiverError::Privilege(error.to_string()))?;
+        }
+        let pending = snapshot.pending_outbox;
         if let Some(event) = pending {
+            super::validate_pending_terminal_git_effect(
+                &lifecycle,
+                &event,
+                &snapshot.head_event_id,
+                &claim,
+                &receiver.agent_pubkey,
+                &receiver.sponsor,
+            )?;
             if let Err(error) = receiver.rest.submit_event_confirmed(&event).await {
                 first_error.get_or_insert_with(|| error.to_string());
                 continue;
@@ -42,25 +85,26 @@ pub(super) async fn terminate_channel(
         let pending_cancel = lifecycle.pending_cancel().await?.is_some();
         let emitter = JobEmitter::new(
             &request,
-            claim.request_event_id,
+            claim.request_event_id.clone(),
             receiver.keys.clone(),
             receiver.rest.clone(),
-            lifecycle,
+            lifecycle.clone(),
             receiver
                 .grants
                 .capabilities_for(&request)
                 .unwrap_or_default(),
-            claim.digest,
+            claim.digest.clone(),
             receiver.sponsor.clone(),
         );
         let result = if pending_cancel {
-            emitter
-                .control(
-                    JobControlAction::Cancelled,
-                    "requester_cancelled".into(),
-                    None,
-                )
-                .await
+            super::cancel::terminal_for_lifecycle(
+                &lifecycle,
+                &receiver.tenant.community_id,
+                &receiver.agent_pubkey,
+                &claim,
+            )
+            .publish(&emitter)
+            .await
         } else {
             emitter
                 .indeterminate(

@@ -2,12 +2,15 @@
 
 use serde::Serialize;
 use std::io::Write;
+use std::path::Path;
 use std::path::PathBuf;
+use std::time::Duration;
 use zeroize::{Zeroize, Zeroizing};
 
 pub(super) const MARKER_ENV: &str = "BUZZ_ACP_STARTUP_STDIN";
 const SCHEMA_VERSION: &str = "buzz.acp-startup.v1";
 const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
+const DELIVERY_TIMEOUT: Duration = Duration::from_secs(5);
 
 const STARTUP_ENV_KEYS: &[&str] = &[
     "BUZZ_PRIVATE_KEY",
@@ -109,13 +112,56 @@ impl<'a> StartupPayload<'a> {
             .stdin
             .take()
             .ok_or_else(|| "secure startup pipe was not opened".to_owned())?;
-        let result = stdin
-            .write_all(&encoded)
-            .and_then(|()| stdin.flush())
-            .map_err(|error| format!("failed to deliver secure startup payload: {error}"));
-        encoded.zeroize();
-        drop(stdin);
-        result
+
+        #[cfg(unix)]
+        {
+            let result = write_payload_bounded(&mut stdin, &encoded, DELIVERY_TIMEOUT);
+            encoded.zeroize();
+            drop(stdin);
+            if let Err(error) = result {
+                let termination = super::process::terminate_process(child.id());
+                let _ = child.wait();
+                return match termination {
+                    Ok(()) => Err(error),
+                    Err(termination) => Err(format!(
+                        "{error}; failed to terminate rejected ACP process: {termination}"
+                    )),
+                };
+            }
+            Ok(())
+        }
+
+        #[cfg(not(unix))]
+        {
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            let writer = std::thread::spawn(move || {
+                let result = stdin
+                    .write_all(&encoded)
+                    .and_then(|()| stdin.flush())
+                    .map_err(|error| format!("failed to deliver secure startup payload: {error}"));
+                encoded.zeroize();
+                drop(stdin);
+                let _ = tx.send(result);
+            });
+            match rx.recv_timeout(DELIVERY_TIMEOUT) {
+                Ok(result) => {
+                    let _ = writer.join();
+                    result
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    // Closing the child end unblocks the writer so secret-bearing
+                    // memory cannot outlive this failed spawn indefinitely.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = writer.join();
+                    Err("secure startup payload delivery timed out".into())
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    let _ = writer.join();
+                    Err("secure startup payload writer stopped unexpectedly".into())
+                }
+            }
+        }
     }
 }
 
@@ -133,6 +179,135 @@ fn resolve_job_grant_sources(
         (None, None, Some(json)) => Ok((Some(json), None)),
         (None, None, None) => Ok((None, None)),
     }
+}
+
+/// Write the startup secret without moving it into an unbounded helper thread.
+///
+/// A child that never reads stdin must not be able to retain a desktop thread
+/// containing the managed-agent key. Unix pipes can be made non-blocking, so
+/// the payload remains in this bounded call and is zeroized before the rejected
+/// process group is terminated by the caller.
+#[cfg(unix)]
+fn write_payload_bounded(
+    stdin: &mut std::process::ChildStdin,
+    payload: &[u8],
+    timeout: Duration,
+) -> Result<(), String> {
+    use std::os::fd::AsRawFd;
+
+    let fd = stdin.as_raw_fd();
+    let original_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if original_flags == -1 {
+        return Err(format!(
+            "failed to inspect secure startup pipe: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, original_flags | libc::O_NONBLOCK) } == -1 {
+        return Err(format!(
+            "failed to bound secure startup pipe: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let deadline = std::time::Instant::now() + timeout;
+    let result = (|| {
+        let mut offset = 0;
+        while offset < payload.len() {
+            match stdin.write(&payload[offset..]) {
+                Ok(0) => return Err("secure startup pipe closed before delivery".to_owned()),
+                Ok(written) => offset += written,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err("secure startup payload delivery timed out".to_owned());
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => {
+                    return Err(format!("failed to deliver secure startup payload: {error}"))
+                }
+            }
+        }
+        stdin
+            .flush()
+            .map_err(|error| format!("failed to deliver secure startup payload: {error}"))
+    })();
+
+    // Best effort: the descriptor is dropped immediately after this function,
+    // so failure to restore blocking mode cannot extend secret lifetime.
+    unsafe {
+        libc::fcntl(fd, libc::F_SETFL, original_flags);
+    }
+    result
+}
+
+/// Resolve the only executable allowed to receive the startup secret payload.
+///
+/// The persisted `acp_command` remains useful for diagnostics, but it is not
+/// an authority to redirect managed-agent signing keys to another program.
+pub(super) fn trusted_harness_path(resolved: &Path) -> Result<PathBuf, String> {
+    let expected = super::sweep::expected_harness_exe_path()
+        .ok_or_else(|| "cannot resolve the bundled buzz-acp harness".to_owned())?;
+    verify_exact_harness_path(resolved, &expected)
+}
+
+fn verify_exact_harness_path(resolved: &Path, expected: &Path) -> Result<PathBuf, String> {
+    let resolved = std::fs::canonicalize(resolved)
+        .map_err(|_| "cannot verify the configured ACP harness executable".to_owned())?;
+    let expected = std::fs::canonicalize(expected)
+        .map_err(|_| "the bundled buzz-acp harness is unavailable".to_owned())?;
+    if resolved != expected {
+        return Err(
+            "managed-agent secrets may be delivered only to this Buzz installation's bundled buzz-acp harness"
+                .into(),
+        );
+    }
+    Ok(expected)
+}
+
+/// Re-check the kernel-observed child image after `exec` and before writing a
+/// secret byte. This closes the path-replacement window between resolution and
+/// spawn on supported Unix release targets.
+#[cfg(target_os = "macos")]
+pub(super) fn verify_spawned_harness(
+    child: &std::process::Child,
+    expected: &Path,
+) -> Result<(), String> {
+    let actual = super::sweep::proc_exe_path_from_procargs2(child.id())
+        .and_then(|path| std::fs::canonicalize(path).ok())
+        .ok_or_else(|| "cannot verify the spawned buzz-acp executable".to_owned())?;
+    if actual == expected {
+        Ok(())
+    } else {
+        Err("spawned ACP process does not match the bundled buzz-acp executable".into())
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+pub(super) fn verify_spawned_harness(
+    child: &std::process::Child,
+    expected: &Path,
+) -> Result<(), String> {
+    let actual = std::fs::read_link(format!("/proc/{}/exe", child.id()))
+        .ok()
+        .and_then(|path| std::fs::canonicalize(path).ok())
+        .ok_or_else(|| "cannot verify the spawned buzz-acp executable".to_owned())?;
+    if actual == expected {
+        Ok(())
+    } else {
+        Err("spawned ACP process does not match the bundled buzz-acp executable".into())
+    }
+}
+
+#[cfg(not(unix))]
+pub(super) fn verify_spawned_harness(
+    _child: &std::process::Child,
+    _expected: &Path,
+) -> Result<(), String> {
+    // The exact canonical path was checked immediately before CreateProcess.
+    // Windows does not expose a dependency-free post-spawn image lookup here.
+    Ok(())
 }
 
 fn nonempty_env(name: &str) -> Option<String> {
@@ -211,6 +386,26 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn exact_harness_path_accepts_symlink_to_expected_and_rejects_other_binary() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("harness fixture directory");
+        let expected = directory.path().join("buzz-acp");
+        let other = directory.path().join("custom-acp");
+        let alias = directory.path().join("buzz-acp-alias");
+        std::fs::write(&expected, b"expected").expect("expected fixture");
+        std::fs::write(&other, b"other").expect("other fixture");
+        symlink(&expected, &alias).expect("harness symlink");
+
+        assert_eq!(
+            verify_exact_harness_path(&alias, &expected).expect("verified alias"),
+            expected.canonicalize().expect("canonical expected")
+        );
+        assert!(verify_exact_harness_path(&other, &expected).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn spawned_process_environment_and_argv_never_contain_piped_secrets() {
         use std::time::{Duration, Instant};
 
@@ -264,6 +459,32 @@ mod tests {
         assert!(child_env.contains("BUZZ_ACP_STARTUP_STDIN=1"));
 
         let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stalled_startup_reader_hits_a_bounded_nonblocking_deadline() {
+        use std::os::unix::process::CommandExt;
+
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "sleep 30"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0);
+        let mut child = command.spawn().expect("spawn stalled startup reader");
+        let mut stdin = child.stdin.take().expect("startup pipe");
+        let payload = vec![b'x'; MAX_PAYLOAD_BYTES];
+        let started = std::time::Instant::now();
+        let error = write_payload_bounded(&mut stdin, &payload, Duration::from_millis(50))
+            .expect_err("a full unread pipe must time out");
+        assert!(error.contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        drop(stdin);
+        let _ = super::super::process::terminate_process(child.id());
         let _ = child.wait();
     }
 }

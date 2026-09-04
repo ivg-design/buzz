@@ -1115,6 +1115,7 @@ dependencies = [
  "buzz-core",
  "buzz-sdk",
  "chrono",
+ "git-sign-nostr",
  "hex",
  "ignore",
  "image",

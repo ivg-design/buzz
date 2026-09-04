@@ -25,8 +25,17 @@ const READ_CHUNK: usize = 16 * 1024;
 
 pub struct SharedState {
     pub cwd: PathBuf,
+    pub(crate) protected_paths: crate::paths::ProtectedPathPolicy,
     pub shim: Shim,
     pub session_dir: TempDir,
+    /// Session-private home presented to every model-controlled shell.  The
+    /// operator's real HOME may contain GitHub CLI state and global Git
+    /// credential-helper configuration, so it is never inherited here.
+    pub isolated_home: PathBuf,
+    pub isolated_git_config: PathBuf,
+    operator_rustup_home: Option<PathBuf>,
+    #[cfg(target_os = "macos")]
+    sandbox_profile: PathBuf,
     pub bootstrap_instructions: String,
     /// The shell resolved at construction: `Ok((path, display_name))` when a shell
     /// is available, `Err(msg)` when none was found. Stored once so both the
@@ -37,10 +46,69 @@ pub struct SharedState {
 }
 
 impl SharedState {
+    #[cfg(test)]
     pub fn new(cwd: PathBuf, shim: Shim) -> std::io::Result<Self> {
+        Self::new_with_protected_paths(cwd, shim, crate::paths::ProtectedPathPolicy::default())
+    }
+
+    pub(crate) fn new_with_protected_paths(
+        cwd: PathBuf,
+        shim: Shim,
+        protected_paths: crate::paths::ProtectedPathPolicy,
+    ) -> std::io::Result<Self> {
+        Self::new_inner(
+            cwd,
+            shim,
+            std::env::var_os("HOME").map(PathBuf::from),
+            protected_paths,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        cwd: PathBuf,
+        shim: Shim,
+        protected_paths: crate::paths::ProtectedPathPolicy,
+    ) -> std::io::Result<Self> {
+        Self::new_with_protected_paths(cwd, shim, protected_paths)
+    }
+
+    #[cfg(test)]
+    fn new_with_operator_home(
+        cwd: PathBuf,
+        shim: Shim,
+        operator_home: Option<PathBuf>,
+    ) -> std::io::Result<Self> {
+        Self::new_inner(
+            cwd,
+            shim,
+            operator_home,
+            crate::paths::ProtectedPathPolicy::default(),
+        )
+    }
+
+    fn new_inner(
+        cwd: PathBuf,
+        shim: Shim,
+        operator_home: Option<PathBuf>,
+        protected_paths: crate::paths::ProtectedPathPolicy,
+    ) -> std::io::Result<Self> {
+        let cwd = cwd.canonicalize()?;
+        let operator_rustup_home = operator_home.as_deref().and_then(|home| {
+            home.join(".rustup")
+                .canonicalize()
+                .ok()
+                .filter(|path| path.is_dir())
+        });
         let session_dir = tempfile::Builder::new()
             .prefix("buzz-dev-mcp-session-")
             .tempdir()?;
+        let isolated_home = session_dir.path().join("home");
+        std::fs::create_dir(&isolated_home)?;
+        set_owner_only_directory(&isolated_home)?;
+        let isolated_git_config = session_dir.path().join("gitconfig");
+        std::fs::write(&isolated_git_config, b"")?;
+        set_owner_only_file(&isolated_git_config)?;
         // Resolve the shell ONCE using the same PATH the spawn will use.
         // Both the bootstrap dialect hint and every run() call read this result,
         // so they can never disagree. A failed resolution is stored as Err and
@@ -51,10 +119,31 @@ impl SharedState {
             Err(_) => "bash",
         };
         let bootstrap_instructions = build_bootstrap(&cwd, shell_hint);
+        #[cfg(target_os = "macos")]
+        let sandbox_profile_contents = macos_sandbox_profile(
+            &cwd,
+            session_dir.path(),
+            operator_home.as_deref(),
+            &protected_paths,
+            shim.read_roots(),
+        )?;
+        #[cfg(target_os = "macos")]
+        let sandbox_profile = {
+            let path = session_dir.path().join("sandbox.sb");
+            std::fs::write(&path, sandbox_profile_contents)?;
+            set_owner_only_file(&path)?;
+            path
+        };
         Ok(Self {
             cwd,
+            protected_paths,
             shim,
             session_dir,
+            isolated_home,
+            isolated_git_config,
+            operator_rustup_home,
+            #[cfg(target_os = "macos")]
+            sandbox_profile,
             bootstrap_instructions,
             resolved_shell,
             artifacts: Mutex::new(VecDeque::with_capacity(ARTIFACT_RING_SIZE)),
@@ -119,6 +208,7 @@ fn detect_stack(cwd: &Path) -> String {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ShellParams {
     pub command: String,
+    /// Checkout-relative directory. Absolute, tilde and parent paths fail.
     #[serde(default)]
     pub workdir: Option<String>,
     /// Defaults to 120000 ms (2 min) if omitted; capped at 1,200,000 ms (20 min).
@@ -136,6 +226,16 @@ pub async fn run(
     p: ShellParams,
     ct: CancellationToken,
 ) -> Result<CallToolResult, ErrorData> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (state, p, ct);
+        return Ok(CallToolResult::error(vec![Content::text(
+            "generic shell is unavailable: equivalent OS-level filesystem isolation is not implemented on this platform",
+        )]));
+    }
+    #[cfg(target_os = "macos")]
+    let (state, p, ct) = (state, p, ct);
+
     if p.command.len() > MAX_COMMAND_BYTES {
         return Err(ErrorData::invalid_params(
             format!("command exceeds {MAX_COMMAND_BYTES} byte limit"),
@@ -143,35 +243,81 @@ pub async fn run(
         ));
     }
     let timeout_ms = effective_timeout_ms(p.timeout_ms);
-    let workdir: PathBuf = p
-        .workdir
-        .as_deref()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| state.cwd.clone());
-
-    if !workdir.is_dir() {
-        return Err(ErrorData::invalid_params(
-            format!(
-                "workdir does not exist or is not a directory: {}",
-                workdir.display()
-            ),
-            None,
-        ));
-    }
-
+    let workdir = crate::paths::resolve_workdir(state, p.workdir.as_deref())
+        .map_err(|message| ErrorData::invalid_params(message, None))?;
     let bash = match &state.resolved_shell {
         Ok((path, _)) => path.clone(),
         Err(msg) => return Ok(CallToolResult::error(vec![Content::text(msg.clone())])),
     };
     let shell_arg = shell_flag(&bash);
-    let mut cmd = Command::new(&bash);
-    cmd.arg(shell_arg).arg(&p.command);
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut command = Command::new("/usr/bin/sandbox-exec");
+        command
+            .arg("-f")
+            .arg(&state.sandbox_profile)
+            .arg(&bash)
+            .arg(shell_arg)
+            .arg(&p.command);
+        command
+    };
+    #[cfg(not(target_os = "macos"))]
+    let mut cmd = {
+        let mut command = Command::new(&bash);
+        command.arg(shell_arg).arg(&p.command);
+        command
+    };
     cmd.current_dir(&workdir);
+    cmd.env_clear();
     cmd.env("PATH", &state.shim.path_env);
     // The generic model shell never receives harness signing, bearer, grant,
     // or session-scope inputs, even when this library runs in-process inside
     // buzz-acp (whose own process legitimately retains those values).
     crate::trusted::scrub_async_command_environment(&mut cmd);
+    let isolated_config_home = state.isolated_home.join(".config");
+    let isolated_gh_config = isolated_config_home.join("gh");
+    let isolated_cargo_home = state.isolated_home.join(".cargo");
+    let isolated_tmp = state.session_dir.path().join("tmp");
+    if let Err(error) = std::fs::create_dir_all(&isolated_tmp)
+        .and_then(|()| std::fs::create_dir_all(&isolated_cargo_home))
+    {
+        return Ok(CallToolResult::error(vec![Content::text(format!(
+            "failed to prepare isolated temporary directory: {error}"
+        ))]));
+    }
+    cmd.env("HOME", &state.isolated_home)
+        .env("USERPROFILE", &state.isolated_home)
+        .env("XDG_CONFIG_HOME", &isolated_config_home)
+        .env("GH_CONFIG_DIR", &isolated_gh_config)
+        .env("CARGO_HOME", &isolated_cargo_home)
+        .env("TMPDIR", &isolated_tmp)
+        .env("TMP", &isolated_tmp)
+        .env("TEMP", &isolated_tmp)
+        .env("GIT_CONFIG_GLOBAL", &state.isolated_git_config)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "")
+        .env("SSH_ASKPASS", "")
+        .env("GCM_INTERACTIVE", "Never");
+    if let Some(rustup_home) = &state.operator_rustup_home {
+        cmd.env("RUSTUP_HOME", rustup_home);
+    }
+    // Explicitly retain only build/runtime hints known not to carry auth.
+    // `env_clear` is the security boundary: a future GITHUB_PAT-like alias is
+    // denied without relying on an ever-growing secret-name blocklist.
+    for name in [
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TERM",
+        "NO_COLOR",
+        "SDKROOT",
+        "DEVELOPER_DIR",
+    ] {
+        if let Some(value) = std::env::var_os(name) {
+            cmd.env(name, value);
+        }
+    }
     for (k, v) in &state.shim.git_env {
         cmd.env(k, v);
     }
@@ -324,6 +470,253 @@ pub async fn run(
     let text = serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".into());
     kill_group.disarm();
     Ok(CallToolResult::success(vec![Content::text(text)]))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_sandbox_profile(
+    cwd: &Path,
+    session_dir: &Path,
+    operator_home: Option<&Path>,
+    protected_paths: &crate::paths::ProtectedPathPolicy,
+    shim_read_roots: &[PathBuf],
+) -> std::io::Result<String> {
+    fn literal(path: &Path) -> String {
+        path.to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+    }
+
+    let session_dir = session_dir.canonicalize()?;
+    let operator_home = operator_home
+        .ok_or_else(|| std::io::Error::other("operator HOME is required for shell isolation"))?
+        .canonicalize()
+        .map_err(|error| {
+            std::io::Error::other(format!(
+                "operator HOME must name an existing canonical directory: {error}"
+            ))
+        })?;
+    if !operator_home.is_dir() {
+        return Err(std::io::Error::other(
+            "operator HOME must name an existing canonical directory",
+        ));
+    }
+    let temporary_root = std::env::temp_dir()
+        .canonicalize()
+        .unwrap_or_else(|_| std::env::temp_dir());
+    let git_directories = git_storage_directories(cwd);
+    let mut profile = String::from(
+        "(version 1)\n\
+         (allow default)\n\
+         (deny process-exec (literal \"/usr/bin/security\"))\n\
+         (deny process-exec (literal \"/usr/bin/osascript\"))\n\
+         (deny process-exec (literal \"/usr/bin/open\"))\n\
+         (deny process-exec (literal \"/bin/launchctl\"))\n\
+         (deny process-exec (literal \"/usr/libexec/git-core/git-credential-osxkeychain\"))\n\
+         (deny appleevent-send)\n\
+         (deny mach-priv-task-port)\n\
+         (deny process-info*)\n\
+         (allow process-info* (target self))\n\
+         (deny mach-lookup (global-name \"com.apple.securityd\") (global-name \"com.apple.secd\"))\n",
+    );
+    let read_only_tool_roots = [
+        operator_home.join(".cargo/bin"),
+        operator_home.join(".cargo/registry"),
+        operator_home.join(".cargo/git"),
+        operator_home.join(".rustup"),
+        operator_home.join(".nvm/versions"),
+        operator_home.join(".local/bin"),
+    ];
+    let mut readable_roots = vec![cwd.to_path_buf(), session_dir.clone()];
+    readable_roots.extend(git_directories.iter().cloned());
+    readable_roots.extend(
+        read_only_tool_roots
+            .into_iter()
+            .filter(|path| path.exists()),
+    );
+    readable_roots.extend(shim_read_roots.iter().cloned());
+    let mut writable_roots = vec![cwd.to_path_buf(), session_dir.clone()];
+    writable_roots.extend(git_directories.iter().cloned());
+    append_tree_denies(
+        &mut profile,
+        &operator_home,
+        &readable_roots,
+        &writable_roots,
+        &literal,
+    );
+    append_tree_denies(
+        &mut profile,
+        &temporary_root,
+        &readable_roots,
+        &writable_roots,
+        &literal,
+    );
+    let private_tmp = Path::new("/private/tmp");
+    if private_tmp != temporary_root {
+        append_tree_denies(
+            &mut profile,
+            private_tmp,
+            &readable_roots,
+            &writable_roots,
+            &literal,
+        );
+    }
+
+    // A linked worktree's Git storage normally lives outside `cwd` (and often
+    // under the operator home). Permit the storage needed by `git add`, then
+    // remove every configuration, pointer, ref and hook authority surface.
+    for git_dir in git_directories {
+        for name in [
+            "config",
+            "config.worktree",
+            "HEAD",
+            "commondir",
+            "gitdir",
+            "packed-refs",
+            "shallow",
+            "info/grafts",
+            "objects/info/alternates",
+        ] {
+            profile.push_str(&format!(
+                "(deny file-write* (literal \"{}\"))\n",
+                literal(&git_dir.join(name))
+            ));
+        }
+        for name in ["refs", "hooks"] {
+            profile.push_str(&format!(
+                "(deny file-write* (subpath \"{}\"))\n",
+                literal(&git_dir.join(name))
+            ));
+        }
+    }
+    let dot_git = cwd.join(".git");
+    profile.push_str(&format!(
+        "(deny file-write* (literal \"{}\"))\n",
+        literal(&dot_git)
+    ));
+    for protected in protected_paths.paths() {
+        profile.push_str(&format!(
+            "(deny file-write* (literal \"{}\") (subpath \"{}\"))\n",
+            literal(protected),
+            literal(protected)
+        ));
+    }
+    Ok(profile)
+}
+
+/// Deny an operator-owned tree except for pre-resolved capabilities. The
+/// compound filter matters: Seatbelt deny rules cannot be reopened by a later
+/// allow, while `require-not` gives the checkout one narrow exception directly
+/// in the deny rule.
+#[cfg(target_os = "macos")]
+fn append_tree_denies(
+    profile: &mut String,
+    root: &Path,
+    readable_roots: &[PathBuf],
+    writable_roots: &[PathBuf],
+    literal: &impl Fn(&Path) -> String,
+) {
+    if !root.exists() {
+        return;
+    }
+    append_operation_tree(profile, "file-read*", root, readable_roots, literal);
+    append_operation_tree(profile, "file-write*", root, writable_roots, literal);
+}
+
+#[cfg(target_os = "macos")]
+fn append_operation_tree(
+    profile: &mut String,
+    operation: &str,
+    root: &Path,
+    allowed_roots: &[PathBuf],
+    literal: &impl Fn(&Path) -> String,
+) {
+    let allowed = allowed_roots
+        .iter()
+        .filter(|allowed| allowed.starts_with(root))
+        .collect::<Vec<_>>();
+    if allowed.is_empty() {
+        profile.push_str(&format!(
+            "(deny {operation} (subpath \"{}\"))\n",
+            literal(root)
+        ));
+        return;
+    }
+    profile.push_str(&format!(
+        "(deny {operation} (require-all (subpath \"{}\") (require-not (require-any",
+        literal(root)
+    ));
+    for allowed in allowed {
+        profile.push_str(&format!(" (subpath \"{}\")", literal(allowed)));
+    }
+    profile.push_str("))))\n");
+}
+
+#[cfg(target_os = "macos")]
+fn git_storage_directories(cwd: &Path) -> Vec<PathBuf> {
+    let dot_git = cwd.join(".git");
+    let git_dir = if dot_git.is_dir() {
+        dot_git.canonicalize().ok()
+    } else {
+        std::fs::read_to_string(&dot_git)
+            .ok()
+            .and_then(|value| {
+                value
+                    .strip_prefix("gitdir:")
+                    .map(str::trim)
+                    .map(PathBuf::from)
+            })
+            .map(|path| {
+                if path.is_absolute() {
+                    path
+                } else {
+                    cwd.join(path)
+                }
+            })
+            .and_then(|path| path.canonicalize().ok())
+    };
+    let Some(git_dir) = git_dir else {
+        return Vec::new();
+    };
+    let common_dir = std::fs::read_to_string(git_dir.join("commondir"))
+        .ok()
+        .map(|value| PathBuf::from(value.trim()))
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                git_dir.join(path)
+            }
+        })
+        .and_then(|path| path.canonicalize().ok());
+    let mut directories = vec![git_dir];
+    if let Some(common_dir) = common_dir {
+        if !directories.contains(&common_dir) {
+            directories.push(common_dir);
+        }
+    }
+    directories
+}
+
+#[cfg(unix)]
+fn set_owner_only_directory(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+fn set_owner_only_directory(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_owner_only_file(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn set_owner_only_file(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// The flag used to pass a command string to the shell.
@@ -1002,7 +1395,7 @@ mod tests {
             Some(t) => t.text.clone(),
             None => panic!("no text content"),
         };
-        serde_json::from_str(&text).expect("json")
+        serde_json::from_str(&text).unwrap_or_else(|error| panic!("json ({error}): {text}"))
     }
 
     #[test]
@@ -1014,6 +1407,33 @@ mod tests {
         assert_eq!(effective_timeout_ms(Some(u64::MAX)), 1_200_000);
     }
 
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test(flavor = "current_thread")]
+    async fn generic_shell_fails_closed_without_os_isolation() {
+        let dir = tempdir().expect("tempdir");
+        let state = make_state(dir.path());
+        let result = run(
+            &state,
+            ShellParams {
+                command: "echo must-not-run".into(),
+                workdir: None,
+                timeout_ms: None,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .expect("tool result");
+        let text = result
+            .content
+            .first()
+            .and_then(|content| content.as_text())
+            .map(|text| text.text.as_str())
+            .unwrap_or_default();
+        assert!(text.contains("unavailable"));
+        assert!(!text.contains("must-not-run"));
+    }
+
+    #[cfg(target_os = "macos")]
     #[tokio::test(flavor = "current_thread")]
     async fn basic_echo() {
         let dir = tempdir().expect("tempdir");
@@ -1030,11 +1450,163 @@ mod tests {
         .await
         .expect("ok");
         let v = body(r);
-        assert_eq!(v["exit_code"], 0);
+        assert_eq!(
+            v["exit_code"],
+            0,
+            "profile={} body={v}",
+            state.sandbox_profile.display()
+        );
         assert_eq!(v["stdout"], "hello\n");
         assert_eq!(v["timed_out"], false);
     }
 
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn model_shell_cannot_reach_operator_home_or_global_git_helper() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let universe = tempdir().expect("universe");
+        let cwd = universe.path().join("checkout");
+        let operator_home = universe.path().join("operator-home");
+        std::fs::create_dir_all(&cwd).expect("checkout");
+        std::fs::create_dir_all(&operator_home).expect("operator home");
+        let sentinel = format!("credential-{}", uuid::Uuid::new_v4());
+        let helper = operator_home.join("credential-helper");
+        std::fs::write(
+            &helper,
+            format!("#!/bin/sh\nprintf 'username=buzz\\npassword={sentinel}\\n'\n"),
+        )
+        .expect("helper");
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700))
+            .expect("helper permissions");
+        std::fs::write(
+            operator_home.join(".gitconfig"),
+            format!("[credential]\n\thelper = {}\n", helper.display()),
+        )
+        .expect("global config");
+        std::fs::write(operator_home.join("sentinel"), &sentinel).expect("sentinel file");
+
+        let shim = Shim::install().expect("shim install");
+        let state = SharedState::new_with_operator_home(cwd, shim, Some(operator_home.clone()))
+            .expect("state new");
+        let command = format!(
+            "printf 'protocol=https\\nhost=github.com\\n\\n' | /usr/bin/git credential fill 2>/dev/null || true; \
+             /bin/cat '{}' 2>/dev/null || true; \
+             '{}' get 2>/dev/null || true; \
+             printf poison > '{}' 2>/dev/null || true; \
+             printf 'HOME=%s\\n' \"$HOME\"",
+            operator_home.join("sentinel").display(),
+            helper.display(),
+            operator_home.join(".gitconfig").display(),
+        );
+        let result = run(
+            &state,
+            ShellParams {
+                command,
+                workdir: None,
+                timeout_ms: Some(5_000),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .expect("shell result");
+        let result = body(result);
+        let stdout = result["stdout"].as_str().expect("stdout");
+        let stderr = result["stderr"].as_str().expect("stderr");
+        assert!(!stdout.contains(&sentinel));
+        assert!(!stderr.contains(&sentinel));
+        assert!(!stdout.contains(operator_home.to_string_lossy().as_ref()));
+        assert!(stdout.contains(state.isolated_home.to_string_lossy().as_ref()));
+        assert_eq!(
+            std::fs::read_to_string(operator_home.join(".gitconfig")).expect("gitconfig"),
+            format!("[credential]\n\thelper = {}\n", helper.display())
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_shell_construction_requires_canonical_operator_home() {
+        let checkout = tempdir().expect("checkout");
+        let shim = Shim::install().expect("shim");
+        let error = SharedState::new_with_operator_home(checkout.path().to_path_buf(), shim, None)
+            .err()
+            .expect("missing HOME must fail closed");
+        assert!(error.to_string().contains("operator HOME is required"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn model_shell_env_is_allowlisted_and_protected_writes_fail() {
+        let checkout = tempdir().expect("checkout");
+        let protected = checkout.path().join(".buzz/ledger");
+        std::fs::create_dir_all(&protected).expect("protected root");
+        let sentinel = protected.join("authority.json");
+        std::fs::write(&sentinel, "operator").expect("sentinel");
+        let shim = Shim::install().expect("shim");
+        let state = SharedState::new_for_test(
+            checkout.path().to_path_buf(),
+            shim,
+            crate::paths::ProtectedPathPolicy::from_paths([protected]),
+        )
+        .expect("state");
+        // The test runner environment commonly lacks this name; setting it
+        // verifies env_clear rather than merely observing absence.
+        std::env::set_var("GITHUB_PAT_FUTURE_ALIAS", "must-not-cross");
+        let result = run(
+            &state,
+            ShellParams {
+                command: "printf '%s' \"${GITHUB_PAT_FUTURE_ALIAS-unset}\"; printf poison > .buzz/ledger/authority.json 2>/dev/null || true".into(),
+                workdir: None,
+                timeout_ms: Some(5_000),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .expect("shell result");
+        std::env::remove_var("GITHUB_PAT_FUTURE_ALIAS");
+        let value = body(result);
+        assert_eq!(value["stdout"], "unset");
+        assert_eq!(
+            std::fs::read_to_string(&sentinel).expect("sentinel"),
+            "operator"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn model_shell_can_edit_and_stage_ordinary_checkout_files() {
+        let checkout = tempdir().expect("checkout");
+        let init = std::process::Command::new("/usr/bin/git")
+            .args(["init", "-q"])
+            .current_dir(checkout.path())
+            .status()
+            .expect("git init");
+        assert!(init.success());
+        std::fs::write(checkout.path().join("ordinary.txt"), "before\n").expect("file");
+        let state = make_state(checkout.path());
+        let result = run(
+            &state,
+            ShellParams {
+                command: "printf 'after\\n' > ordinary.txt && /usr/bin/git add ordinary.txt && /usr/bin/git status --short".into(),
+                workdir: None,
+                timeout_ms: Some(5_000),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .expect("shell result");
+        let value = body(result);
+        assert_eq!(value["exit_code"], 0, "{value}");
+        assert!(
+            value["stdout"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("A  ordinary.txt"),
+            "{value}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
     #[tokio::test(flavor = "current_thread")]
     async fn timeout_fires() {
         let dir = tempdir().expect("tempdir");
@@ -1060,6 +1632,7 @@ mod tests {
         assert_eq!(v["exit_code"], 124);
     }
 
+    #[cfg(target_os = "macos")]
     #[tokio::test(flavor = "current_thread")]
     async fn workdir_is_honored() {
         let dir = tempdir().expect("tempdir");
@@ -1070,7 +1643,7 @@ mod tests {
             &state,
             ShellParams {
                 command: "pwd".into(),
-                workdir: Some(sub.display().to_string()),
+                workdir: Some("sub".to_string()),
                 timeout_ms: Some(5_000),
             },
             CancellationToken::new(),
@@ -1088,6 +1661,18 @@ mod tests {
                 || stdout.contains(sub.file_name().unwrap().to_str().unwrap()),
             "stdout: {stdout}"
         );
+        let error = run(
+            &state,
+            ShellParams {
+                command: "pwd".into(),
+                workdir: Some(sub_canon.display().to_string()),
+                timeout_ms: Some(5_000),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("absolute workdir must be rejected");
+        assert!(format!("{error:?}").contains("must be relative"));
     }
 
     // --- is_windows_apps_alias predicate tests (cross-host) ---

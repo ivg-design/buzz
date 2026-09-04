@@ -17,6 +17,8 @@ fn test_relay() -> TrustedRelay {
         session_thread_root_id: None,
         job_operation_id: None,
         job_request_event_id: None,
+        session_working_directory: None,
+        github_credentials: Default::default(),
     }
 }
 

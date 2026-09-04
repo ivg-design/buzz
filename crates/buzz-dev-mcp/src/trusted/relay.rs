@@ -27,7 +27,7 @@ pub struct TrustedRelay {
     pub(super) relay_host: String,
     pub(super) keys: nostr::Keys,
     auth_tag: Option<Tag>,
-    auth_tag_json: Option<String>,
+    pub(super) auth_tag_json: Option<String>,
     pub(super) owner_pubkey: String,
     pub(super) owner_github_login: Option<String>,
     pub(super) grants: super::GrantSet,
@@ -35,6 +35,8 @@ pub struct TrustedRelay {
     pub(super) session_thread_root_id: Option<String>,
     pub(super) job_operation_id: Option<String>,
     pub(super) job_request_event_id: Option<String>,
+    pub(super) session_working_directory: Option<std::path::PathBuf>,
+    pub(super) github_credentials: super::git::GitHubCredentialStore,
 }
 
 impl TrustedRelay {
@@ -77,6 +79,8 @@ impl TrustedRelay {
             session_thread_root_id: config.session_thread_root_id,
             job_operation_id: config.job_operation_id,
             job_request_event_id: config.job_request_event_id,
+            session_working_directory: config.session_working_directory,
+            github_credentials: config.github_credentials,
         })
     }
 
@@ -112,7 +116,14 @@ impl TrustedRelay {
         job: JobEvent,
         cancellation: &CancellationToken,
     ) -> Result<PublishedEvent, String> {
-        self.fresh_context(cancellation).await?;
+        let event = self.prepare_job_event(job)?;
+        self.publish_prepared_job_event(event, cancellation).await
+    }
+
+    /// Sign one fully validated model-owned job event without crossing the
+    /// network boundary. Handoff uses this so ACP can durably freeze the exact
+    /// bytes before publication.
+    pub(super) fn prepare_job_event(&self, job: JobEvent) -> Result<Event, String> {
         let kind = job_kind(&job);
         if !model_owned_job(&job) {
             return Err(
@@ -123,6 +134,30 @@ impl TrustedRelay {
         let tags = build_job_tags(&job).map_err(|error| error.to_string())?;
         let event = self.sign(EventBuilder::new(Kind::Custom(kind as u16), content).tags(tags))?;
         JobEvent::parse(&event).map_err(|error| error.to_string())?;
+        Ok(event)
+    }
+
+    /// Revalidate current tenant authority and publish only the exact event
+    /// previously returned by `prepare_job_event`.
+    pub(super) async fn publish_prepared_job_event(
+        &self,
+        event: Event,
+        cancellation: &CancellationToken,
+    ) -> Result<PublishedEvent, String> {
+        self.fresh_context(cancellation).await?;
+        buzz_core::verify_event(&event)
+            .map_err(|_| "prepared job event signature is invalid".to_owned())?;
+        if event.pubkey != self.keys.public_key() {
+            return Err("prepared job event signer does not match this session".into());
+        }
+        let job =
+            JobEvent::parse(&event).map_err(|_| "prepared job event is invalid".to_owned())?;
+        if !model_owned_job(&job)
+            || !self.grants.allows_event(&job, &self.signer_pubkey())
+            || self.bound_a2a_channel()? != job.common().project.home_channel
+        {
+            return Err("prepared job event escaped the bound A2A session".into());
+        }
         self.submit(event, PublishClass::ModelJob, cancellation)
             .await
     }

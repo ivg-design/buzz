@@ -193,6 +193,26 @@ fn cancel_request_requires_worker_quiescence_after_claim() {
     assert!(validate_predecessor(&cancelled, &cancel, &"a".repeat(64)).is_ok());
     assert!(is_terminal(&cancelled));
 
+    let indeterminate = JobEvent::Error(JobError {
+        followup: JobFollowup {
+            common: worker_common(&root, &worker, &requester),
+            request_event_id: "a".repeat(64),
+            prior_event_id: Some("d".repeat(64)),
+        },
+        outcome: JobErrorOutcome::Indeterminate,
+        code: "cancel_after_applied_git_operation".into(),
+        message: "repository state requires reconciliation".into(),
+        retryable: false,
+    });
+    assert!(validate_transition(&indeterminate, &root).is_ok());
+    assert!(validate_predecessor(&indeterminate, &cancel, &"a".repeat(64)).is_ok());
+    let mut false_failure = indeterminate.clone();
+    let JobEvent::Error(error) = &mut false_failure else {
+        unreachable!()
+    };
+    error.outcome = JobErrorOutcome::Failed;
+    assert!(validate_predecessor(&false_failure, &cancel, &"a".repeat(64)).is_err());
+
     let root_cancel = JobEvent::Control(JobControl {
         followup: JobFollowup {
             common: root.common().clone(),

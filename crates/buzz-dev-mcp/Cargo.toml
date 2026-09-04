@@ -17,6 +17,7 @@ path = "src/main.rs"
 nostr = { workspace = true }
 buzz-sdk = { workspace = true }
 buzz-core = { workspace = true }
+git-sign-nostr = { path = "../git-sign-nostr" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 serde = { workspace = true }
@@ -43,7 +44,7 @@ base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", default-features = false, features = ["signal", "process"] }
+nix = { version = "0.31", default-features = false, features = ["fs", "signal", "process"] }
 
 # Windows Job Object APIs for the shell tool's timeout kill path: terminating a
 # job kills the bash child AND every MSYS grandchild it forked, the Windows

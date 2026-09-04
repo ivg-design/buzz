@@ -21,11 +21,20 @@ struct JobGrant {
     repository: String,
     requester_pubkeys: Vec<String>,
     capabilities: Vec<String>,
+    /// Privileged Git mutations are opt-in independently from the job's
+    /// semantic capability. Older grants deserialize to an empty deny-all set.
+    #[serde(default)]
+    git_operations: Vec<String>,
     path_prefixes: Vec<String>,
     base_sha: String,
     branch: String,
     worktree_id: String,
     checkout_root: PathBuf,
+    /// Captured before any model process starts and never deserialized from
+    /// the operator document. Shared worktrees therefore serialize on the
+    /// same immutable common Git directory.
+    #[serde(skip)]
+    git_common_dir: PathBuf,
 }
 
 /// One exact local authorization selected for an outbound request.
@@ -39,6 +48,22 @@ pub struct GrantMatch {
     pub worktree_id: String,
 }
 
+/// Exact, operator-granted checkout available to harness-owned Git tools.
+///
+/// This type is intentionally crate-private and has no serialization or
+/// `Debug` implementation. Model-facing tools cannot supply or widen any of
+/// these values.
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct TrustedGitCheckout {
+    pub(super) root: PathBuf,
+    pub(super) git_common_dir: PathBuf,
+    pub(super) repository: String,
+    pub(super) base_sha: String,
+    pub(super) head_sha: String,
+    pub(super) branch: String,
+    pub(super) path_prefixes: Vec<String>,
+}
+
 /// Validated local, operator-controlled collaboration grants.
 ///
 /// No `Debug` implementation is provided so the allowlist cannot be dumped by
@@ -49,7 +74,11 @@ pub struct GrantSet {
 }
 
 impl GrantSet {
-    pub fn load(cwd: &Path, inline: Option<String>, file: Option<PathBuf>) -> Result<Self, String> {
+    pub fn load(
+        _cwd: &Path,
+        inline: Option<String>,
+        file: Option<PathBuf>,
+    ) -> Result<Self, String> {
         if inline.is_some() && file.is_some() {
             return Err(
                 "set only one of BUZZ_ACP_JOB_GRANTS_JSON or BUZZ_ACP_JOB_GRANTS_FILE".into(),
@@ -61,13 +90,9 @@ impl GrantSet {
                 std::fs::read_to_string(path)
                     .map_err(|error| format!("reading local A2A grants: {error}"))?,
             ),
-            (None, None) => {
-                match std::fs::read_to_string(cwd.join(".buzz/agent-job-grants.json")) {
-                    Ok(raw) => Some(raw),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                    Err(error) => return Err(format!("reading local A2A grants: {error}")),
-                }
-            }
+            // An absent explicit source is deny-all. In particular, never
+            // discover a checkout-local grant document that a model can edit.
+            (None, None) => None,
             _ => None,
         };
         let Some(raw) = raw else {
@@ -95,6 +120,44 @@ impl GrantSet {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect()
+    }
+
+    /// Canonical repositories whose explicit grant requires an operator
+    /// credential. Commit-only grants never trigger credential resolution.
+    pub(super) fn credential_repositories(&self) -> Vec<String> {
+        self.grants
+            .iter()
+            .filter(|grant| {
+                grant
+                    .git_operations
+                    .iter()
+                    .any(|operation| matches!(operation.as_str(), "fetch" | "push"))
+            })
+            .map(|grant| grant.repository.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    pub(super) fn git_lock_key(
+        &self,
+        session_working_directory: Option<&Path>,
+    ) -> Result<PathBuf, String> {
+        let root = session_working_directory
+            .ok_or_else(|| "trusted Git requires a receiver-verified checkout".to_owned())?
+            .canonicalize()
+            .map_err(|_| "trusted Git checkout is unavailable".to_owned())?;
+        let keys = self
+            .grants
+            .iter()
+            .filter(|grant| grant.checkout_root == root)
+            .map(|grant| grant.git_common_dir.clone())
+            .collect::<BTreeSet<_>>();
+        match keys.into_iter().collect::<Vec<_>>().as_slice() {
+            [key] => Ok(key.clone()),
+            [] => Err("trusted Git checkout has no local grant".into()),
+            _ => Err("trusted Git checkout has conflicting common directories".into()),
+        }
     }
 
     pub fn outbound(
@@ -202,6 +265,74 @@ impl GrantSet {
                     .all(|path| path_allowed(path, &grant.path_prefixes))
         })
     }
+
+    /// Select the one checkout fixed to this job session's channel and
+    /// receiver-verified working directory.
+    ///
+    /// Unlike outbound dispatch, Git operations may advance HEAD after a
+    /// signed commit. The original grant SHA must remain an ancestor and every
+    /// other checkout invariant remains exact.
+    pub(super) fn trusted_git_checkout(
+        &self,
+        session_channel_id: Option<&str>,
+        session_working_directory: Option<&Path>,
+        request: &buzz_core::job::JobRequest,
+        operation: super::ProjectGitOperation,
+    ) -> Result<TrustedGitCheckout, String> {
+        let channel = session_channel_id
+            .ok_or_else(|| "trusted Git requires a channel-bound session".to_owned())?;
+        let working_directory = session_working_directory
+            .ok_or_else(|| "trusted Git requires a receiver-verified checkout".to_owned())?
+            .canonicalize()
+            .map_err(|_| "trusted Git checkout is unavailable".to_owned())?;
+        let common = &request.common;
+        if common.project.home_channel != channel {
+            return Err("trusted Git request does not match the session channel".into());
+        }
+        let mut matches = self
+            .grants
+            .iter()
+            .filter(|grant| {
+                grant.home_channel == channel
+                    && grant.project_address == common.project.address
+                    && grant.repository == common.repository.canonical
+                    && grant.base_sha == common.repository.base_sha
+                    && grant.branch == common.repository.branch
+                    && grant.worktree_id == common.repository.worktree_id
+                    && common
+                        .repository
+                        .paths
+                        .iter()
+                        .all(|path| path_allowed(path, &grant.path_prefixes))
+                    && grant.checkout_root == working_directory
+                    && grant
+                        .git_operations
+                        .iter()
+                        .any(|allowed| allowed == operation.as_str())
+            })
+            .filter_map(|grant| inspect_trusted_git_checkout(grant, &common.repository.paths).ok())
+            .collect::<Vec<_>>();
+        matches.sort_by(|left, right| {
+            (
+                &left.repository,
+                &left.base_sha,
+                &left.branch,
+                &left.path_prefixes,
+            )
+                .cmp(&(
+                    &right.repository,
+                    &right.base_sha,
+                    &right.branch,
+                    &right.path_prefixes,
+                ))
+        });
+        matches.dedup();
+        match matches.as_slice() {
+            [checkout] => Ok(checkout.clone()),
+            [] => Err("session checkout is outside the local Project grant".into()),
+            _ => Err("session checkout matches conflicting local Project grants".into()),
+        }
+    }
 }
 
 struct Checkout {
@@ -222,24 +353,84 @@ fn inspect_checkout(grant: &JobGrant) -> Result<Checkout, String> {
     let branch = git(&cwd, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
     let remote = git(&cwd, &["remote", "get-url", "origin"])?;
     let repository = canonical_github_remote(&remote)?;
-    if repository != grant.repository || base_sha != grant.base_sha || branch != grant.branch {
+    let git_common_dir = PathBuf::from(git(
+        &cwd,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?)
+    .canonicalize()
+    .map_err(|_| "local A2A Git directory is unavailable".to_owned())?;
+    if repository != grant.repository
+        || base_sha != grant.base_sha
+        || branch != grant.branch
+        || git_common_dir != grant.git_common_dir
+    {
         return Err("local A2A checkout no longer matches its exact grant".into());
     }
     Ok(Checkout { base_sha, branch })
 }
 
+fn inspect_trusted_git_checkout(
+    grant: &JobGrant,
+    request_paths: &[String],
+) -> Result<TrustedGitCheckout, String> {
+    let root = grant
+        .checkout_root
+        .canonicalize()
+        .map_err(|_| "local Project checkout is unavailable".to_owned())?;
+    let top = PathBuf::from(git(&root, &["rev-parse", "--show-toplevel"])?);
+    if top.canonicalize().ok().as_ref() != Some(&root) {
+        return Err("local Project checkout root no longer matches its grant".into());
+    }
+    let head_sha = git(&root, &["rev-parse", "HEAD"])?;
+    let branch = git(&root, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
+    let remote = git(&root, &["remote", "get-url", "origin"])?;
+    let repository = canonical_github_remote(&remote)?;
+    let git_common_dir = PathBuf::from(git(
+        &root,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?)
+    .canonicalize()
+    .map_err(|_| "local Project Git directory is unavailable".to_owned())?;
+    if repository != grant.repository
+        || branch != grant.branch
+        || git_common_dir != grant.git_common_dir
+    {
+        return Err("local Project checkout no longer matches its grant".into());
+    }
+    if !git_status(
+        &root,
+        &["merge-base", "--is-ancestor", &grant.base_sha, &head_sha],
+    )? {
+        return Err("local Project checkout no longer descends from its granted base".into());
+    }
+    Ok(TrustedGitCheckout {
+        root,
+        git_common_dir,
+        repository: grant.repository.clone(),
+        base_sha: grant.base_sha.clone(),
+        head_sha,
+        branch,
+        // The accepted signed request may be narrower than the operator's
+        // reusable grant. Git operations use the request's exact path scope.
+        path_prefixes: request_paths.to_vec(),
+    })
+}
+
 fn git(cwd: &Path, args: &[&str]) -> Result<String, String> {
-    let mut command = Command::new("git");
+    let mut command = Command::new(system_git()?);
     command
         .args(args)
         .current_dir(cwd)
         .env_clear()
         .env(
             "PATH",
-            std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()),
+            "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
         )
         .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_CONFIG_NOSYSTEM", "1");
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_NO_REPLACE_OBJECTS", "1");
     let output = command
         .output()
         .map_err(|error| format!("running git: {error}"))?;
@@ -251,19 +442,61 @@ fn git(cwd: &Path, args: &[&str]) -> Result<String, String> {
         .map_err(|_| "git output was not UTF-8".into())
 }
 
+fn git_status(cwd: &Path, args: &[&str]) -> Result<bool, String> {
+    let mut command = Command::new(system_git()?);
+    command
+        .args(args)
+        .current_dir(cwd)
+        .env_clear()
+        .env(
+            "PATH",
+            "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        )
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_NO_REPLACE_OBJECTS", "1");
+    let status = command
+        .status()
+        .map_err(|error| format!("running git: {error}"))?;
+    match status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err("local checkout ancestry inspection failed".into()),
+    }
+}
+
 fn canonical_github_remote(value: &str) -> Result<String, String> {
     let value = value.strip_suffix(".git").unwrap_or(value);
     let path = value
         .strip_prefix("https://github.com/")
         .or_else(|| value.strip_prefix("git@github.com:"))
         .ok_or_else(|| "origin must be a canonical GitHub HTTPS or SSH remote".to_owned())?;
-    if path.split('/').count() != 2 || path.split('/').any(|part| part.is_empty()) {
+    if path.split('/').count() != 2 || path.split('/').any(|part| !valid_github_part(part)) {
         return Err("origin must identify one GitHub owner/repository".into());
     }
     Ok(format!("https://github.com/{}", path.to_ascii_lowercase()))
 }
 
-fn path_allowed(path: &str, prefixes: &[String]) -> bool {
+fn valid_github_part(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 100
+        && value != "."
+        && value != ".."
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn system_git() -> Result<&'static str, String> {
+    ["/usr/bin/git", "/bin/git"]
+        .into_iter()
+        .find(|path| Path::new(path).is_file())
+        .ok_or_else(|| "trusted system git was not found".to_owned())
+}
+
+pub(super) fn path_allowed(path: &str, prefixes: &[String]) -> bool {
     valid_relative_path(path)
         && !prefixes.is_empty()
         && prefixes
@@ -282,6 +515,7 @@ fn validate_grant(grant: &mut JobGrant) -> Result<(), String> {
     }
     unique_valid(&grant.requester_pubkeys, valid_pubkey, "requester_pubkeys")?;
     unique_valid(&grant.capabilities, valid_token, "capabilities")?;
+    unique_valid(&grant.git_operations, valid_git_operation, "git_operations")?;
     if grant.path_prefixes.is_empty() {
         return Err("path_prefixes must contain at least one repository-relative path".into());
     }
@@ -299,6 +533,12 @@ fn validate_grant(grant: &mut JobGrant) -> Result<(), String> {
         .checkout_root
         .canonicalize()
         .map_err(|_| "checkout_root must be an absolute existing directory".to_owned())?;
+    grant.git_common_dir = PathBuf::from(git(
+        &grant.checkout_root,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?)
+    .canonicalize()
+    .map_err(|_| "checkout_root must name an existing Git worktree".to_owned())?;
     Ok(())
 }
 
@@ -355,6 +595,10 @@ fn valid_branch(value: &str) -> bool {
             .any(|byte| matches!(byte, b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\'))
 }
 
+fn valid_git_operation(value: &str) -> bool {
+    matches!(value, "commit" | "fetch" | "push")
+}
+
 fn valid_sha(value: &str) -> bool {
     matches!(value.len(), 40 | 64)
         && value
@@ -406,6 +650,60 @@ mod tests {
         assert!(!path_allowed("other/a", &["crates".into()]));
         assert!(!path_allowed("crates/../secret", &["crates".into()]));
         assert!(!path_allowed("crates/.GiT/config", &["crates".into()]));
+    }
+
+    #[test]
+    fn git_operations_are_explicit_bounded_and_deny_by_default() {
+        let peer = "a".repeat(64);
+        let checkout = tempfile::tempdir().expect("checkout");
+        assert!(Command::new("git")
+            .arg("init")
+            .arg(checkout.path())
+            .status()
+            .expect("git init")
+            .success());
+        let base = serde_json::json!({
+            "version": 1,
+            "grants": [{
+                "project_address": format!("30621:{peer}:nemo"),
+                "home_channel": "3580ca9b-47b4-4af9-b22a-1068778f26c6",
+                "repository": "https://github.com/mysteropodes/nemo",
+                "requester_pubkeys": [peer],
+                "capabilities": ["rust"],
+                "path_prefixes": ["crates"],
+                "base_sha": "b".repeat(40),
+                "branch": "codex/a2a",
+                "worktree_id": "a2a",
+                "checkout_root": checkout.path(),
+            }]
+        });
+        let without: GrantDocument =
+            serde_json::from_value(base.clone()).expect("legacy grant parses deny-all");
+        assert!(without.grants[0].git_operations.is_empty());
+
+        let mut allowed = base.clone();
+        allowed["grants"][0]["git_operations"] = serde_json::json!(["commit", "fetch", "push"]);
+        let allowed: GrantDocument = serde_json::from_value(allowed).expect("operations parse");
+        assert!(validate_grant(&mut allowed.grants[0].clone()).is_ok());
+
+        let mut invalid = base;
+        invalid["grants"][0]["git_operations"] = serde_json::json!(["commit", "shell"]);
+        let mut invalid: GrantDocument = serde_json::from_value(invalid).expect("schema parses");
+        assert!(validate_grant(&mut invalid.grants[0]).is_err());
+    }
+
+    #[test]
+    fn absent_explicit_grant_source_ignores_checkout_local_document() {
+        let checkout = tempfile::tempdir().expect("checkout");
+        std::fs::create_dir(checkout.path().join(".buzz")).expect("buzz dir");
+        std::fs::write(
+            checkout.path().join(".buzz/agent-job-grants.json"),
+            r#"{"version":1,"grants":"model-poison"}"#,
+        )
+        .expect("poisoned local grant");
+        let grants = GrantSet::load(checkout.path(), None, None)
+            .expect("absent explicit source is empty, not local discovery");
+        assert!(grants.channels().is_empty());
     }
 
     #[test]

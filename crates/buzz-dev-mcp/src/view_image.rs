@@ -10,7 +10,6 @@
 //! into the right provider-native shape on our behalf (see Goose's
 //! `providers::utils::convert_image` for a reference implementation).
 
-use crate::paths::resolve_path;
 use crate::shell::SharedState;
 use base64::Engine;
 use image::{
@@ -24,7 +23,6 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::io::Cursor;
-use std::path::PathBuf;
 use std::time::Duration;
 
 /// Hard cap on bytes we will read from disk / URL / data: URL.
@@ -59,7 +57,7 @@ fn decode_limits() -> Limits {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ViewImageParams {
-    /// Image source: an absolute or workspace-relative file path,
+    /// Image source: a checkout-relative file path,
     /// an `http://` / `https://` URL, or a `data:image/<type>;base64,...` URL.
     pub source: String,
     /// Optional longest-edge cap in pixels. Clamped to [64, 2048].
@@ -67,8 +65,8 @@ pub struct ViewImageParams {
     /// OpenAI's high-detail tile size.
     #[serde(default)]
     pub max_dim: Option<u32>,
-    /// Workspace root for relative path resolution. Ignored for URL sources.
-    /// Defaults to the server's cwd.
+    /// Checkout-relative directory for path resolution. Ignored for URL
+    /// sources. Defaults to the checkout root; absolute paths are rejected.
     #[serde(default)]
     pub workdir: Option<String>,
 }
@@ -148,49 +146,13 @@ async fn load_source(
             "unsupported URL scheme in `source`: {src}",
         )))
     } else {
-        let workspace_root = match p.workdir.as_deref() {
-            Some(w) => PathBuf::from(w),
-            None => state.cwd.clone(),
-        };
-        let target = resolve_path(&workspace_root, src).map_err(invalid_params)?;
-        let meta = std::fs::metadata(&target).map_err(|e| {
-            ErrorData::internal_error(format!("cannot stat {}: {e}", target.display()), None)
-        })?;
-        if !meta.is_file() {
-            return Err(invalid_params(format!(
-                "not a regular file: {}",
-                target.display()
-            )));
-        }
-        if meta.len() as usize > MAX_SOURCE_BYTES {
-            return Err(invalid_params(format!(
-                "file too large: {} is {} bytes (limit {} bytes)",
-                target.display(),
-                meta.len(),
-                MAX_SOURCE_BYTES
-            )));
-        }
-        // Use `take(cap + 1)` so a file that grows between the metadata
-        // check and the read still cannot exceed our budget. The +1
-        // distinguishes "exactly at cap" from "grew past cap".
-        let file = std::fs::File::open(&target).map_err(|e| {
-            ErrorData::internal_error(format!("cannot open {}: {e}", target.display()), None)
-        })?;
-        let mut bytes = Vec::with_capacity(meta.len() as usize);
-        use std::io::Read;
-        file.take(MAX_SOURCE_BYTES as u64 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|e| {
-                ErrorData::internal_error(format!("cannot read {}: {e}", target.display()), None)
-            })?;
-        if bytes.len() > MAX_SOURCE_BYTES {
-            return Err(invalid_params(format!(
-                "file {} grew past {} byte cap during read",
-                target.display(),
-                MAX_SOURCE_BYTES
-            )));
-        }
-        Ok((bytes, target.display().to_string()))
+        let (target, bytes) = crate::paths::read_file_bytes(
+            state,
+            src,
+            p.workdir.as_deref(),
+            MAX_SOURCE_BYTES as u64,
+        )?;
+        Ok((bytes, target.display.display().to_string()))
     }
 }
 
@@ -623,7 +585,7 @@ mod tests {
             ViewImageParams {
                 source: "tiny.png".into(),
                 max_dim: None,
-                workdir: Some(dir.path().display().to_string()),
+                workdir: None,
             },
         )
         .await
@@ -652,7 +614,7 @@ mod tests {
             ViewImageParams {
                 source: "big.png".into(),
                 max_dim: Some(512),
-                workdir: Some(dir.path().display().to_string()),
+                workdir: None,
             },
         )
         .await
@@ -687,7 +649,7 @@ mod tests {
             ViewImageParams {
                 source: "big.jpg".into(),
                 max_dim: Some(800),
-                workdir: Some(dir.path().display().to_string()),
+                workdir: None,
             },
         )
         .await
@@ -701,7 +663,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn allows_path_outside_workspace() {
+    async fn rejects_path_outside_workspace() {
         let dir = tempdir().unwrap();
         // A real non-image file in a SECOND tempdir, genuinely outside the
         // workspace root — we expect a format error, not a path-escape error,
@@ -716,16 +678,13 @@ mod tests {
             ViewImageParams {
                 source: target.display().to_string(),
                 max_dim: None,
-                workdir: Some(dir.path().display().to_string()),
+                workdir: None,
             },
         )
         .await
         .unwrap_err();
         let msg = format!("{res:?}");
-        assert!(
-            msg.contains("unsupported image format") || msg.contains("empty image"),
-            "{msg}"
-        );
+        assert!(msg.contains("must be relative"), "{msg}");
     }
 
     #[tokio::test]
@@ -740,7 +699,7 @@ mod tests {
             ViewImageParams {
                 source: "a.bmp".into(),
                 max_dim: None,
-                workdir: Some(dir.path().display().to_string()),
+                workdir: None,
             },
         )
         .await
@@ -773,7 +732,7 @@ mod tests {
             ViewImageParams {
                 source: "a.gif".into(),
                 max_dim: None,
-                workdir: Some(dir.path().display().to_string()),
+                workdir: None,
             },
         )
         .await
@@ -826,7 +785,7 @@ mod tests {
                 ViewImageParams {
                     source: "ftp://example.com/foo.png".into(),
                     max_dim: None,
-                    workdir: Some(dir.path().display().to_string()),
+                    workdir: None,
                 },
             ))
             .unwrap_err();

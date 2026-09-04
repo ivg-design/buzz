@@ -24,6 +24,7 @@ use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
 use crate::acp::{HttpHeader, McpServer};
+use crate::job_receiver::JobPrivilegeRegistry;
 use crate::scope::SessionScope;
 
 const SERVER_NAME: &str = "buzz-trusted-session";
@@ -35,21 +36,42 @@ const MIN_TOKEN_BYTES: usize = 32;
 pub struct TrustedMcpFactory {
     identity: HarnessTrustedIdentity,
     lifetime: Duration,
+    job_privileges: JobPrivilegeRegistry,
 }
 
 impl TrustedMcpFactory {
     /// Create a factory. `lifetime` must cover a complete maximum-length turn;
     /// callers rotate provider sessions before the remaining lifetime is short.
-    pub fn new(identity: HarnessTrustedIdentity, lifetime: Duration) -> Result<Self, String> {
+    #[cfg(test)]
+    pub(crate) fn new(
+        identity: HarnessTrustedIdentity,
+        lifetime: Duration,
+    ) -> Result<Self, String> {
+        Self::with_job_privileges(identity, lifetime, JobPrivilegeRegistry::default())
+    }
+
+    pub(crate) fn with_job_privileges(
+        identity: HarnessTrustedIdentity,
+        lifetime: Duration,
+        job_privileges: JobPrivilegeRegistry,
+    ) -> Result<Self, String> {
         if lifetime.is_zero() {
             return Err("trusted MCP capability lifetime must be non-zero".into());
         }
-        Ok(Self { identity, lifetime })
+        Ok(Self {
+            identity,
+            lifetime,
+            job_privileges,
+        })
     }
 
     /// Start one loopback-only MCP server with an independently generated
     /// bearer capability and a handler fixed to `scope`.
-    pub async fn start(&self, scope: &SessionScope) -> Result<TrustedMcpSession, String> {
+    pub async fn start(
+        &self,
+        scope: &SessionScope,
+        working_directory: &std::path::Path,
+    ) -> Result<TrustedMcpSession, String> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .map_err(|_| "failed to bind trusted MCP loopback listener".to_owned())?;
@@ -60,9 +82,13 @@ impl TrustedMcpFactory {
             return Err("trusted MCP listener was not bound to loopback".into());
         }
 
-        let relay = self.identity.scoped_relay(scope_binding(scope))?;
+        let relay = self
+            .identity
+            .scoped_relay(scope_binding(scope, working_directory))?;
         let cancellation = CancellationToken::new();
-        let handler = TrustedSessionMcp::new(relay, cancellation.clone());
+        let privilege_gate = self.job_privileges.for_session(scope, working_directory)?;
+        let handler =
+            TrustedSessionMcp::new_with_privilege_gate(relay, cancellation.clone(), privilege_gate);
         let expires_at = tokio::time::Instant::now() + self.lifetime;
         let token = Arc::new(SessionSecret::generate()?);
         let auth = AuthState {
@@ -207,10 +233,11 @@ fn constant_time_eq(left: &str, right: &str) -> bool {
         == 0
 }
 
-fn scope_binding(scope: &SessionScope) -> TrustedSessionScope {
+fn scope_binding(scope: &SessionScope, working_directory: &std::path::Path) -> TrustedSessionScope {
     let mut binding = TrustedSessionScope {
         channel_id: Some(scope.channel_id().to_string()),
         thread_root_id: scope.root_event_id().map(str::to_owned),
+        working_directory: Some(working_directory.to_path_buf()),
         ..TrustedSessionScope::default()
     };
     if let SessionScope::Job {
@@ -253,6 +280,14 @@ mod tests {
         }
     }
 
+    fn job_scope() -> SessionScope {
+        SessionScope::Job {
+            channel_id: uuid::Uuid::new_v4(),
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            request_event_id: "a".repeat(64),
+        }
+    }
+
     async fn post(session: &TrustedMcpSession, auth: &str) -> reqwest::Result<reqwest::Response> {
         reqwest::Client::new()
             .post(session.url())
@@ -267,8 +302,14 @@ mod tests {
     #[tokio::test]
     async fn bearer_is_unique_scope_bound_and_required() {
         let factory = TrustedMcpFactory::new(identity(), Duration::from_secs(60)).unwrap();
-        let first = factory.start(&scope()).await.unwrap();
-        let second = factory.start(&scope()).await.unwrap();
+        let first = factory
+            .start(&scope(), std::path::Path::new("."))
+            .await
+            .unwrap();
+        let second = factory
+            .start(&scope(), std::path::Path::new("."))
+            .await
+            .unwrap();
         assert_eq!(post(&first, "Bearer wrong").await.unwrap().status(), 401);
         assert_eq!(
             post(&second, &first.authorization())
@@ -284,9 +325,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn job_session_without_registered_privilege_fails_closed() {
+        let factory = TrustedMcpFactory::new(identity(), Duration::from_secs(60)).unwrap();
+        assert!(factory
+            .start(&job_scope(), std::path::Path::new("."))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
     async fn exact_host_is_required() {
         let factory = TrustedMcpFactory::new(identity(), Duration::from_secs(60)).unwrap();
-        let session = factory.start(&scope()).await.unwrap();
+        let session = factory
+            .start(&scope(), std::path::Path::new("."))
+            .await
+            .unwrap();
         let response = reqwest::Client::new()
             .post(session.url())
             .header("Authorization", session.authorization())
@@ -302,7 +355,10 @@ mod tests {
     #[tokio::test]
     async fn expiry_and_drop_close_capability() {
         let factory = TrustedMcpFactory::new(identity(), Duration::from_millis(30)).unwrap();
-        let session = factory.start(&scope()).await.unwrap();
+        let session = factory
+            .start(&scope(), std::path::Path::new("."))
+            .await
+            .unwrap();
         let url = session.url();
         let auth = session.authorization();
         tokio::time::sleep(Duration::from_millis(60)).await;
@@ -319,7 +375,10 @@ mod tests {
     #[tokio::test]
     async fn drop_closes_listener_before_expiry() {
         let factory = TrustedMcpFactory::new(identity(), Duration::from_secs(60)).unwrap();
-        let session = factory.start(&scope()).await.unwrap();
+        let session = factory
+            .start(&scope(), std::path::Path::new("."))
+            .await
+            .unwrap();
         let url = session.url();
         let auth = session.authorization();
         assert_eq!(post(&session, &auth).await.unwrap().status(), 200);
@@ -408,7 +467,10 @@ mod tests {
         )
         .unwrap();
         let factory = TrustedMcpFactory::new(identity, Duration::from_secs(60)).unwrap();
-        let session = factory.start(&scope()).await.unwrap();
+        let session = factory
+            .start(&scope(), std::path::Path::new("."))
+            .await
+            .unwrap();
         let initialized = post(&session, &session.authorization()).await.unwrap();
         assert_eq!(initialized.status(), 200);
         let mcp_session = initialized

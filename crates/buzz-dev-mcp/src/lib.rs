@@ -21,7 +21,11 @@ mod tree;
 mod trusted;
 mod view_image;
 
-pub use trusted::{HarnessTrustedIdentity, TrustedSessionMcp, TrustedSessionScope};
+pub use trusted::{
+    HarnessTrustedIdentity, JobPrivilegeGate, PrivilegeFuture, PrivilegedGitDisposition,
+    PrivilegedGitOperationReceipt, PrivilegedOperationOutcome, ProjectGitOperation,
+    TrustedGitOperationLease, TrustedSessionMcp, TrustedSessionScope,
+};
 
 #[derive(Clone)]
 struct DevMcp {
@@ -42,7 +46,7 @@ impl DevMcp {
 
     #[tool(
         name = "shell",
-        description = "Run a shell command (bash by default; set `BUZZ_SHELL` to use cmd, PowerShell, or another shell). Ephemeral process per call. Output tail-truncated to ~8KB for the LLM; full output (first 10MB) saved to artifact file. timeout_ms defaults to 120000 (2 min) if omitted; capped at 1,200,000 (20 min). For long-running commands (git push with hooks, cargo build, test suites), use 300000+. On PATH: rg (prefer over grep; flags: -n -i -l -g <glob> -C <n> --files) and tree (flags: -d <depth>; shows line counts)."
+        description = "Run a checkout-confined shell command on macOS. Ephemeral process per call with an explicit non-secret environment and no access to operator HOME or protected authority paths. This shell never receives the managed Nostr signer or relay credentials; use the typed Project Git tools for authorized commit/fetch/push. Output tail-truncated to ~8KB for the LLM; full output (first 10MB) saved to an isolated session artifact. timeout_ms defaults to 120000 (2 min) if omitted; capped at 1,200,000 (20 min). For long-running commands (cargo build, test suites), use 300000+. On PATH: rg and tree."
     )]
     async fn shell(
         &self,
@@ -54,7 +58,7 @@ impl DevMcp {
 
     #[tool(
         name = "read_file",
-        description = "Read a text file and return its contents with line numbers. Returns lines in `{number}:{content}` format. Use `offset` (0-based) and `limit` (default 2000) to window into large files. Path resolved relative to workdir (defaults to server cwd). Prefer over cat/head/tail."
+        description = "Read a regular text file inside the session checkout without following symlinks. Returns lines in `{number}:{content}` format. Use `offset` (0-based) and `limit` (default 2000) to window into large files. `workdir` may only select a directory inside the checkout. Prefer over cat/head/tail."
     )]
     async fn read_file(
         &self,
@@ -76,7 +80,7 @@ impl DevMcp {
 
     #[tool(
         name = "str_replace",
-        description = "Atomic find-and-replace in a file. old_str must occur exactly once unless replace_all is true, in which case all occurrences are replaced. Returns a unified diff. Path resolved relative to workdir (defaults to server cwd). Prefer over sed/awk."
+        description = "Descriptor-safe atomic find-and-replace in an ordinary checkout file. Symlinks, protected authority inputs, and every `.git` component are rejected. old_str must occur exactly once unless replace_all is true. `workdir` may only select a directory inside the checkout. Returns a unified diff."
     )]
     async fn str_replace(
         &self,
@@ -167,6 +171,7 @@ async fn async_main(_cmd: String) -> Result<(), Box<dyn std::error::Error>> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let cwd = std::env::current_dir()?;
+    let protected_paths = paths::ProtectedPathPolicy::take_from_environment()?;
     // A standalone/generic MCP never captures signing material. Typed Buzz
     // publishing is hosted in-process by buzz-acp on a loopback-only server.
     trusted::scrub_harness_environment();
@@ -178,7 +183,11 @@ async fn async_main(_cmd: String) -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let shim = shim::Shim::install()?;
-    let state = Arc::new(shell::SharedState::new(cwd, shim)?);
+    let state = Arc::new(shell::SharedState::new_with_protected_paths(
+        cwd,
+        shim,
+        protected_paths,
+    )?);
 
     let service = DevMcp::new(state).serve(stdio()).await?;
     service.waiting().await?;
@@ -240,6 +249,9 @@ mod tool_inventory_tests {
                     "buzz_a2a_handoff",
                     "buzz_chat_send",
                     "buzz_private_media_get",
+                    "buzz_project_git_commit",
+                    "buzz_project_git_fetch",
+                    "buzz_project_git_push",
                 ]
                 .map(str::to_owned)
             )

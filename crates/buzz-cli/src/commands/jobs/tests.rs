@@ -1,8 +1,8 @@
 use buzz_core::job::{
     build_job_tags, semantic_request_digest, JobAccepted, JobClaim, JobClaimStatus, JobCommon,
-    JobControl, JobControlAction, JobEvent, JobFollowup, JobProgress, JobProgressStatus,
-    JobProject, JobRepository, JobRequest, JobResult, JobSponsor, JobSuccessOutcome,
-    JOB_SCHEMA_VERSION,
+    JobControl, JobControlAction, JobError, JobErrorOutcome, JobEvent, JobFollowup, JobProgress,
+    JobProgressStatus, JobProject, JobRepository, JobRequest, JobResult, JobSponsor,
+    JobSuccessOutcome, JOB_SCHEMA_VERSION,
 };
 use clap::CommandFactory;
 use nostr::{Event, EventBuilder, Keys, Kind, Timestamp};
@@ -298,6 +298,160 @@ fn root_and_claimed_cancel_states_are_distinct() {
     .expect("job");
     assert_eq!(done.lifecycle.state, "cancelled");
     assert!(done.lifecycle.terminal.is_some());
+}
+
+#[test]
+fn cancel_requested_accepts_only_non_retryable_indeterminate_worker_error() {
+    let base = chain();
+    let request = &base[0];
+    let requester = Keys::parse("0000000000000000000000000000000000000000000000000000000000000011")
+        .expect("requester");
+    let worker = Keys::parse("0000000000000000000000000000000000000000000000000000000000000012")
+        .expect("worker");
+    let root_job = JobEvent::parse(request).expect("request");
+    let cancel_job = JobEvent::Control(JobControl {
+        followup: JobFollowup {
+            common: root_job.common().clone(),
+            request_event_id: request.id.to_hex(),
+            prior_event_id: Some(base[2].id.to_hex()),
+        },
+        action: JobControlAction::Cancel,
+        reason: "stop".into(),
+        handoff_to: None,
+    });
+    let cancel = sign(&cancel_job, &requester);
+    let error_job = JobEvent::Error(JobError {
+        followup: JobFollowup {
+            common: response_common(root_job.common(), &worker, &requester),
+            request_event_id: request.id.to_hex(),
+            prior_event_id: Some(cancel.id.to_hex()),
+        },
+        outcome: JobErrorOutcome::Indeterminate,
+        code: "cancel_after_applied_git_operation".into(),
+        message: "repository state requires reconciliation".into(),
+        retryable: false,
+    });
+    let error = sign(&error_job, &worker);
+    let projection = project(vec![
+        base[0].clone(),
+        base[1].clone(),
+        base[2].clone(),
+        cancel,
+        error,
+    ])
+    .expect("cancel indeterminate projection")
+    .pop()
+    .expect("job");
+    assert_eq!(projection.lifecycle.state, "indeterminate");
+    assert!(!projection.lifecycle.conflict);
+    assert_eq!(
+        projection.lifecycle.terminal.as_ref().unwrap().event_id,
+        projection.event_ids[4]
+    );
+}
+
+#[test]
+fn cancel_requested_rejects_failed_worker_error() {
+    let base = chain();
+    let request = &base[0];
+    let requester = Keys::parse("0000000000000000000000000000000000000000000000000000000000000011")
+        .expect("requester");
+    let worker = Keys::parse("0000000000000000000000000000000000000000000000000000000000000012")
+        .expect("worker");
+    let root_job = JobEvent::parse(request).expect("request");
+    let cancel = sign(
+        &JobEvent::Control(JobControl {
+            followup: JobFollowup {
+                common: root_job.common().clone(),
+                request_event_id: request.id.to_hex(),
+                prior_event_id: Some(base[2].id.to_hex()),
+            },
+            action: JobControlAction::Cancel,
+            reason: "stop".into(),
+            handoff_to: None,
+        }),
+        &requester,
+    );
+    let error = sign(
+        &JobEvent::Error(JobError {
+            followup: JobFollowup {
+                common: response_common(root_job.common(), &worker, &requester),
+                request_event_id: request.id.to_hex(),
+                prior_event_id: Some(cancel.id.to_hex()),
+            },
+            outcome: JobErrorOutcome::Failed,
+            code: "cancelled_failure".into(),
+            message: "known failure".into(),
+            retryable: false,
+        }),
+        &worker,
+    );
+    let projection = project(vec![
+        base[0].clone(),
+        base[1].clone(),
+        base[2].clone(),
+        cancel,
+        error,
+    ])
+    .expect("projection")
+    .pop()
+    .expect("job");
+    assert_eq!(projection.lifecycle.state, "conflict");
+    assert!(projection.lifecycle.conflict);
+    assert!(projection
+        .lifecycle
+        .conflicts
+        .iter()
+        .any(|conflict| conflict.starts_with("invalid_transition:")));
+}
+
+#[test]
+fn cancel_requested_rejects_retryable_indeterminate_worker_error() {
+    let base = chain();
+    let request = &base[0];
+    let requester = Keys::parse("0000000000000000000000000000000000000000000000000000000000000011")
+        .expect("requester");
+    let worker = Keys::parse("0000000000000000000000000000000000000000000000000000000000000012")
+        .expect("worker");
+    let root_job = JobEvent::parse(request).expect("request");
+    let cancel = sign(
+        &JobEvent::Control(JobControl {
+            followup: JobFollowup {
+                common: root_job.common().clone(),
+                request_event_id: request.id.to_hex(),
+                prior_event_id: Some(base[2].id.to_hex()),
+            },
+            action: JobControlAction::Cancel,
+            reason: "stop".into(),
+            handoff_to: None,
+        }),
+        &requester,
+    );
+    let error = sign(
+        &JobEvent::Error(JobError {
+            followup: JobFollowup {
+                common: response_common(root_job.common(), &worker, &requester),
+                request_event_id: request.id.to_hex(),
+                prior_event_id: Some(cancel.id.to_hex()),
+            },
+            outcome: JobErrorOutcome::Indeterminate,
+            code: "retryable_unknown".into(),
+            message: "retry would be unsafe".into(),
+            retryable: true,
+        }),
+        &worker,
+    );
+    let error = project(vec![
+        base[0].clone(),
+        base[1].clone(),
+        base[2].clone(),
+        cancel,
+        error,
+    ])
+    .expect_err("retryable indeterminate error must be rejected by the job schema");
+    assert!(error
+        .to_string()
+        .contains("indeterminate errors require retryable=false"));
 }
 
 #[test]

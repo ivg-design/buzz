@@ -294,7 +294,7 @@ pub fn select_untracked_bundle_harnesses(
 ///
 /// Returns `None` if the buffer is unreadable or malformed.
 #[cfg(target_os = "macos")]
-fn proc_exe_path_from_procargs2(pid: u32) -> Option<PathBuf> {
+pub(super) fn proc_exe_path_from_procargs2(pid: u32) -> Option<PathBuf> {
     let buf = procargs2_buffer(pid)?;
     if buf.len() < std::mem::size_of::<libc::c_int>() {
         return None;

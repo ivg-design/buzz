@@ -1452,7 +1452,10 @@ async fn create_session_and_apply_model_at(
         agent.acp.http_mcp_supported(),
     ) {
         (Some(factory), Some(scope), true) => {
-            let session = factory.start(scope).await.map_err(AcpError::Protocol)?;
+            let session = factory
+                .start(scope, std::path::Path::new(working_directory))
+                .await
+                .map_err(AcpError::Protocol)?;
             mcp_servers.push(session.mcp_server());
             Some((scope.clone(), session))
         }
@@ -11174,7 +11177,16 @@ not acceptance. Never put credentials or host-local paths in a prompt."#;
                 operation_id: Uuid::new_v4().to_string(),
                 request_event_id: format!("{index:064x}"),
             };
-            let session = factory.start(&scope).await.expect("trusted session");
+            // This test exercises scope-keyed cleanup, not job authority. Use
+            // an ordinary session capability and store it under the synthetic
+            // job key; production job sessions must have a registered gate.
+            let session_scope = SessionScope::Conversation {
+                channel_id: scope.channel_id(),
+            };
+            let session = factory
+                .start(&session_scope, std::path::Path::new("."))
+                .await
+                .expect("trusted session");
             urls.push(session.url());
             agent
                 .state

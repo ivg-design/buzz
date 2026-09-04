@@ -5,7 +5,10 @@ use zeroize::Zeroize;
 
 #[cfg(test)]
 use super::HARNESS_ONLY_ENV;
-use super::{is_harness_only_env, GrantSet};
+use super::{
+    git::{capture_operator_github_credentials, GitHubCredentialStore},
+    is_harness_only_env, GrantSet,
+};
 
 /// Validated configuration retained only by typed in-process tools.
 ///
@@ -22,6 +25,8 @@ pub struct TrustedConfig {
     pub(super) session_thread_root_id: Option<String>,
     pub(super) job_operation_id: Option<String>,
     pub(super) job_request_event_id: Option<String>,
+    pub(super) session_working_directory: Option<PathBuf>,
+    pub(super) github_credentials: GitHubCredentialStore,
     pub(super) allow_insecure_loopback: bool,
 }
 
@@ -40,6 +45,7 @@ pub struct HarnessTrustedIdentity {
     owner_pubkey: String,
     owner_github_login: Option<String>,
     grants: GrantSet,
+    github_credentials: GitHubCredentialStore,
     allow_insecure_loopback: bool,
 }
 
@@ -50,6 +56,9 @@ pub struct TrustedSessionScope {
     pub thread_root_id: Option<String>,
     pub job_operation_id: Option<String>,
     pub job_request_event_id: Option<String>,
+    /// Exact working directory passed to ACP `session/new` by the harness.
+    /// This is trusted orchestration state, never a model tool argument.
+    pub working_directory: Option<PathBuf>,
 }
 
 impl HarnessTrustedIdentity {
@@ -90,8 +99,44 @@ impl HarnessTrustedIdentity {
             owner_pubkey,
             owner_github_login,
             grants: GrantSet::load(cwd, grants_json, grants_file)?,
+            // Synchronous construction is used by tests and deliberately has
+            // no access to the operator's HOME or credential helpers. Any
+            // network grant therefore fails closed unless production startup
+            // explicitly uses `new_with_operator_git_credentials`.
+            github_credentials: GitHubCredentialStore::default(),
             allow_insecure_loopback,
         })
+    }
+
+    /// Build the production harness identity and resolve each explicitly
+    /// network-enabled GitHub grant before any model process is started.
+    ///
+    /// Credential helpers run only during this bounded trusted capture. Their
+    /// configuration is never retained or replayed into later Git children.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new_with_operator_git_credentials(
+        cwd: &Path,
+        relay_url: String,
+        keys: Keys,
+        auth_tag: Option<nostr::Tag>,
+        owner_github_login: Option<String>,
+        grants_json: Option<String>,
+        grants_file: Option<PathBuf>,
+        allow_insecure_loopback: bool,
+    ) -> Result<Self, String> {
+        let mut identity = Self::new(
+            cwd,
+            relay_url,
+            keys,
+            auth_tag,
+            owner_github_login,
+            grants_json,
+            grants_file,
+            allow_insecure_loopback,
+        )?;
+        let repositories = identity.grants.credential_repositories();
+        identity.github_credentials = capture_operator_github_credentials(&repositories).await?;
+        Ok(identity)
     }
 
     /// Create a validated relay client whose publish authority is fixed to one
@@ -109,14 +154,17 @@ impl HarnessTrustedIdentity {
             session_thread_root_id: scope.thread_root_id,
             job_operation_id: scope.job_operation_id,
             job_request_event_id: scope.job_request_event_id,
+            session_working_directory: scope.working_directory,
+            github_credentials: self.github_credentials.clone(),
             allow_insecure_loopback: self.allow_insecure_loopback,
         })
     }
 }
 
 impl TrustedConfig {
-    /// Capture credentials exactly once and scrub all harness-only inputs before
-    /// tracing, shim creation, or any child process can observe them.
+    /// Capture harness identity inputs and scrub their environment variables
+    /// before tracing, shim creation, or any generic child can observe them.
+    /// This legacy synchronous path deliberately does not resolve Git secrets.
     pub fn capture(cwd: &Path) -> Result<Option<Self>, String> {
         let relay_url = std::env::var("BUZZ_RELAY_URL").ok();
         let mut private_key = std::env::var("BUZZ_PRIVATE_KEY").ok();
@@ -185,6 +233,10 @@ impl TrustedConfig {
             session_thread_root_id,
             job_operation_id,
             job_request_event_id,
+            session_working_directory: Some(cwd.to_path_buf()),
+            // This legacy synchronous path is intentionally credential-empty.
+            // Production harness startup uses the async identity constructor.
+            github_credentials: GitHubCredentialStore::default(),
             allow_insecure_loopback,
         }))
     }
@@ -233,6 +285,23 @@ mod tests {
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn synchronous_identity_constructor_is_credential_empty() {
+        let cwd = tempfile::tempdir().expect("cwd");
+        let identity = HarnessTrustedIdentity::new(
+            cwd.path(),
+            "wss://relay.example.test".to_owned(),
+            Keys::generate(),
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .expect("identity");
+        assert!(identity.github_credentials.is_empty());
+    }
 
     #[test]
     fn capture_without_key_still_scrubs_every_harness_variable() {

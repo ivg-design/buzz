@@ -139,13 +139,21 @@ pub(super) fn project(request: &JobRequest) -> PromptProjectInfo {
 }
 
 pub(super) fn grants(request: &JobRequest) -> GrantSet {
+    grants_with_git_operations(request, &[])
+}
+
+pub(super) fn grants_with_git_operations(
+    request: &JobRequest,
+    git_operations: &[&str],
+) -> GrantSet {
     let checkout = test_checkout();
     GrantSet::from_json(&format!(
-            r#"{{"version":1,"grants":[{{"project_address":"{}","home_channel":"{}","repository":"{}","requester_pubkeys":["{}"],"capabilities":["rust"],"path_prefixes":["src"],"base_sha":"{}","branch":"{}","worktree_id":"{}","checkout_root":{}}}]}}"#,
+            r#"{{"version":1,"grants":[{{"project_address":"{}","home_channel":"{}","repository":"{}","requester_pubkeys":["{}"],"capabilities":["rust"],"git_operations":{},"path_prefixes":["src"],"base_sha":"{}","branch":"{}","worktree_id":"{}","checkout_root":{}}}]}}"#,
             request.common.project.address,
             request.common.project.home_channel,
             request.common.repository.canonical,
             request.common.sender_pubkey,
+            serde_json::to_string(git_operations).expect("git operations json"),
             request.common.repository.base_sha,
             request.common.repository.branch,
             request.common.repository.worktree_id,
@@ -356,7 +364,11 @@ async fn requester_cancel_fences_claim_and_worker_acknowledges_once() {
     .sign_with_keys(&sender)
     .expect("sign cancel");
     let CancelOutcome::Cancel(cancel) = receiver
-        .handle_cancel(channel, cancel_event.clone())
+        .handle_cancel(
+            &JobPrivilegeRegistry::default(),
+            channel,
+            cancel_event.clone(),
+        )
         .await
         .expect("observe cancel")
     else {
@@ -364,12 +376,8 @@ async fn requester_cancel_fences_claim_and_worker_acknowledges_once() {
     };
     assert_eq!(cancel.scope, dispatch.scope);
     cancel
-        .emitter
-        .control(
-            JobControlAction::Cancelled,
-            "requester_cancelled".into(),
-            None,
-        )
+        .terminal
+        .publish(&cancel.emitter)
         .await
         .expect("acknowledge cancel");
     let cancelled = published.recv().await.expect("cancelled event");
@@ -379,7 +387,7 @@ async fn requester_cancel_fences_claim_and_worker_acknowledges_once() {
     ));
     assert!(matches!(
         receiver
-            .handle_cancel(channel, cancel_event)
+            .handle_cancel(&JobPrivilegeRegistry::default(), channel, cancel_event)
             .await
             .expect("terminal replay"),
         CancelOutcome::Consumed
@@ -443,7 +451,7 @@ async fn restart_after_cancel_fence_emits_cancelled_instead_of_indeterminate() {
     .sign_with_keys(&sender)
     .expect("sign cancel");
     let CancelOutcome::Cancel(cancel) = receiver
-        .handle_cancel(channel, cancel_event)
+        .handle_cancel(&JobPrivilegeRegistry::default(), channel, cancel_event)
         .await
         .expect("fence cancel")
     else {

@@ -1,12 +1,14 @@
 mod authority;
 mod cancel;
 mod emitter;
+mod git_receipt_journal;
 mod grants;
 mod lease;
 mod ledger;
 mod lifecycle;
 mod outcome;
 mod paths;
+mod privilege;
 mod prompt;
 mod receipts;
 mod revocation;
@@ -14,7 +16,8 @@ mod revocation;
 use std::path::{Path, PathBuf};
 
 use buzz_core::job::{
-    semantic_request_digest, JobEvent, JobRequest, JobSponsor, MAX_JOB_TTL_SECONDS,
+    semantic_request_digest, JobClaimStatus, JobCommon, JobEvent, JobRequest, JobSponsor,
+    MAX_JOB_TTL_SECONDS,
 };
 use chrono::{DateTime, Utc};
 use nostr::{Event, Keys};
@@ -23,12 +26,221 @@ use uuid::Uuid;
 
 use emitter::build_claim_receipts;
 pub use emitter::JobEmitter;
+use git_receipt_journal::GitEffect;
+pub(crate) use grants::prepare_job_sources;
 use grants::{GrantError, GrantSet};
 use lease::ReceiverLease;
 use ledger::{ClaimDecision, JobLedger, LedgerError, StoredClaim};
 use lifecycle::LifecycleError;
 pub use outcome::{parse_terminal_outcome, TerminalDisposition};
+pub(crate) use privilege::{JobPrivilege, JobPrivilegeRegistry};
 pub use prompt::format_job_prompt;
+
+pub(crate) fn guard_terminal_with_git_effect(
+    disposition: TerminalDisposition,
+    summary: Result<git_receipt_journal::GitEffectSummary, String>,
+) -> TerminalDisposition {
+    match summary {
+        Ok(summary)
+            if summary.effect == GitEffect::Applied
+                && matches!(
+                    disposition,
+                    TerminalDisposition::Failed {
+                        retryable: true,
+                        ..
+                    }
+                ) =>
+        {
+            TerminalDisposition::Indeterminate {
+                code: "applied_git_operation".into(),
+                message: format!(
+                    "{} of {} privileged Git operations have a durable applied effect; automatic retry is unsafe and repository state requires reconciliation",
+                    summary.applied_count, summary.operation_count
+                ),
+            }
+        }
+        Ok(summary) if summary.effect != GitEffect::Ambiguous => disposition,
+        Ok(summary) => TerminalDisposition::Indeterminate {
+            code: "ambiguous_git_operation".into(),
+            message: format!(
+                "{} of {} privileged Git operations have an ambiguous durable effect; repository state requires reconciliation",
+                summary.ambiguous_count, summary.operation_count
+            ),
+        },
+        Err(_) => TerminalDisposition::Indeterminate {
+            code: "git_receipt_journal_unavailable".into(),
+            message: "The durable Git receipt journal is missing or invalid; repository state requires reconciliation".into(),
+        },
+    }
+}
+
+/// Verify the immutable request and Processed -> Accepted chain, then return
+/// the exact worker-authored common coordinates frozen in those receipts.
+/// Sponsor login is audit metadata and may legitimately change across a
+/// restart; worker and owner public-key bindings remain authoritative.
+fn verified_durable_response_common(
+    claim: &StoredClaim,
+    agent_pubkey: &str,
+    current_sponsor_pubkey: &str,
+) -> Result<JobCommon, ReceiverError> {
+    claim
+        .request_event
+        .verify()
+        .map_err(|error| ReceiverError::Receipt(format!("stored request signature: {error}")))?;
+    claim
+        .processed
+        .verify()
+        .map_err(|error| ReceiverError::Receipt(format!("stored Processed signature: {error}")))?;
+    claim
+        .accepted
+        .verify()
+        .map_err(|error| ReceiverError::Receipt(format!("stored Accepted signature: {error}")))?;
+
+    let JobEvent::Request(request) = JobEvent::parse(&claim.request_event)
+        .map_err(|error| ReceiverError::Receipt(format!("stored request event: {error}")))?
+    else {
+        return Err(ReceiverError::Receipt(
+            "stored lifecycle root is not a job request".into(),
+        ));
+    };
+    let JobEvent::Accepted(processed) = JobEvent::parse(&claim.processed)
+        .map_err(|error| ReceiverError::Receipt(format!("stored Processed event: {error}")))?
+    else {
+        return Err(ReceiverError::Receipt(
+            "stored Processed receipt is not kind 43002".into(),
+        ));
+    };
+    let JobEvent::Accepted(accepted) = JobEvent::parse(&claim.accepted)
+        .map_err(|error| ReceiverError::Receipt(format!("stored Accepted event: {error}")))?
+    else {
+        return Err(ReceiverError::Receipt(
+            "stored Accepted receipt is not kind 43002".into(),
+        ));
+    };
+
+    let request_id = claim.request_event.id.to_hex();
+    let digest = semantic_request_digest(&request)
+        .map_err(|error| ReceiverError::Receipt(error.to_string()))?;
+    let response_common = processed.followup.common.clone();
+    let mut expected_common = request.common.clone();
+    expected_common.sender_pubkey = agent_pubkey.to_owned();
+    expected_common.recipient_pubkey = request.common.sender_pubkey.clone();
+    expected_common.sponsor = response_common.sponsor.clone();
+    if claim.request_event_id != request_id
+        || claim.requester != request.common.sender_pubkey
+        || claim.idempotency_key != request.common.idempotency_key
+        || claim.digest != digest
+        || claim.processed.pubkey.to_hex() != agent_pubkey
+        || claim.accepted.pubkey.to_hex() != agent_pubkey
+        || response_common != expected_common
+        || response_common.sponsor.pubkey != current_sponsor_pubkey
+        || processed.claim.status != JobClaimStatus::Processed
+        || processed.claim.scope_digest != digest
+        || processed.followup.request_event_id != request_id
+        || processed.followup.prior_event_id.is_some()
+        || accepted.claim.status != JobClaimStatus::Accepted
+        || accepted.claim.scope_digest != digest
+        || accepted.followup.common != response_common
+        || accepted.followup.request_event_id != request_id
+        || accepted.followup.prior_event_id.as_deref() != Some(claim.processed.id.to_hex().as_str())
+    {
+        return Err(ReceiverError::Receipt(
+            "stored claim receipts do not match the exact accepted chain or current key bindings"
+                .into(),
+        ));
+    }
+    Ok(response_common)
+}
+
+/// A terminal already frozen in the lifecycle outbox predates the current
+/// process, so replay it only when the durable Git journal proves that its
+/// semantics are still possible. In particular, an old Cancelled event cannot
+/// hide an earlier applied Git operation, and no terminal may cross an
+/// unresolved or unavailable journal.
+fn validate_pending_terminal_git_effect(
+    lifecycle: &lifecycle::LifecycleStore,
+    event: &Event,
+    expected_head: &str,
+    claim: &StoredClaim,
+    agent_pubkey: &str,
+    current_sponsor: &JobSponsor,
+) -> Result<(), ReceiverError> {
+    event.verify().map_err(|error| {
+        ReceiverError::Receipt(format!("stored lifecycle event signature: {error}"))
+    })?;
+    let expected_common =
+        verified_durable_response_common(claim, agent_pubkey, &current_sponsor.pubkey)?;
+
+    let parsed = JobEvent::parse(event)
+        .map_err(|error| ReceiverError::Receipt(format!("stored lifecycle event: {error}")))?;
+    let (followup, cancelled, safe_without_journal, retryable_failure) = match &parsed {
+        JobEvent::Progress(progress) => (&progress.followup, false, true, false),
+        JobEvent::Result(result) => (&result.followup, false, false, false),
+        JobEvent::Error(error) => (
+            &error.followup,
+            false,
+            error.outcome == buzz_core::job::JobErrorOutcome::Indeterminate && !error.retryable,
+            error.outcome == buzz_core::job::JobErrorOutcome::Failed && error.retryable,
+        ),
+        JobEvent::Control(control)
+            if matches!(
+                control.action,
+                buzz_core::job::JobControlAction::Cancelled
+                    | buzz_core::job::JobControlAction::Release
+                    | buzz_core::job::JobControlAction::Handoff
+            ) =>
+        {
+            (
+                &control.followup,
+                control.action == buzz_core::job::JobControlAction::Cancelled,
+                false,
+                false,
+            )
+        }
+        _ => {
+            return Err(ReceiverError::Receipt(
+                "stored lifecycle outbox contains an invalid transition kind".into(),
+            ));
+        }
+    };
+    if followup.common != expected_common
+        || followup.request_event_id != claim.request_event_id
+        || followup.prior_event_id.as_deref() != Some(expected_head)
+    {
+        return Err(ReceiverError::Receipt(
+            "stored lifecycle event does not match its exact request chain".into(),
+        ));
+    }
+    if safe_without_journal {
+        return Ok(());
+    }
+    let summary = git_receipt_journal::summary_for_lifecycle(
+        lifecycle,
+        &claim.community,
+        agent_pubkey,
+        claim,
+    )
+    .map_err(|error| ReceiverError::Privilege(error.to_string()))?;
+    if summary.effect == GitEffect::Ambiguous {
+        return Err(ReceiverError::Privilege(format!(
+            "refusing to replay a frozen terminal across {} ambiguous Git operation(s)",
+            summary.ambiguous_count
+        )));
+    }
+    if cancelled && summary.effect == GitEffect::Applied {
+        return Err(ReceiverError::Privilege(format!(
+            "refusing to replay Cancelled after {} applied Git operation(s)",
+            summary.applied_count
+        )));
+    }
+    if retryable_failure && summary.effect == GitEffect::Applied {
+        return Err(ReceiverError::Privilege(format!(
+            "refusing to replay retryable Failed after {} applied Git operation(s)",
+            summary.applied_count
+        )));
+    }
+    Ok(())
+}
 
 use crate::prompt_project::PromptProjectInfo;
 use crate::relay::{AuthenticatedContext, RelayError, RestClient};
@@ -48,6 +260,8 @@ pub enum ReceiverError {
     Tenant(String),
     #[error(transparent)]
     Lifecycle(#[from] LifecycleError),
+    #[error("job privilege registry failed: {0}")]
+    Privilege(String),
 }
 
 pub struct JobDispatch {
@@ -56,6 +270,7 @@ pub struct JobDispatch {
     pub emitter: JobEmitter,
     pub claim: StoredClaim,
     pub checkout_root: PathBuf,
+    pub(crate) privilege: std::sync::Arc<JobPrivilege>,
 }
 
 pub enum HandleOutcome {
@@ -64,6 +279,7 @@ pub enum HandleOutcome {
 }
 
 pub use cancel::CancelOutcome;
+pub(crate) use cancel::{CancellationTerminal, JobCancel};
 
 #[derive(Clone, Default)]
 pub struct ReceiverSources {
@@ -122,9 +338,12 @@ impl JobReceiver {
             ));
         }
         let grants = GrantSet::load_from(cwd, sources.grants_json, sources.grants_file)?;
-        let ledger_root = sources
-            .ledger_root
-            .unwrap_or_else(|| default_ledger_root(cwd, &tenant.community_id, &agent_pubkey));
+        let ledger_candidate = match sources.ledger_root {
+            Some(root) => root,
+            None => default_ledger_root(&tenant.community_id, &agent_pubkey)?,
+        };
+        let ledger_root =
+            grants::prepare_private_ledger_root(cwd, &ledger_candidate, grants.checkout_roots())?;
         let lease = ReceiverLease::acquire(&ledger_root)?;
         Ok(Self {
             tenant,
@@ -197,11 +416,43 @@ impl JobReceiver {
                 continue;
             }
             let result = async {
-                receipts::publish(self, &claim, false).await?;
+                let processed_acked = self
+                    .ledger
+                    .receipt_acked(&claim, ledger::ReceiptKind::Processed)
+                    .await?;
+                let accepted_acked = self
+                    .ledger
+                    .receipt_acked(&claim, ledger::ReceiptKind::Accepted)
+                    .await?;
+                if !processed_acked || !accepted_acked {
+                    let _ = verified_durable_response_common(
+                        &claim,
+                        &self.agent_pubkey,
+                        &self.sponsor.pubkey,
+                    )?;
+                }
+                let _ = receipts::publish(self, &claim, false).await?;
                 let lifecycle = self.ledger.lifecycle_store(&claim);
                 if lifecycle.exists() {
-                    let (_, pending, _) = lifecycle.snapshot().await?;
+                    if !self.ledger.prompt_started(&claim).await? {
+                        git_receipt_journal::initialize_for_unstarted_lifecycle(
+                            &lifecycle,
+                            &self.tenant.community_id,
+                            &self.agent_pubkey,
+                            &claim,
+                        )
+                        .map_err(|error| ReceiverError::Privilege(error.to_string()))?;
+                    }
+                    let (head, pending, _) = lifecycle.snapshot().await?;
                     if let Some(event) = pending {
+                        validate_pending_terminal_git_effect(
+                            &lifecycle,
+                            &event,
+                            &head,
+                            &claim,
+                            &self.agent_pubkey,
+                            &self.sponsor,
+                        )?;
                         self.rest.submit_event_confirmed(&event).await?;
                         lifecycle.confirm(event.id.to_hex()).await?;
                     }
@@ -229,14 +480,50 @@ impl JobReceiver {
                 continue;
             }
             let lifecycle = self.ledger.lifecycle_store(&claim);
-            lifecycle.initialize(claim.accepted.id.to_hex()).await?;
-            let (_, pending, _) = lifecycle.snapshot().await?;
+            if !lifecycle.exists() {
+                if !self
+                    .ledger
+                    .receipt_acked(&claim, ledger::ReceiptKind::Accepted)
+                    .await?
+                {
+                    // Processed may already have a relay-stored Cancel child.
+                    // Do not invent an Accepted lifecycle anchor before that
+                    // inbound control event is replayed from the relay.
+                    continue;
+                }
+                lifecycle.initialize(claim.accepted.id.to_hex()).await?;
+            }
+            let prompt_started = self.ledger.prompt_started(&claim).await?;
+            if !prompt_started {
+                git_receipt_journal::initialize_for_unstarted_lifecycle(
+                    &lifecycle,
+                    &self.tenant.community_id,
+                    &self.agent_pubkey,
+                    &claim,
+                )
+                .map_err(|error| ReceiverError::Privilege(error.to_string()))?;
+            }
+            let (head, pending, _) = lifecycle.snapshot().await?;
             if let Some(event) = pending {
+                validate_pending_terminal_git_effect(
+                    &lifecycle,
+                    &event,
+                    &head,
+                    &claim,
+                    &self.agent_pubkey,
+                    &self.sponsor,
+                )?;
                 self.rest.submit_event_confirmed(&event).await?;
                 lifecycle.confirm(event.id.to_hex()).await?;
             }
             let (_, _, terminal) = lifecycle.snapshot().await?;
-            if !terminal && self.ledger.prompt_started(&claim).await? {
+            let pending_cancel = lifecycle.pending_cancel().await?.is_some();
+            if !terminal && (pending_cancel || prompt_started) {
+                let durable_common = verified_durable_response_common(
+                    &claim,
+                    &self.agent_pubkey,
+                    &self.sponsor.pubkey,
+                )?;
                 claim.request_event.verify().map_err(|error| {
                     ReceiverError::Receipt(format!("stored request signature: {error}"))
                 })?;
@@ -247,26 +534,26 @@ impl JobReceiver {
                         "stored claim is not a job request".into(),
                     ));
                 };
-                let pending_cancel = lifecycle.pending_cancel().await?.is_some();
                 let emitter = JobEmitter::new(
                     &request,
                     claim.request_event_id.clone(),
                     self.keys.clone(),
                     self.rest.clone(),
-                    lifecycle,
+                    lifecycle.clone(),
                     self.grants.capabilities_for(&request).unwrap_or_default(),
                     claim.digest.clone(),
-                    self.sponsor.clone(),
+                    durable_common.sponsor.clone(),
                 );
                 if pending_cancel {
-                    emitter
-                        .control(
-                            buzz_core::job::JobControlAction::Cancelled,
-                            "requester_cancelled".into(),
-                            None,
-                        )
-                        .await
-                        .map_err(|error| ReceiverError::Receipt(error.to_string()))?;
+                    cancel::terminal_for_lifecycle(
+                        &lifecycle,
+                        &self.tenant.community_id,
+                        &self.agent_pubkey,
+                        &claim,
+                    )
+                    .publish(&emitter)
+                    .await
+                    .map_err(|error| ReceiverError::Receipt(error.to_string()))?;
                 } else {
                     emitter
                         .indeterminate(
@@ -367,7 +654,7 @@ impl JobReceiver {
             receipts.processed,
             receipts.accepted,
         );
-        authority::authorize(
+        let _authorization_expires_at = authority::authorize(
             &self.rest,
             &self.tenant,
             &request,
@@ -389,8 +676,14 @@ impl JobReceiver {
                 return Ok(HandleOutcome::Consumed);
             }
         };
+        let durable_common =
+            verified_durable_response_common(&stored, &self.agent_pubkey, &self.sponsor.pubkey)?;
 
-        receipts::publish(self, &stored, force_receipt_replay).await?;
+        if receipts::publish(self, &stored, force_receipt_replay).await?
+            == receipts::PublishOutcome::CancelledBeforeAccept
+        {
+            return Ok(HandleOutcome::Consumed);
+        }
         if self.ledger.prompt_started(&stored).await? {
             return Ok(HandleOutcome::Consumed);
         }
@@ -417,25 +710,43 @@ impl JobReceiver {
             lifecycle,
             grant_match.capabilities,
             stored.digest.clone(),
-            self.sponsor.clone(),
+            durable_common.sponsor.clone(),
         );
+        let privilege = JobPrivilege::new(
+            scope.clone(),
+            self.tenant.clone(),
+            self.agent_pubkey.clone(),
+            self.rest.clone(),
+            durable_common.sponsor,
+            self.grants.clone(),
+            self.ledger.clone(),
+            stored.clone(),
+            request.clone(),
+            emitter.clone(),
+            self.ledger.lifecycle_store(&stored),
+            grant_match.checkout_root.clone(),
+            self.allow_insecure_loopback,
+        )
+        .map_err(ReceiverError::Privilege)?;
         Ok(HandleOutcome::Dispatch(Box::new(JobDispatch {
             scope,
             event,
             emitter,
             claim: stored,
             checkout_root: grant_match.checkout_root,
+            privilege,
         })))
     }
 
     /// Observe an addressed requester cancellation and durably fence the
     /// worker lifecycle before the caller signals or removes any prompt.
-    pub async fn handle_cancel(
+    pub(crate) async fn handle_cancel(
         &self,
+        privileges: &JobPrivilegeRegistry,
         channel_id: Uuid,
         event: Event,
     ) -> Result<CancelOutcome, ReceiverError> {
-        cancel::handle(self, channel_id, event).await
+        cancel::handle(self, privileges, channel_id, event).await
     }
 
     pub async fn terminate_channel(&self, channel_id: Uuid) -> Result<usize, ReceiverError> {
@@ -497,30 +808,42 @@ fn validate_tenant_identity(
     Ok(())
 }
 
-fn default_ledger_root(cwd: &Path, community_id: &str, agent_pubkey: &str) -> PathBuf {
+fn default_ledger_root(community_id: &str, agent_pubkey: &str) -> Result<PathBuf, ReceiverError> {
+    Ok(default_ledger_base()?.join(community_id).join(agent_pubkey))
+}
+
+fn default_ledger_base() -> Result<PathBuf, GrantError> {
     #[cfg(target_os = "macos")]
     if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home)
-            .join("Library/Application Support/Buzz/agent-jobs")
-            .join(community_id)
-            .join(agent_pubkey);
+        let home = PathBuf::from(home);
+        if home.is_absolute() {
+            return Ok(home.join("Library/Application Support/Buzz/agent-jobs"));
+        }
     }
     #[cfg(target_os = "windows")]
     if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-        return PathBuf::from(local)
-            .join("Buzz/agent-jobs")
-            .join(community_id)
-            .join(agent_pubkey);
+        let local = PathBuf::from(local);
+        if local.is_absolute() {
+            return Ok(local.join("Buzz/agent-jobs"));
+        }
     }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     if let Some(state) = std::env::var_os("XDG_STATE_HOME") {
-        return PathBuf::from(state)
-            .join("buzz/agent-jobs")
-            .join(community_id)
-            .join(agent_pubkey);
+        let state = PathBuf::from(state);
+        if state.is_absolute() {
+            return Ok(state.join("buzz/agent-jobs"));
+        }
     }
-    cwd.join(".buzz/agent-jobs")
-        .join(community_id)
-        .join(agent_pubkey)
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        if home.is_absolute() {
+            return Ok(home.join(".local/state/buzz/agent-jobs"));
+        }
+    }
+    Err(GrantError::Invalid(
+        "no absolute operator state directory is available for the job ledger".into(),
+    ))
 }
 
 #[cfg(test)]

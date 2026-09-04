@@ -3,7 +3,6 @@ use rmcp::ErrorData;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use similar::{DiffTag, TextDiff};
-use std::io::Write;
 use std::path::Path;
 
 const MAX_INPUT_BYTES: usize = 1024 * 1024;
@@ -51,7 +50,7 @@ pub fn run(state: &SharedState, p: StrReplaceParams) -> Result<String, ErrorData
         return Err(ErrorData::invalid_params(
             format!(
                 "old_str not found in {}.\nold_str (truncated): {:?}{hint}",
-                target.display(),
+                target.display.display(),
                 truncate(&p.old_str, 80)
             ),
             None,
@@ -61,7 +60,7 @@ pub fn run(state: &SharedState, p: StrReplaceParams) -> Result<String, ErrorData
         return Err(ErrorData::invalid_params(
             format!(
                 "old_str matched multiple locations in {}; provide more surrounding context to make the match unique.",
-                target.display()
+                target.display.display()
             ),
             None,
         ));
@@ -87,13 +86,8 @@ pub fn run(state: &SharedState, p: StrReplaceParams) -> Result<String, ErrorData
         content.replacen(&p.old_str, &p.new_str, 1)
     };
 
-    if let Err(e) = atomic_write(&target, &new_content) {
-        return Err(ErrorData::internal_error(
-            format!("failed to write {}: {e}", target.display()),
-            None,
-        ));
-    }
-    let diff = unified_diff(&content, &new_content, &target);
+    crate::paths::atomic_replace(state, &target, new_content.as_bytes())?;
+    let diff = unified_diff(&content, &new_content, &target.display);
     let label = if count == 1 {
         "1 occurrence".to_string()
     } else {
@@ -101,7 +95,7 @@ pub fn run(state: &SharedState, p: StrReplaceParams) -> Result<String, ErrorData
     };
     Ok(format!(
         "Replaced {label} in {}.\n\n{diff}",
-        target.display()
+        target.display.display()
     ))
 }
 
@@ -119,22 +113,6 @@ pub(crate) fn count_occurrences_capped(text: &str, pattern: &str) -> usize {
         start += pos + pattern.len();
     }
     count
-}
-
-fn atomic_write(target: &Path, content: &str) -> std::io::Result<()> {
-    let parent = target.parent().unwrap_or_else(|| Path::new("."));
-    // Preserve original permissions so the atomic rename doesn't drop the file's mode.
-    let original_perms = std::fs::metadata(target).ok().map(|m| m.permissions());
-
-    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
-    tmp.write_all(content.as_bytes())?;
-    tmp.flush()?;
-    tmp.persist(target).map_err(|e| e.error)?;
-
-    if let Some(perms) = original_perms {
-        let _ = std::fs::set_permissions(target, perms);
-    }
-    Ok(())
 }
 
 const MAX_DIFF_BYTES: usize = 64 * 1024;
@@ -244,7 +222,7 @@ mod tests {
             old_str: "beta".into(),
             new_str: "BETA".into(),
             replace_all: false,
-            workdir: Some(dir.path().display().to_string()),
+            workdir: None,
         };
         let out = run(&state, p).expect("ok");
         assert!(out.contains("Replaced 1 occurrence"), "out: {out}");
@@ -255,7 +233,7 @@ mod tests {
     }
 
     #[test]
-    fn run_allows_path_outside_workspace() {
+    fn run_rejects_path_outside_workspace() {
         let dir = tempdir().expect("tempdir");
         // A real file in a SECOND tempdir, genuinely outside the workspace
         // root, that does NOT contain our old_str — we expect a "not found"
@@ -270,14 +248,49 @@ mod tests {
             old_str: "UNIQUE_STRING_NOT_IN_FILE_abc123".into(),
             new_str: "y".into(),
             replace_all: false,
-            workdir: Some(dir.path().display().to_string()),
+            workdir: None,
         };
         let err = run(&state, p).unwrap_err();
         let msg = format!("{err:?}");
-        assert!(
-            msg.contains("not found"),
-            "expected 'not found' error (proving path resolved), got: {msg}"
-        );
+        assert!(msg.contains("must be relative"), "got: {msg}");
+    }
+
+    #[test]
+    fn run_rejects_git_and_harness_protected_paths() {
+        let dir = tempdir().expect("tempdir");
+        let grant_dir = dir.path().join(".buzz");
+        fs::create_dir_all(dir.path().join(".GiT")).expect("git dir");
+        fs::create_dir_all(&grant_dir).expect("grant dir");
+        fs::write(dir.path().join(".GiT/config"), "old").expect("git config");
+        let grant = grant_dir.join("agent-job-grants.json");
+        fs::write(&grant, "old").expect("grant");
+        let shim = crate::shim::Shim::install().expect("shim");
+        let state = SharedState::new_for_test(
+            dir.path().to_path_buf(),
+            shim,
+            crate::paths::ProtectedPathPolicy::from_paths([grant.clone()]),
+        )
+        .expect("state");
+
+        for path in [".GiT/config", ".buzz/agent-job-grants.json"] {
+            let error = run(
+                &state,
+                StrReplaceParams {
+                    path: path.to_string(),
+                    old_str: "old".into(),
+                    new_str: "poison".into(),
+                    replace_all: false,
+                    workdir: None,
+                },
+            )
+            .expect_err("authority write must fail");
+            let message = format!("{error:?}");
+            assert!(
+                message.contains("authority") || message.contains("protected"),
+                "{message}"
+            );
+        }
+        assert_eq!(fs::read_to_string(&grant).expect("grant"), "old");
     }
 
     #[test]
@@ -292,7 +305,7 @@ mod tests {
             old_str: "a".into(),
             new_str: "b".into(),
             replace_all: false,
-            workdir: Some(dir.path().display().to_string()),
+            workdir: None,
         };
         let err = run(&state, p).unwrap_err();
         let msg = format!("{err:?}");
@@ -310,7 +323,7 @@ mod tests {
             old_str: "foo".into(),
             new_str: "qux".into(),
             replace_all: true,
-            workdir: Some(dir.path().display().to_string()),
+            workdir: None,
         };
         let out = run(&state, p).expect("ok");
         assert!(out.contains("Replaced 3 occurrence(s)"), "out: {out}");
@@ -329,7 +342,7 @@ mod tests {
             old_str: "xyz".into(),
             new_str: "abc".into(),
             replace_all: true,
-            workdir: Some(dir.path().display().to_string()),
+            workdir: None,
         };
         let err = run(&state, p).unwrap_err();
         let msg = format!("{err:?}");
@@ -347,7 +360,7 @@ mod tests {
             old_str: "foo".into(),
             new_str: "qux".into(),
             replace_all: false,
-            workdir: Some(dir.path().display().to_string()),
+            workdir: None,
         };
         let err = run(&state, p).unwrap_err();
         let msg = format!("{err:?}");

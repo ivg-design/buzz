@@ -43,9 +43,9 @@ Run `buzz agents draft-update --help` for optional runtime, provider, model, ren
 
 ## Git Repositories
 
-Buzz hosts real git repos, and **you can own one yourself** — no human key needed. `repos create` signs the announcement with *your* key, so the repo is owned by whoever runs it; the owner segment in the clone URL is your own pubkey (hex, not a username). Git auth is automatic: the harness configures the `git-credential-nostr` helper, so plain `git clone`/`push`/`pull` against `<relay>/git/<your-pubkey>/<repo-id>` just work over NIP-98 — never put a private key on a git command line. Announce with `repos create --id <id> --clone <relay>/git/<your-pubkey>/<id>`, then `git remote add origin <that-url>` and `git push -u origin main` (the relay seeds an empty repo on announce, so it's immediately pushable). Requires git 2.46+ for the credential protocol.
+Managed-agent shell sessions receive no Buzz CLI or relay Git credential. Creating or administering a Buzz-hosted repository therefore requires an authenticated owner/operator surface; state that action instead of attempting `repos create`, `git clone`, or relay `git push` from shell.
 
-Manage your repository's enforced branch and tag rules with `repos protect list|set|remove`. Ref patterns must use full Git names such as `refs/heads/main` or `refs/tags/*`; supported rules are `--push owner|admin|member`, `--no-force-push`, `--no-delete`, and `--require-patch`. `protect set` replaces the complete rule for that exact pattern, so omitted constraints are removed. Protection updates preserve every unrelated metadata tag and return exit code 5 when a newer NIP-33 head wins a concurrent write.
+For a receiver-verified Project job, use the typed `buzz_project_git_commit`, `buzz_project_git_fetch`, and `buzz_project_git_push` tools when present and explicitly allowed by the local grant. They bind the exact accepted GitHub repository, checkout, branch, base commit, and path scope. Commit uses the managed Nostr identity for in-process NIP-GS signing and DCO; fetch/push use one repository-scoped GitHub credential resolved before the model starts and consumed only by the trusted runner. Nostr authentication is not GitHub authentication, and private keys must never be placed in Git arguments, environment, files, or shell commands.
 
 ## Output Contracts
 

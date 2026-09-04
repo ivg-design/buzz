@@ -1,277 +1,383 @@
-//! Path resolution and file I/O shared across dev-mcp tools.
+//! Checkout-confined path resolution and descriptor-based file I/O.
 //!
-//! `resolve_path` resolves and canonicalizes a user-supplied path against a
-//! workspace root. A leading `~` expands to the user's home directory (bare
-//! `~` or `~/...`), matching the shell tool. No containment enforcement — the
-//! resolved path may land anywhere on the filesystem (consistent with the
-//! `shell` tool's posture).
-//!
-//! `read_text_file` builds on `resolve_path` to provide the full
-//! resolve → stat → size-check → read → UTF-8 decode pipeline shared by
-//! `read_file` and `str_replace`.
+//! Model-controlled paths are interpreted relative to the immutable checkout
+//! root. Absolute paths are accepted only inside that checkout, `~` and parent
+//! traversal are rejected, and Unix walks never follow symlinks.
 
 use crate::shell::SharedState;
 use rmcp::ErrorData;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 pub(crate) const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
+pub(crate) const PROTECTED_PATHS_ENV: &str = "BUZZ_MCP_PROTECTED_PATHS_JSON";
 
-/// Resolve `path` (absolute or relative) against `root` and canonicalize
-/// the result. Returns an error string suitable for `ErrorData::invalid_params`
-/// if the path cannot be resolved.
-pub(crate) fn resolve_path(root: &Path, path: &str) -> Result<PathBuf, String> {
-    // The agent runs inside MSYS bash and naturally hands us MSYS-form absolute
-    // paths (`/c/Users/...`). On Windows those are NOT `is_absolute()` (a leading
-    // `/` has no drive `Prefix`), so without translation they'd take the relative
-    // branch and `root.join` would double the drive (`C:/c/Users/...`) and fail.
-    // The `shell` tool avoids this because bash translates internally; the MCP
-    // file tools call `canonicalize` directly, so we mirror that translation here
-    // to keep the same posture. No-op on the already-resolved path on Unix.
-    #[cfg(windows)]
-    let path = &msys_to_windows(path);
-
-    // Expand a leading `~` (bare or `~/...`) to the user's home directory,
-    // matching the shell tool's tilde semantics. Without this, a user-named
-    // path like `~/.claude/skills/x` takes the relative branch and resolves
-    // under the workspace root (`<root>/~/.claude/...`), which never exists.
-    // We deliberately do NOT handle `~user` (another user's home): that needs
-    // a passwd lookup and is out of scope, mirroring the conservative posture
-    // for un-mappable MSYS forms above. `~user...` falls through untouched and
-    // fails with the clear `path not accessible` error rather than mis-mapping.
-    let expanded = expand_tilde(path, home_dir().as_deref());
-    let path: &str = expanded.as_deref().unwrap_or(path);
-
-    let raw = Path::new(path);
-    let candidate: PathBuf = if raw.is_absolute() {
-        raw.to_path_buf()
-    } else {
-        root.join(raw)
-    };
-
-    let resolved = std::fs::canonicalize(&candidate)
-        .map_err(|e| format!("path not accessible: {} ({e})", candidate.display()))?;
-
-    Ok(resolved)
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ProtectedPathPolicy {
+    paths: Vec<PathBuf>,
 }
 
-/// Expand a leading `~` to the user's home directory, returning `Some(expanded)`
-/// when a rewrite happened and `None` when the input should be used unchanged.
-///
-/// Handles the two shell forms that map deterministically to a home directory:
-///   - bare `~`            -> `home`
-///   - `~/rest` (or `~\rest` on Windows) -> `<home>/rest`
-///
-/// A leading `~` followed by anything else (`~user`, `~+`, `~foo`) is a form we
-/// cannot resolve without extra state, so it is left untouched — consistent with
-/// how `msys_to_windows` leaves un-mappable inputs alone. Returns `None` when
-/// `home` is `None` (unset) so the caller falls back to the raw path. Kept pure
-/// (home passed in) so it is testable without mutating process environment.
-fn expand_tilde(path: &str, home: Option<&str>) -> Option<String> {
-    let rest = path.strip_prefix('~')?;
-    // Only a bare `~` or a `~` immediately followed by a path separator is a
-    // home-relative reference. Anything else (`~user`) is left to the caller.
-    let is_sep = |c: char| c == '/' || (cfg!(windows) && c == '\\');
-    if !rest.is_empty() && !rest.starts_with(is_sep) {
-        return None;
+impl ProtectedPathPolicy {
+    /// Consume the one-shot non-secret policy before constructing tool state.
+    pub(crate) fn take_from_environment() -> Result<Self, String> {
+        let value = std::env::var_os(PROTECTED_PATHS_ENV);
+        std::env::remove_var(PROTECTED_PATHS_ENV);
+        let Some(value) = value else {
+            return Ok(Self::default());
+        };
+        let value = value
+            .into_string()
+            .map_err(|_| format!("{PROTECTED_PATHS_ENV} must be UTF-8"))?;
+        Self::from_json(&value)
     }
 
-    let home = home?;
-    if home.is_empty() {
-        return None;
-    }
-
-    if rest.is_empty() {
-        // Bare `~` -> home directory.
-        return Some(home.to_string());
-    }
-    // `~/rest` -> `<home>/rest`. `rest` begins with a separator, so strip it to
-    // avoid an absolute-looking join and let `Path` re-add the separator.
-    let tail = rest.trim_start_matches(is_sep);
-    let joined = Path::new(home).join(tail);
-    Some(joined.to_string_lossy().into_owned())
-}
-
-/// The user's home directory from the environment. Reads `$HOME` first, falling
-/// back to `%USERPROFILE%` on Windows, then hands the raw values to `select_home`
-/// (pure, so it is testable without mutating process env). Returns `None` if no
-/// usable value is set or the value is not UTF-8.
-fn home_dir() -> Option<String> {
-    let home = std::env::var_os("HOME").and_then(|v| v.into_string().ok());
-    #[cfg(windows)]
-    let userprofile = std::env::var_os("USERPROFILE").and_then(|v| v.into_string().ok());
-    #[cfg(not(windows))]
-    let userprofile: Option<String> = None;
-    select_home(home.as_deref(), userprofile.as_deref())
-}
-
-/// Choose the home directory from the two env candidates, preferring `$HOME`.
-///
-/// `$HOME` is preferred because that is exactly what bash — and therefore the
-/// `shell` tool — expands `~` against, and `HOME` is passed through to the MCP
-/// child on every platform (see `buzz-agent`'s `PASSTHROUGH_ENV`). Picking
-/// `USERPROFILE` first on Windows would diverge from the shell tool whenever the
-/// two differ (a git-bash `HOME=/c/Users/x`, or an `mcpServers[].env` override),
-/// which is precisely the "match the shell tool" contract this fix exists for.
-/// `USERPROFILE` is only a Windows fallback for when `HOME` is unset.
-///
-/// On Windows the chosen value is passed through `msys_to_windows` so an MSYS
-/// `HOME` (`/c/Users/x`) becomes a native path (`C:\Users\x`) — `~` expansion
-/// happens after `msys_to_windows` in `resolve_path`, so the spliced-in home
-/// would otherwise never be translated and `canonicalize` would reject it. An
-/// MSYS form with no Windows equivalent (`/home/x`) falls through untranslated
-/// and fails with the clear `path not accessible` error, the correct outcome.
-/// Empty strings are treated as unset.
-fn select_home(home: Option<&str>, userprofile: Option<&str>) -> Option<String> {
-    fn non_empty(v: Option<&str>) -> Option<&str> {
-        v.filter(|s| !s.is_empty())
-    }
-    let chosen = non_empty(home).or_else(|| non_empty(userprofile))?;
-    #[cfg(windows)]
-    {
-        Some(msys_to_windows(chosen))
-    }
-    #[cfg(not(windows))]
-    {
-        Some(chosen.to_string())
-    }
-}
-
-/// Translate the MSYS/Cygwin absolute path forms bash would accept into a
-/// native Windows path, matching `cygpath -w` semantics so the file tools
-/// resolve the same inputs the `shell` tool does. Anything that is not a
-/// recognized MSYS-absolute form is returned unchanged.
-///
-/// Two forms are translated natively because they are deterministic with no
-/// external state:
-///   - cygdrive: `/c/Users/x` -> `C:\Users\x` (the form that bit the agent).
-///   - UNC:      `//server/share/x` -> `\\server\share\x`.
-///
-/// A third form — root-anchored `/tmp`, `/usr/...`, `/bin` — maps under the
-/// MSYS install root (from the host's Git for Windows install), which this
-/// process does not reliably know. We deliberately do NOT guess it: such a path
-/// falls through untranslated and fails with the clear `path not accessible`
-/// error rather than being silently mis-mapped to the wrong location. Resolving
-/// it correctly would require shelling out to `cygpath`; that is out of scope
-/// here and these paths are not a normal target for agent file I/O.
-#[cfg(windows)]
-fn msys_to_windows(path: &str) -> String {
-    // UNC: exactly two leading slashes then a non-empty host segment.
-    if let Some(rest) = path.strip_prefix("//") {
-        if !rest.is_empty() && !rest.starts_with('/') {
-            return format!(r"\\{}", rest.replace('/', r"\"));
+    fn from_json(value: &str) -> Result<Self, String> {
+        let paths: Vec<String> = serde_json::from_str(value)
+            .map_err(|error| format!("invalid {PROTECTED_PATHS_ENV}: {error}"))?;
+        let mut normalized = Vec::with_capacity(paths.len());
+        for raw in paths {
+            let path = PathBuf::from(&raw);
+            if !path.is_absolute() {
+                return Err(format!(
+                    "{PROTECTED_PATHS_ENV} entry must be absolute: {raw}"
+                ));
+            }
+            let path = normalize_absolute(&path)
+                .ok_or_else(|| format!("{PROTECTED_PATHS_ENV} entry is not normalized: {raw}"))?;
+            normalized.push(path);
         }
-        return path.to_string();
+        normalized.sort();
+        normalized.dedup();
+        Ok(Self { paths: normalized })
     }
 
-    // cygdrive: `/<letter>` optionally followed by `/...`. The drive segment is
-    // a single ASCII letter; `/cc/...` (two letters) is a root-anchored path,
-    // not a drive, and must NOT match.
-    if let Some(rest) = path.strip_prefix('/') {
-        let mut chars = rest.chars();
-        if let Some(drive) = chars.next() {
-            if drive.is_ascii_alphabetic() {
-                let after = chars.as_str();
-                if after.is_empty() {
-                    // `/c` -> `C:\`
-                    return format!(r"{}:\", drive.to_ascii_uppercase());
-                }
-                if let Some(tail) = after.strip_prefix('/') {
-                    // `/c/Users/x` -> `C:\Users\x`
-                    return format!(
-                        r"{}:\{}",
-                        drive.to_ascii_uppercase(),
-                        tail.replace('/', r"\")
-                    );
-                }
+    #[cfg(test)]
+    pub(crate) fn from_paths(paths: impl IntoIterator<Item = PathBuf>) -> Self {
+        Self {
+            paths: paths
+                .into_iter()
+                .map(|path| path.canonicalize().unwrap_or(path))
+                .collect(),
+        }
+    }
+
+    pub(crate) fn paths(&self) -> &[PathBuf] {
+        &self.paths
+    }
+
+    pub(crate) fn protects(&self, path: &Path) -> bool {
+        self.paths
+            .iter()
+            .any(|protected| path == protected || path.starts_with(protected))
+    }
+}
+
+fn normalize_absolute(path: &Path) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                out.push(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => return None,
+        }
+    }
+    Some(out)
+}
+
+pub(crate) struct OpenedFile {
+    pub(crate) display: PathBuf,
+    pub(crate) relative: PathBuf,
+    #[cfg(unix)]
+    stat: nix::libc::stat,
+}
+
+fn invalid(message: impl Into<String>) -> ErrorData {
+    ErrorData::invalid_params(message.into(), None)
+}
+
+fn io_error(action: &str, path: &Path, error: impl std::fmt::Display) -> ErrorData {
+    ErrorData::internal_error(format!("cannot {action} {}: {error}", path.display()), None)
+}
+
+/// Convert an optional workdir and a requested path to a normalized relative
+/// path beneath `root`. This lexical gate runs before descriptor traversal.
+pub(crate) fn confined_relative_path(
+    root: &Path,
+    path: &str,
+    workdir: Option<&str>,
+) -> Result<PathBuf, String> {
+    if path.is_empty() {
+        return Err("path must not be empty".to_string());
+    }
+    if path == "~" || path.starts_with("~/") || path.starts_with("~\\") {
+        return Err("tilde paths are outside the session checkout".to_string());
+    }
+    let root = normalize_absolute(root)
+        .ok_or_else(|| "session checkout root must be absolute and normalized".to_string())?;
+    let workdir_relative = match workdir {
+        None => PathBuf::new(),
+        Some(raw) => lexical_beneath(&root, Path::new(raw), Path::new(""), "workdir")?,
+    };
+    lexical_beneath(&root, Path::new(path), &workdir_relative, "path")
+}
+
+fn lexical_beneath(
+    _root: &Path,
+    requested: &Path,
+    relative_base: &Path,
+    label: &str,
+) -> Result<PathBuf, String> {
+    if requested.is_absolute() {
+        return Err(format!("{label} must be relative to the session checkout"));
+    }
+    let candidate = relative_base.join(requested);
+    let mut out = PathBuf::new();
+    for component in candidate.components() {
+        match component {
+            Component::Normal(value) => out.push(value),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(format!("{label} must remain inside the session checkout"));
             }
         }
     }
-
-    // Root-anchored (`/tmp`, `/usr/...`) or anything else: leave untouched.
-    path.to_string()
+    Ok(out)
 }
 
-/// Resolve a user-supplied path within the workspace, read the file, and
-/// return `(resolved_path, utf8_content)`. Rejects files that are not
-/// regular files, exceed `MAX_FILE_BYTES`, or are not valid UTF-8.
+pub(crate) fn resolve_workdir(
+    state: &SharedState,
+    workdir: Option<&str>,
+) -> Result<PathBuf, String> {
+    let relative = confined_relative_path(&state.cwd, ".", workdir)?;
+    #[cfg(unix)]
+    {
+        let _ = open_directory_chain(&state.cwd, &relative)?;
+        Ok(state.cwd.join(relative))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (state, relative);
+        Err("generic workdirs require descriptor no-follow support".to_string())
+    }
+}
+
 pub(crate) fn read_text_file(
     state: &SharedState,
     path: &str,
     workdir: Option<&str>,
-) -> Result<(PathBuf, String), ErrorData> {
-    let workspace_root: PathBuf = match workdir {
-        Some(w) => PathBuf::from(w),
-        None => state.cwd.clone(),
-    };
-    let target = match resolve_path(&workspace_root, path) {
-        Ok(t) => t,
-        Err(e) => return Err(ErrorData::invalid_params(e, None)),
-    };
+) -> Result<(OpenedFile, String), ErrorData> {
+    let (opened, bytes) = read_file_bytes(state, path, workdir, MAX_FILE_BYTES)?;
+    let content = String::from_utf8(bytes)
+        .map_err(|error| io_error("decode as UTF-8", &opened.display, error))?;
+    Ok((opened, content))
+}
 
-    let meta = match std::fs::metadata(&target) {
-        Ok(m) => m,
-        Err(e) => {
-            return Err(ErrorData::internal_error(
-                format!("cannot stat {}: {e}", target.display()),
-                None,
-            ));
-        }
-    };
-    if !meta.is_file() {
-        return Err(ErrorData::invalid_params(
-            format!("not a regular file: {}", target.display()),
-            None,
-        ));
+pub(crate) fn read_file_bytes(
+    state: &SharedState,
+    path: &str,
+    workdir: Option<&str>,
+    max_bytes: u64,
+) -> Result<(OpenedFile, Vec<u8>), ErrorData> {
+    let relative = confined_relative_path(&state.cwd, path, workdir).map_err(invalid)?;
+    if relative.as_os_str().is_empty() {
+        return Err(invalid("path must name a file inside the session checkout"));
     }
-    if meta.len() > MAX_FILE_BYTES {
-        return Err(ErrorData::invalid_params(
-            format!(
-                "file too large: {} is {} bytes (limit {} bytes)",
-                target.display(),
-                meta.len(),
-                MAX_FILE_BYTES
-            ),
-            None,
-        ));
+    let display = state.cwd.join(&relative);
+    #[cfg(unix)]
+    {
+        read_file_bytes_unix(&state.cwd, relative, display, max_bytes)
     }
+    #[cfg(not(unix))]
+    {
+        let _ = (state, relative, display, max_bytes);
+        Err(invalid(
+            "generic file reads are unavailable: descriptor-confined no-follow traversal is not implemented on this platform",
+        ))
+    }
+}
 
-    let file = match std::fs::File::open(&target) {
-        Ok(f) => f,
-        Err(e) => {
-            return Err(ErrorData::internal_error(
-                format!("cannot open {}: {e}", target.display()),
-                None,
-            ));
-        }
-    };
-    let mut buf = Vec::with_capacity(meta.len() as usize);
+#[cfg(unix)]
+fn open_directory_chain(root: &Path, relative: &Path) -> Result<std::os::fd::OwnedFd, String> {
+    use nix::fcntl::{open, openat, OFlag};
+    use nix::sys::stat::Mode;
+    let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+    let mut fd = open(root, flags, Mode::empty())
+        .map_err(|error| format!("session checkout is not safely accessible: {error}"))?;
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            return Err("path must remain inside the session checkout".to_string());
+        };
+        fd = openat(&fd, name, flags, Mode::empty())
+            .map_err(|error| format!("directory is not safely accessible: {error}"))?;
+    }
+    Ok(fd)
+}
+
+#[cfg(unix)]
+fn read_file_bytes_unix(
+    root: &Path,
+    relative: PathBuf,
+    display: PathBuf,
+    max_bytes: u64,
+) -> Result<(OpenedFile, Vec<u8>), ErrorData> {
+    use nix::fcntl::{openat, OFlag};
+    use nix::sys::stat::{fstat, Mode, SFlag};
     use std::io::Read;
-    match file.take(MAX_FILE_BYTES + 1).read_to_end(&mut buf) {
-        Ok(n) if n as u64 > MAX_FILE_BYTES => {
-            return Err(ErrorData::invalid_params(
-                format!("file grew past {} bytes during read", MAX_FILE_BYTES),
-                None,
-            ));
-        }
-        Ok(_) => {}
-        Err(e) => {
-            return Err(ErrorData::internal_error(
-                format!("cannot read {}: {e}", target.display()),
-                None,
-            ));
-        }
+    let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+    let name = relative
+        .file_name()
+        .ok_or_else(|| invalid("path must name a file"))?;
+    let parent_fd = open_directory_chain(root, parent).map_err(invalid)?;
+    let fd = openat(
+        &parent_fd,
+        name,
+        OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| io_error("open safely", &display, error))?;
+    let stat = fstat(&fd).map_err(|error| io_error("inspect", &display, error))?;
+    if SFlag::from_bits_truncate(stat.st_mode) != SFlag::S_IFREG {
+        return Err(invalid(format!(
+            "not a regular file: {}",
+            display.display()
+        )));
     }
-    let content = match String::from_utf8(buf) {
-        Ok(s) => s,
-        Err(e) => {
-            return Err(ErrorData::internal_error(
-                format!("not valid UTF-8: {}: {e}", target.display()),
-                None,
-            ));
-        }
-    };
+    let length = u64::try_from(stat.st_size).unwrap_or(u64::MAX);
+    if length > max_bytes {
+        return Err(invalid(format!(
+            "file too large: {} is {} bytes (limit {} bytes)",
+            display.display(),
+            length,
+            max_bytes
+        )));
+    }
+    let mut file = std::fs::File::from(fd);
+    let mut bytes = Vec::with_capacity(length as usize);
+    file.by_ref()
+        .take(max_bytes + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| io_error("read", &display, error))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(invalid(format!(
+            "file grew past {max_bytes} bytes during read: {}",
+            display.display()
+        )));
+    }
+    Ok((
+        OpenedFile {
+            display,
+            relative,
+            stat,
+        },
+        bytes,
+    ))
+}
 
-    Ok((target, content))
+pub(crate) fn ensure_writable(state: &SharedState, target: &OpenedFile) -> Result<(), ErrorData> {
+    if target.relative.components().any(|component| {
+        matches!(component, Component::Normal(name) if name.to_string_lossy().eq_ignore_ascii_case(".git"))
+    }) {
+        return Err(invalid("generic file tools may not modify Git authority paths"));
+    }
+    if state.protected_paths.protects(&target.display) {
+        return Err(invalid(format!(
+            "path is protected from model writes: {}",
+            target.display.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+pub(crate) fn atomic_replace(
+    state: &SharedState,
+    target: &OpenedFile,
+    content: &[u8],
+) -> Result<(), ErrorData> {
+    use nix::fcntl::{openat, renameat, AtFlags, OFlag};
+    use nix::sys::stat::{fchmod, fstatat, Mode, SFlag};
+    use nix::unistd::{unlinkat, UnlinkatFlags};
+    use std::io::Write;
+
+    ensure_writable(state, target)?;
+    let parent = target.relative.parent().unwrap_or_else(|| Path::new(""));
+    let name = target
+        .relative
+        .file_name()
+        .ok_or_else(|| invalid("path must name a file"))?;
+    let parent_fd = open_directory_chain(&state.cwd, parent).map_err(invalid)?;
+    let current = fstatat(&parent_fd, name, AtFlags::AT_SYMLINK_NOFOLLOW)
+        .map_err(|error| io_error("revalidate", &target.display, error))?;
+    if SFlag::from_bits_truncate(current.st_mode) != SFlag::S_IFREG
+        || current.st_dev != target.stat.st_dev
+        || current.st_ino != target.stat.st_ino
+    {
+        return Err(invalid("file changed while preparing replacement; retry"));
+    }
+
+    let temp_name = format!(".buzz-mcp-write-{}-{}", std::process::id(), next_nonce());
+    let temp_path = Path::new(&temp_name);
+    let fd = openat(
+        &parent_fd,
+        temp_path,
+        OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::from_bits_truncate(0o600),
+    )
+    .map_err(|error| io_error("create replacement", &target.display, error))?;
+    let write_result = (|| -> Result<(), ErrorData> {
+        fchmod(&fd, Mode::from_bits_truncate(target.stat.st_mode & 0o7777))
+            .map_err(|error| io_error("set replacement permissions", &target.display, error))?;
+        let mut file = std::fs::File::from(fd);
+        file.write_all(content)
+            .and_then(|()| file.flush())
+            .and_then(|()| file.sync_all())
+            .map_err(|error| io_error("write replacement", &target.display, error))?;
+        let now = fstatat(&parent_fd, name, AtFlags::AT_SYMLINK_NOFOLLOW)
+            .map_err(|error| io_error("revalidate", &target.display, error))?;
+        if now.st_dev != target.stat.st_dev || now.st_ino != target.stat.st_ino {
+            return Err(invalid("file changed while preparing replacement; retry"));
+        }
+        renameat(&parent_fd, temp_path, &parent_fd, name)
+            .map_err(|error| io_error("install replacement", &target.display, error))?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = unlinkat(&parent_fd, temp_path, UnlinkatFlags::NoRemoveDir);
+    }
+    write_result
+}
+
+#[cfg(not(unix))]
+pub(crate) fn atomic_replace(
+    state: &SharedState,
+    target: &OpenedFile,
+    content: &[u8],
+) -> Result<(), ErrorData> {
+    use std::io::Write;
+    ensure_writable(state, target)?;
+    let parent = target
+        .display
+        .parent()
+        .ok_or_else(|| invalid("invalid path"))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|error| io_error("create replacement", &target.display, error))?;
+    temporary
+        .write_all(content)
+        .map_err(|error| io_error("write replacement", &target.display, error))?;
+    temporary
+        .persist(&target.display)
+        .map_err(|error| io_error("install replacement", &target.display, error.error))?;
+    Ok(())
+}
+
+fn next_nonce() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NONCE: AtomicU64 = AtomicU64::new(0);
+    NONCE.fetch_add(1, Ordering::Relaxed)
 }
 
 #[cfg(test)]
@@ -280,202 +386,139 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
-    #[test]
-    fn resolve_path_allows_outside_workspace() {
-        let dir = tempdir().expect("tempdir");
-        let inside = dir.path().join("file.txt");
-        fs::write(&inside, b"x").expect("write");
-        // Symlink targeting outside the dir should now resolve successfully.
-        #[cfg(unix)]
-        {
-            let outside = std::env::temp_dir().join("dev-mcp-paths-escape-target");
-            let _ = fs::remove_file(&outside);
-            fs::write(&outside, b"y").expect("write outside");
-            let link = dir.path().join("link.txt");
-            std::os::unix::fs::symlink(&outside, &link).expect("symlink");
-            let resolved = resolve_path(dir.path(), "link.txt").expect("resolve");
-            let outside_canon = std::fs::canonicalize(&outside).expect("canonicalize");
-            assert_eq!(resolved, outside_canon);
-            let _ = fs::remove_file(&outside);
-        }
-        // Resolves a normal path inside.
-        let p = resolve_path(dir.path(), "file.txt").expect("resolve");
-        assert!(p.ends_with("file.txt"));
+    fn state(root: &Path) -> SharedState {
+        let shim = crate::shim::Shim::install().expect("shim");
+        SharedState::new_for_test(root.to_path_buf(), shim, ProtectedPathPolicy::default())
+            .expect("state")
     }
 
-    // `expand_tilde` is pure (home is passed in), so these cases need no env
-    // mutation and cannot race parallel tests.
     #[test]
-    fn expand_tilde_forms() {
-        let home = "/home/agent";
-
-        // Non-tilde inputs are never rewritten.
-        assert_eq!(expand_tilde("file.txt", Some(home)), None);
-        assert_eq!(expand_tilde("/abs/path", Some(home)), None);
-        assert_eq!(expand_tilde("sub/~notleading", Some(home)), None);
-
-        // `~user` and other non-separator suffixes are left for the caller.
-        assert_eq!(expand_tilde("~user/x", Some(home)), None);
-        assert_eq!(expand_tilde("~foo", Some(home)), None);
-
-        // Bare `~` and `~/rest` expand against the supplied home.
-        assert_eq!(expand_tilde("~", Some(home)), Some(home.to_string()));
-        let expanded = expand_tilde("~/.claude/skills/x", Some(home)).expect("expands");
-        assert_eq!(
-            expanded,
-            Path::new(home).join(".claude/skills/x").to_string_lossy()
+    fn confines_absolute_tilde_parent_and_workdir() {
+        let root = tempdir().expect("root");
+        let outside = tempdir().expect("outside");
+        let root_abs = root.path().canonicalize().expect("root canonical");
+        assert!(confined_relative_path(&root_abs, "file", None).is_ok());
+        assert!(confined_relative_path(
+            &root_abs,
+            &root_abs.join("file").display().to_string(),
+            None
+        )
+        .is_err());
+        assert!(
+            confined_relative_path(&root_abs, "file", Some(&root_abs.display().to_string()))
+                .is_err()
         );
-
-        // Unset or empty home -> no rewrite, caller falls back to the raw path.
-        assert_eq!(expand_tilde("~/rest", None), None);
-        assert_eq!(expand_tilde("~", None), None);
-        assert_eq!(expand_tilde("~/rest", Some("")), None);
+        assert!(confined_relative_path(&root_abs, "~/secret", None).is_err());
+        assert!(confined_relative_path(&root_abs, "../secret", None).is_err());
+        assert!(confined_relative_path(
+            &root_abs,
+            &outside.path().join("secret").display().to_string(),
+            None
+        )
+        .is_err());
+        assert!(confined_relative_path(
+            &root_abs,
+            "file",
+            Some(&outside.path().display().to_string())
+        )
+        .is_err());
     }
 
-    // `select_home` is pure (both env candidates passed in), so it exercises the
-    // HOME-first preference and empty/unset handling without mutating process
-    // env or racing parallel tests. `select_home` itself does not gate the
-    // fallback by platform — `home_dir` is what only supplies `userprofile` on
-    // Windows — so these assertions hold identically on every platform.
     #[test]
-    fn select_home_prefers_home() {
-        // $HOME wins when both are set.
-        assert_eq!(
-            select_home(Some("/home/agent"), Some("/other")),
-            Some("/home/agent".to_string())
-        );
-        // Empty $HOME is treated as unset -> fall back to the second candidate.
-        assert_eq!(
-            select_home(Some(""), Some("/other")),
-            Some("/other".to_string())
-        );
-        // No usable candidate -> None.
-        assert_eq!(select_home(None, None), None);
-        assert_eq!(select_home(Some(""), Some("")), None);
+    fn protected_policy_rejects_malformed_and_relative_entries() {
+        assert!(ProtectedPathPolicy::from_json("not-json").is_err());
+        assert!(ProtectedPathPolicy::from_json(r#"["relative/path"]"#).is_err());
+        assert!(ProtectedPathPolicy::from_json(r#"["/absolute/../ambiguous"]"#).is_err());
+        assert!(ProtectedPathPolicy::from_json(r#"["/absolute/path"]"#).is_ok());
     }
 
-    // End-to-end through `resolve_path`, exercising the real `home_dir()` env
-    // read: a `~/...` path resolves against the actual home directory, not the
-    // workspace root. Uses a temp file created under the real home so it does
-    // not mutate the environment.
+    #[cfg(not(unix))]
     #[test]
-    fn resolve_path_expands_tilde_against_home() {
-        let home = match home_dir() {
-            Some(h) if !h.is_empty() => h,
-            _ => return, // No home in this environment (e.g. minimal CI) — skip.
-        };
-        let marker = format!(".dev-mcp-tilde-test-{}", std::process::id());
-        let target = Path::new(&home).join(&marker);
-        fs::write(&target, b"z").expect("write under home");
-
-        let workspace = tempdir().expect("tempdir");
-        let resolved = resolve_path(workspace.path(), &format!("~/{marker}"))
-            .expect("tilde path resolves against home, not workspace");
-        let want = std::fs::canonicalize(&target).expect("canon");
-        assert_eq!(resolved, want);
-
-        let _ = fs::remove_file(&target);
+    fn file_tools_fail_closed_without_descriptor_no_follow_support() {
+        let root = tempdir().expect("root");
+        fs::write(root.path().join("ordinary"), "inside").expect("file");
+        let state = state(root.path());
+        let error = read_text_file(&state, "ordinary", None)
+            .err()
+            .expect("unsupported platform");
+        assert!(format!("{error:?}").contains("no-follow traversal is not implemented"));
     }
 
-    // Windows MSYS-absolute path translation. These test `msys_to_windows`
-    // directly (the pure rewrite) rather than `resolve_path`, because the latter
-    // canonicalizes against the real filesystem and we want deterministic
-    // assertions that don't depend on `C:\Users\x` existing on the runner.
-    #[cfg(windows)]
-    mod windows_msys {
-        use super::super::*;
-        use std::path::Path;
+    #[cfg(unix)]
+    #[test]
+    fn read_rejects_intermediate_and_final_symlinks() {
+        use std::os::unix::fs::symlink;
+        let root = tempdir().expect("root");
+        let outside = tempdir().expect("outside");
+        fs::write(outside.path().join("secret"), "nope").expect("secret");
+        symlink(outside.path(), root.path().join("linked-dir")).expect("dir link");
+        symlink(
+            outside.path().join("secret"),
+            root.path().join("linked-file"),
+        )
+        .expect("file link");
+        let state = state(root.path());
+        assert!(read_text_file(&state, "linked-dir/secret", None).is_err());
+        assert!(read_text_file(&state, "linked-file", None).is_err());
+    }
 
-        #[test]
-        fn cygdrive_path_becomes_drive_letter() {
-            assert_eq!(msys_to_windows("/c/Users/x"), r"C:\Users\x");
-            assert_eq!(msys_to_windows("/d/a/_temp/repo"), r"D:\a\_temp\repo");
-        }
+    #[cfg(unix)]
+    #[test]
+    fn atomic_replace_refuses_symlink_swap_and_preserves_outside() {
+        use std::os::unix::fs::symlink;
+        let root = tempdir().expect("root");
+        let outside = tempdir().expect("outside");
+        let victim = outside.path().join("victim");
+        fs::write(&victim, "operator").expect("victim");
+        let local = root.path().join("local");
+        fs::write(&local, "model").expect("local");
+        let state = state(root.path());
+        let (opened, _) = read_text_file(&state, "local", None).expect("read");
+        fs::remove_file(&local).expect("remove");
+        symlink(&victim, &local).expect("swap");
+        assert!(atomic_replace(&state, &opened, b"poison").is_err());
+        assert_eq!(
+            fs::read_to_string(&victim).expect("victim read"),
+            "operator"
+        );
+    }
 
-        #[test]
-        fn cygdrive_root_becomes_drive_root() {
-            assert_eq!(msys_to_windows("/c"), r"C:\");
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_symlink_swaps_never_disclose_outside_reads() {
+        use std::os::unix::fs::symlink;
+        use std::sync::Arc;
+        let root = tempdir().expect("root");
+        let outside = tempdir().expect("outside");
+        let victim = outside.path().join("victim");
+        fs::write(&victim, "operator-secret").expect("victim");
+        let local = root.path().join("local");
+        fs::write(&local, "inside").expect("local");
+        let state = state(root.path());
+        let local = Arc::new(local);
+        let victim_for_writer = victim.clone();
+        let local_for_writer = Arc::clone(&local);
+        let writer = std::thread::spawn(move || {
+            for _ in 0..250 {
+                let _ = fs::remove_file(&*local_for_writer);
+                let _ = symlink(&victim_for_writer, &*local_for_writer);
+                std::thread::yield_now();
+                let _ = fs::remove_file(&*local_for_writer);
+                let _ = fs::write(&*local_for_writer, "inside");
+            }
+        });
+        for _ in 0..500 {
+            if let Ok((_, value)) = read_text_file(&state, "local", None) {
+                assert!(
+                    value.is_empty() || value == "inside",
+                    "outside read: {value:?}"
+                );
+            }
         }
-
-        #[test]
-        fn unc_path_becomes_backslash_unc() {
-            assert_eq!(msys_to_windows("//server/share/x"), r"\\server\share\x");
-        }
-
-        #[test]
-        fn windows_absolute_passes_through_unchanged() {
-            // Already a native Windows path — must not be mangled.
-            assert_eq!(msys_to_windows(r"C:\Users\x"), r"C:\Users\x");
-        }
-
-        // Windows `select_home` behavior: HOME still wins over USERPROFILE, and
-        // an MSYS-form HOME is translated to a native path so the value spliced
-        // in during `~` expansion (which runs after `msys_to_windows`) resolves.
-        // Both candidates are passed in, so this needs no process-env mutation
-        // and does not silently no-op the way a real-env read would when HOME is
-        // unset on CI.
-        #[test]
-        fn select_home_translates_msys_home_and_prefers_it() {
-            // Divergent HOME/USERPROFILE: HOME wins, and its MSYS cygdrive form
-            // is translated to the native path so canonicalize can use it.
-            assert_eq!(
-                select_home(Some("/c/Users/agent"), Some(r"C:\Users\other")),
-                Some(r"C:\Users\agent".to_string())
-            );
-            // A native-form HOME is preferred and passes through unchanged.
-            assert_eq!(
-                select_home(Some(r"C:\Users\agent"), Some(r"C:\Users\other")),
-                Some(r"C:\Users\agent".to_string())
-            );
-            // HOME unset -> fall back to USERPROFILE (already native).
-            assert_eq!(
-                select_home(None, Some(r"C:\Users\other")),
-                Some(r"C:\Users\other".to_string())
-            );
-            // An MSYS HOME with no Windows equivalent (`/home/x`) is left
-            // untranslated; it fails downstream with a clear error rather than
-            // being mis-mapped — the intended conservative outcome.
-            assert_eq!(
-                select_home(Some("/home/agent"), None),
-                Some("/home/agent".to_string())
-            );
-        }
-
-        #[test]
-        fn relative_path_passes_through_unchanged() {
-            // No leading slash — left for the caller's `root.join`.
-            assert_eq!(msys_to_windows("file.txt"), "file.txt");
-            assert_eq!(msys_to_windows("sub/file.txt"), "sub/file.txt");
-        }
-
-        #[test]
-        fn root_anchored_msys_path_is_left_untranslated() {
-            // Form 3: maps under the MSYS install root we don't know — must NOT
-            // be guessed. Returned unchanged so it fails cleanly downstream
-            // rather than being silently mis-mapped.
-            assert_eq!(msys_to_windows("/tmp/scratch"), "/tmp/scratch");
-            assert_eq!(msys_to_windows("/usr/bin/git"), "/usr/bin/git");
-            // Two-letter leading segment is root-anchored, not a drive.
-            assert_eq!(msys_to_windows("/cc/x"), "/cc/x");
-        }
-
-        #[test]
-        fn degenerate_slash_inputs_are_left_untranslated() {
-            assert_eq!(msys_to_windows("/"), "/");
-            assert_eq!(msys_to_windows("//"), "//");
-        }
-
-        #[test]
-        fn cygdrive_path_resolves_against_drive_not_doubled() {
-            // Integration: a cygdrive path resolves to a real Windows-absolute
-            // candidate (the system root always exists), proving the drive is
-            // not doubled into C:/c/... as the pre-fix bug did.
-            let resolved = resolve_path(Path::new(r"C:\does\not\matter"), "/c/Windows")
-                .expect("cygdrive path resolves");
-            assert!(resolved
-                .to_string_lossy()
-                .to_lowercase()
-                .contains(r"c:\windows"));
-        }
+        writer.join().expect("writer");
+        assert_eq!(
+            fs::read_to_string(victim).expect("victim"),
+            "operator-secret"
+        );
     }
 }

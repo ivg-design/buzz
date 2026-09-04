@@ -1,6 +1,8 @@
 //! Session-scoped MCP surface for harness-owned Buzz credentials.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -11,9 +13,12 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
+use super::tools::{prepare_handoff, publish_prepared_handoff};
 use super::{
-    cancel, dispatch, handoff, inbox, send_chat, status, A2aCancelParams, A2aDispatchParams,
-    A2aHandoffParams, A2aInboxParams, A2aStatusParams, ChatSendParams, TrustedRelay,
+    cancel, dispatch, git, inbox, send_chat, status, A2aCancelParams, A2aDispatchParams,
+    A2aHandoffParams, A2aInboxParams, A2aStatusParams, ChatSendParams, JobPrivilegeGate,
+    PrivilegedGitOperationReceipt, PrivilegedOperationOutcome, ProjectGitCommitParams,
+    ProjectGitOperation, ProjectGitParams, TrustedRelay,
 };
 
 /// Typed Buzz tools backed by a harness-owned signer.
@@ -25,6 +30,8 @@ use super::{
 pub struct TrustedSessionMcp {
     relay: Arc<TrustedRelay>,
     session_cancellation: CancellationToken,
+    git_operation_lock: Arc<tokio::sync::Mutex<()>>,
+    privilege_gate: Option<Arc<dyn JobPrivilegeGate>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -43,9 +50,21 @@ struct PrivateMediaParams {
 impl TrustedSessionMcp {
     /// Create a typed MCP handler for one immutable ACP session scope.
     pub fn new(relay: TrustedRelay, session_cancellation: CancellationToken) -> Self {
+        Self::new_with_privilege_gate(relay, session_cancellation, None)
+    }
+
+    /// Create a handler with an ACP-owned lifecycle fence. Job Git and
+    /// handoff operations fail closed when this capability is absent.
+    pub fn new_with_privilege_gate(
+        relay: TrustedRelay,
+        session_cancellation: CancellationToken,
+        privilege_gate: Option<Arc<dyn JobPrivilegeGate>>,
+    ) -> Self {
         Self {
             relay: Arc::new(relay),
             session_cancellation,
+            git_operation_lock: Arc::new(tokio::sync::Mutex::new(())),
+            privilege_gate,
             tool_router: Self::tool_router(),
         }
     }
@@ -129,7 +148,44 @@ impl TrustedSessionMcp {
         context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let cancellation = combine_cancellation(&self.session_cancellation, context.ct);
-        let result = handoff(&self.relay, params, cancellation.clone()).await;
+        let invocation_id = uuid::Uuid::new_v4();
+        let result = match self
+            .begin_privileged_operation(ProjectGitOperation::Handoff, invocation_id, &cancellation)
+            .await
+        {
+            Ok(mut lease) => {
+                let operation_cancellation =
+                    combine_cancellation(&cancellation, lease.cancellation_token());
+                let result = match prepare_handoff(
+                    &self.relay,
+                    params,
+                    operation_cancellation.clone(),
+                )
+                .await
+                {
+                    Ok(event) => match lease
+                        .stage_handoff(event.clone(), operation_cancellation.clone())
+                        .await
+                    {
+                        Ok(()) => {
+                            publish_prepared_handoff(
+                                &self.relay,
+                                event,
+                                operation_cancellation.clone(),
+                            )
+                            .await
+                        }
+                        Err(error) => tool_error(error),
+                    },
+                    Err(error) => tool_error(error),
+                };
+                let outcome = operation_outcome(&result, &operation_cancellation);
+                operation_cancellation.cancel();
+                let handoff_event_id = successful_event_id(&result);
+                finish_privileged_operation(lease, outcome, None, handoff_event_id, result).await
+            }
+            Err(error) => tool_error(error),
+        };
         cancellation.cancel();
         Ok(result)
     }
@@ -179,6 +235,214 @@ impl TrustedSessionMcp {
         cancellation.cancel();
         result
     }
+
+    #[tool(
+        name = "buzz_project_git_commit",
+        description = "Create one DCO and NIP-GS signed commit from already-staged changes inside this job session's exact receiver-verified Project checkout and path grant."
+    )]
+    async fn buzz_project_git_commit(
+        &self,
+        Parameters(params): Parameters<ProjectGitCommitParams>,
+        context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let cancellation = combine_cancellation(&self.session_cancellation, context.ct);
+        let result = self
+            .run_git_operation(
+                ProjectGitOperation::Commit,
+                cancellation.clone(),
+                |operation_cancellation, receipt| async move {
+                    git::commit(&self.relay, params, operation_cancellation, receipt).await
+                },
+            )
+            .await;
+        cancellation.cancel();
+        Ok(result)
+    }
+
+    #[tool(
+        name = "buzz_project_git_fetch",
+        description = "Fetch only this job session's exact granted branch from its fixed Project origin. No caller URL, refspec, or helper is accepted."
+    )]
+    async fn buzz_project_git_fetch(
+        &self,
+        Parameters(params): Parameters<ProjectGitParams>,
+        context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let cancellation = combine_cancellation(&self.session_cancellation, context.ct);
+        let result = self
+            .run_git_operation(
+                ProjectGitOperation::Fetch,
+                cancellation.clone(),
+                |operation_cancellation, receipt| async move {
+                    git::fetch(&self.relay, params, operation_cancellation, receipt).await
+                },
+            )
+            .await;
+        cancellation.cancel();
+        Ok(result)
+    }
+
+    #[tool(
+        name = "buzz_project_git_push",
+        description = "Non-force push HEAD to this job session's exact granted Project branch after verifying path scope, DCO trailers, and NIP-GS signatures."
+    )]
+    async fn buzz_project_git_push(
+        &self,
+        Parameters(params): Parameters<ProjectGitParams>,
+        context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let cancellation = combine_cancellation(&self.session_cancellation, context.ct);
+        let result = self
+            .run_git_operation(
+                ProjectGitOperation::Push,
+                cancellation.clone(),
+                |operation_cancellation, receipt| async move {
+                    git::push(&self.relay, params, operation_cancellation, receipt).await
+                },
+            )
+            .await;
+        cancellation.cancel();
+        Ok(result)
+    }
+}
+
+impl TrustedSessionMcp {
+    async fn begin_privileged_operation(
+        &self,
+        operation: ProjectGitOperation,
+        invocation_id: uuid::Uuid,
+        cancellation: &CancellationToken,
+    ) -> Result<Box<dyn super::TrustedGitOperationLease>, String> {
+        let gate = self.privilege_gate.as_ref().ok_or_else(|| {
+            "job privilege lifecycle capability is unavailable; operation denied".to_owned()
+        })?;
+        gate.begin(operation, invocation_id, cancellation.clone())
+            .await
+    }
+
+    async fn run_git_operation<F, Fut>(
+        &self,
+        operation: ProjectGitOperation,
+        cancellation: CancellationToken,
+        run: F,
+    ) -> CallToolResult
+    where
+        F: FnOnce(CancellationToken, PrivilegedGitOperationReceipt) -> Fut,
+        Fut: std::future::Future<Output = git::GitOperationExecution>,
+    {
+        let session_lock = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                return tool_error("trusted Git operation was cancelled".into());
+            }
+            lock = self.git_operation_lock.lock() => lock,
+        };
+        let lock_key = match self
+            .relay
+            .grants
+            .git_lock_key(self.relay.session_working_directory.as_deref())
+        {
+            Ok(key) => key,
+            Err(error) => return tool_error(error),
+        };
+        let checkout_lock = match shared_checkout_lock(lock_key) {
+            Ok(lock) => lock,
+            Err(error) => return tool_error(error),
+        };
+        let checkout_guard = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                return tool_error("trusted Git operation was cancelled".into());
+            }
+            lock = checkout_lock.lock_owned() => lock,
+        };
+        let invocation_id = uuid::Uuid::new_v4();
+        let receipt = match git::operation_receipt(&self.relay, operation, invocation_id) {
+            Ok(receipt) => receipt,
+            Err(error) => return tool_error(error),
+        };
+        let lease = match self
+            .begin_privileged_operation(operation, invocation_id, &cancellation)
+            .await
+        {
+            Ok(lease) => lease,
+            Err(error) => return tool_error(error),
+        };
+        let operation_cancellation =
+            combine_cancellation(&cancellation, lease.cancellation_token());
+        let execution = run(operation_cancellation.clone(), receipt).await;
+        operation_cancellation.cancel();
+        let result = finish_privileged_operation(
+            lease,
+            execution.outcome,
+            Some(execution.receipt),
+            None,
+            execution.result,
+        )
+        .await;
+        drop(checkout_guard);
+        drop(session_lock);
+        result
+    }
+}
+
+async fn finish_privileged_operation(
+    lease: Box<dyn super::TrustedGitOperationLease>,
+    outcome: PrivilegedOperationOutcome,
+    git_receipt: Option<PrivilegedGitOperationReceipt>,
+    terminal_event_id: Option<String>,
+    result: CallToolResult,
+) -> CallToolResult {
+    match lease.finish(outcome, git_receipt, terminal_event_id).await {
+        Ok(()) => result,
+        Err(error) => tool_error(error),
+    }
+}
+
+fn successful_event_id(result: &CallToolResult) -> Option<String> {
+    if result.is_error == Some(true) {
+        return None;
+    }
+    let text = result.content.first()?.as_text()?.text.as_str();
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()?
+        .get("event_id")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+fn operation_outcome(
+    result: &CallToolResult,
+    cancellation: &CancellationToken,
+) -> PrivilegedOperationOutcome {
+    if cancellation.is_cancelled() {
+        PrivilegedOperationOutcome::Cancelled
+    } else if result.is_error == Some(true) {
+        PrivilegedOperationOutcome::Failed
+    } else {
+        PrivilegedOperationOutcome::Completed
+    }
+}
+
+fn tool_error(error: String) -> CallToolResult {
+    CallToolResult::error(vec![rmcp::model::Content::text(error)])
+}
+
+type CheckoutLocks = Mutex<HashMap<PathBuf, Weak<tokio::sync::Mutex<()>>>>;
+
+fn shared_checkout_lock(path: PathBuf) -> Result<Arc<tokio::sync::Mutex<()>>, String> {
+    static LOCKS: OnceLock<CheckoutLocks> = OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map_err(|_| "trusted Git checkout lock is unavailable".to_owned())?;
+    if let Some(lock) = locks.get(&path).and_then(Weak::upgrade) {
+        return Ok(lock);
+    }
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(path, Arc::downgrade(&lock));
+    Ok(lock)
 }
 
 fn combine_cancellation(

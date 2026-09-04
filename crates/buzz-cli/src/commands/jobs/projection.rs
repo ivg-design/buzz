@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
 use buzz_core::job::{
-    JobClaimStatus, JobControlAction, JobEvent, JobProgressStatus, JOB_SCHEMA_VERSION,
+    JobClaimStatus, JobControlAction, JobErrorOutcome, JobEvent, JobProgressStatus,
+    JOB_SCHEMA_VERSION,
 };
 use nostr::Event;
 use serde::Serialize;
@@ -317,6 +318,11 @@ fn valid_successor(state: &str, next: &JobEvent) -> bool {
         ("processed", JobEvent::Control(body)) if body.action == JobControlAction::Cancel => true,
         ("cancel_requested", JobEvent::Control(body))
             if body.action == JobControlAction::Cancelled =>
+        {
+            true
+        }
+        ("cancel_requested", JobEvent::Error(body))
+            if body.outcome == JobErrorOutcome::Indeterminate && !body.retryable =>
         {
             true
         }

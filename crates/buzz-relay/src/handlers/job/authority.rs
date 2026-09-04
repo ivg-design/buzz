@@ -137,6 +137,27 @@ pub(super) async fn require_channel_member_locked(
     Ok(())
 }
 
+pub(super) async fn require_channel_nonmember_locked(
+    tenant: &TenantContext,
+    lock: &mut buzz_db::JobOperationLock,
+    channel_id: uuid::Uuid,
+    pubkey: &PublicKey,
+    label: &str,
+) -> Result<(), JobAuthError> {
+    let present = lock
+        .channel_member_for_share(tenant.community(), channel_id, &pubkey.to_bytes())
+        .await
+        .map_err(|error| {
+            JobAuthError::Internal(format!("locking {label} channel membership: {error}"))
+        })?;
+    if present {
+        return Err(JobAuthError::Restricted(format!(
+            "{label} still has direct project home channel membership"
+        )));
+    }
+    Ok(())
+}
+
 pub(super) async fn effective_owner_locked(
     tenant: &TenantContext,
     lock: &mut buzz_db::JobOperationLock,

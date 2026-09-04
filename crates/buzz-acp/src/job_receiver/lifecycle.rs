@@ -40,6 +40,19 @@ pub enum CancelDecision {
     AlreadyTerminal,
 }
 
+/// Exact durable state consulted before a job-scoped privileged operation.
+///
+/// This deliberately exposes event IDs and state only. The trusted MCP never
+/// receives the lifecycle file path or any signing material.
+#[derive(Debug, Clone)]
+pub(super) struct PrivilegeSnapshot {
+    pub(super) accepted_event_id: String,
+    pub(super) head_event_id: String,
+    pub(super) pending_outbox: Option<Event>,
+    pub(super) cancel_event_id: Option<String>,
+    pub(super) terminal: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct LifecycleStore {
     path: PathBuf,
@@ -52,6 +65,10 @@ impl LifecycleStore {
             path: root.join(format!("{key}.lifecycle.json")),
             lock_path: root.join(format!("{key}.lifecycle.lock")),
         }
+    }
+
+    pub(super) fn privilege_lock_path(&self) -> PathBuf {
+        self.lock_path.with_extension("privilege.lock")
     }
 
     pub async fn initialize(&self, accepted_event_id: String) -> Result<(), LifecycleError> {
@@ -81,6 +98,21 @@ impl LifecycleStore {
         .await?
     }
 
+    pub(super) async fn privilege_snapshot(&self) -> Result<PrivilegeSnapshot, LifecycleError> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let state = store.with_lock(|| store.read())?;
+            Ok(PrivilegeSnapshot {
+                accepted_event_id: state.accepted_event_id,
+                head_event_id: state.head_event_id,
+                pending_outbox: state.outbox,
+                cancel_event_id: state.cancel_event_id,
+                terminal: state.terminal,
+            })
+        })
+        .await?
+    }
+
     pub async fn stage(
         &self,
         event: Event,
@@ -105,6 +137,24 @@ impl LifecycleStore {
         let store = self.clone();
         tokio::task::spawn_blocking(move || {
             store.observe_cancel_blocking(&event_id, &expected_head)
+        })
+        .await?
+    }
+
+    /// Adopt a relay-confirmed terminal event published outside `JobEmitter`.
+    ///
+    /// The caller must verify the signed event and its exact predecessor before
+    /// invoking this method. A stored terminal proves that any locally frozen
+    /// sibling for `expected_head` lost the relay's serialized transition slot.
+    #[cfg(test)]
+    pub(super) async fn observe_external_terminal(
+        &self,
+        event_id: String,
+        expected_head: String,
+    ) -> Result<(), LifecycleError> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            store.observe_external_terminal_blocking(&event_id, &expected_head)
         })
         .await?
     }
@@ -197,21 +247,59 @@ impl LifecycleStore {
                     "a different cancellation is already recorded".into(),
                 ));
             }
-            if state.outbox.is_some() {
-                return Err(LifecycleError::Invalid(
-                    "cannot record cancellation while a lifecycle event awaits acknowledgement"
-                        .into(),
-                ));
-            }
-            if state.head_event_id != expected_head {
+            let pending_is_predecessor = state
+                .outbox
+                .as_ref()
+                .is_some_and(|event| event.id.to_hex() == expected_head);
+            if state.head_event_id != expected_head && !pending_is_predecessor {
                 return Err(LifecycleError::Invalid(
                     "cancellation predecessor does not match the current lifecycle head".into(),
                 ));
             }
+            // `observe_cancel` is called only for a verified Cancel that the
+            // relay already stored. If the Cancel follows the frozen outbox,
+            // that predecessor must also have been stored even though its local
+            // confirmation had not completed. Otherwise, a frozen local sibling
+            // with the current head lost the relay's serialized transition slot.
+            // In both cases the exact Cancel is now authoritative, so retire the
+            // outbox instead of retrying an impossible transition forever.
+            state.outbox = None;
+            state.outbox_terminal = false;
             state.head_event_id = event_id.into();
             state.cancel_event_id = Some(event_id.into());
             replace_private(&self.path, &state)?;
             Ok(CancelDecision::Observed)
+        })
+    }
+
+    #[cfg(test)]
+    fn observe_external_terminal_blocking(
+        &self,
+        event_id: &str,
+        expected_head: &str,
+    ) -> Result<(), LifecycleError> {
+        self.with_lock(|| {
+            let mut state = self.read()?;
+            if state.terminal {
+                return (state.head_event_id == event_id)
+                    .then_some(())
+                    .ok_or_else(|| {
+                        LifecycleError::Invalid(
+                            "a different terminal event is already recorded".into(),
+                        )
+                    });
+            }
+            if state.head_event_id != expected_head {
+                return Err(LifecycleError::Invalid(
+                    "terminal predecessor does not match the current lifecycle head".into(),
+                ));
+            }
+            state.outbox = None;
+            state.outbox_terminal = false;
+            state.cancel_event_id = None;
+            state.head_event_id = event_id.into();
+            state.terminal = true;
+            replace_private(&self.path, &state)
         })
     }
 
@@ -454,6 +542,110 @@ mod tests {
         assert_eq!(head, cancel);
         assert!(pending.is_none());
         assert!(!terminal);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn stored_cancel_retires_a_frozen_losing_successor() {
+        let root = std::env::temp_dir().join(format!("buzz-lifecycle-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create root");
+        let store = LifecycleStore::new(&root, "job");
+        let accepted = "a".repeat(64);
+        store
+            .initialize(accepted.clone())
+            .await
+            .expect("initialize");
+        store
+            .stage(event("local sibling"), false, accepted.clone())
+            .await
+            .expect("freeze sibling");
+
+        let cancel = "b".repeat(64);
+        assert_eq!(
+            store
+                .observe_cancel(cancel.clone(), accepted)
+                .await
+                .expect("stored cancel wins"),
+            CancelDecision::Observed
+        );
+        let snapshot = store.privilege_snapshot().await.expect("snapshot");
+        assert_eq!(snapshot.head_event_id, cancel);
+        assert!(snapshot.pending_outbox.is_none());
+        assert!(snapshot.cancel_event_id.is_some());
+        assert!(!snapshot.terminal);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn stored_cancel_adopts_its_frozen_acknowledged_predecessor() {
+        let root = std::env::temp_dir().join(format!("buzz-lifecycle-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create root");
+        let store = LifecycleStore::new(&root, "job");
+        let accepted = "a".repeat(64);
+        store
+            .initialize(accepted.clone())
+            .await
+            .expect("initialize");
+        let marker = event("relay-acknowledged marker");
+        store
+            .stage(marker.clone(), false, accepted)
+            .await
+            .expect("freeze marker before local acknowledgement");
+
+        let cancel = "b".repeat(64);
+        assert_eq!(
+            store
+                .observe_cancel(cancel.clone(), marker.id.to_hex())
+                .await
+                .expect("Cancel proves its predecessor was relay stored"),
+            CancelDecision::Observed
+        );
+        let snapshot = store.privilege_snapshot().await.expect("snapshot");
+        assert_eq!(snapshot.head_event_id, cancel);
+        assert!(snapshot.pending_outbox.is_none());
+        assert!(snapshot.cancel_event_id.is_some());
+        assert!(!snapshot.terminal);
+        assert!(
+            store.confirm(marker.id.to_hex()).await.is_err(),
+            "the delayed local marker confirmation must lose to Cancel"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn relay_confirmed_external_terminal_is_idempotent_and_retires_sibling() {
+        let root = std::env::temp_dir().join(format!("buzz-lifecycle-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create root");
+        let store = LifecycleStore::new(&root, "job");
+        let accepted = "a".repeat(64);
+        store
+            .initialize(accepted.clone())
+            .await
+            .expect("initialize");
+        store
+            .stage(event("local sibling"), false, accepted.clone())
+            .await
+            .expect("freeze sibling");
+
+        let handoff = "c".repeat(64);
+        store
+            .observe_external_terminal(handoff.clone(), accepted.clone())
+            .await
+            .expect("adopt handoff");
+        store
+            .observe_external_terminal(handoff.clone(), accepted)
+            .await
+            .expect("exact replay");
+        let snapshot = store.privilege_snapshot().await.expect("snapshot");
+        assert_eq!(snapshot.accepted_event_id, "a".repeat(64));
+        assert_eq!(snapshot.head_event_id, handoff);
+        assert!(snapshot.pending_outbox.is_none());
+        assert!(snapshot.cancel_event_id.is_none());
+        assert!(snapshot.terminal);
+        assert!(store
+            .observe_external_terminal("d".repeat(64), "a".repeat(64))
+            .await
+            .is_err());
         std::fs::remove_dir_all(root).ok();
     }
 }

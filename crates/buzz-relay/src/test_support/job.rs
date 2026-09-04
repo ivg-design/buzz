@@ -3,10 +3,14 @@ use std::sync::Arc;
 use buzz_core::channel::{ChannelType, ChannelVisibility, MemberRole};
 use buzz_core::job::{
     build_job_tags, semantic_request_digest, JobAccepted, JobClaim, JobClaimStatus, JobCommon,
-    JobEvent, JobFollowup, JobProgress, JobProgressStatus, JobProject, JobRepository, JobRequest,
-    JobSponsor, JOB_SCHEMA_VERSION,
+    JobControl, JobControlAction, JobError, JobErrorOutcome, JobEvent, JobFollowup, JobProgress,
+    JobProgressStatus, JobProject, JobRepository, JobRequest, JobResult, JobSponsor,
+    JobSuccessOutcome, JOB_SCHEMA_VERSION,
 };
-use buzz_core::kind::{KIND_JOB_ACCEPTED, KIND_JOB_PROGRESS, KIND_JOB_REQUEST, KIND_PROJECT};
+use buzz_core::kind::{
+    KIND_JOB_ACCEPTED, KIND_JOB_CANCEL, KIND_JOB_ERROR, KIND_JOB_PROGRESS, KIND_JOB_REQUEST,
+    KIND_JOB_RESULT, KIND_PROJECT,
+};
 use buzz_core::TenantContext;
 use chrono::{Duration, SecondsFormat, Utc};
 use nostr::{Event, EventBuilder, Keys, Kind, Tag};
@@ -284,6 +288,79 @@ impl JobFixture {
             evidence: vec![],
         });
         signed_job_event(&job, &self.worker, KIND_JOB_PROGRESS)
+    }
+
+    pub(crate) fn result(&self, request: &Event, prior: &Event) -> Event {
+        let job = JobEvent::Result(JobResult {
+            followup: JobFollowup {
+                common: self.worker_common(request),
+                request_event_id: request.id.to_hex(),
+                prior_event_id: Some(prior.id.to_hex()),
+            },
+            outcome: JobSuccessOutcome::Success,
+            candidate_sha: None,
+            artifacts: vec![],
+            evidence: vec![],
+            capabilities: vec![],
+        });
+        signed_job_event(&job, &self.worker, KIND_JOB_RESULT)
+    }
+
+    pub(crate) fn error(
+        &self,
+        request: &Event,
+        prior: &Event,
+        outcome: JobErrorOutcome,
+        code: &str,
+        message: &str,
+    ) -> Event {
+        let job = JobEvent::Error(JobError {
+            followup: JobFollowup {
+                common: self.worker_common(request),
+                request_event_id: request.id.to_hex(),
+                prior_event_id: Some(prior.id.to_hex()),
+            },
+            outcome,
+            code: code.into(),
+            message: message.into(),
+            retryable: false,
+        });
+        signed_job_event(&job, &self.worker, KIND_JOB_ERROR)
+    }
+
+    pub(crate) fn cancel(&self, request: &Event, prior: &Event) -> Event {
+        let job = JobEvent::Control(JobControl {
+            followup: JobFollowup {
+                common: self.request_common_from_event(request),
+                request_event_id: request.id.to_hex(),
+                prior_event_id: Some(prior.id.to_hex()),
+            },
+            action: JobControlAction::Cancel,
+            reason: "stop".into(),
+            handoff_to: None,
+        });
+        signed_job_event(&job, &self.requester, KIND_JOB_CANCEL)
+    }
+
+    pub(crate) fn cancelled(&self, request: &Event, prior: &Event) -> Event {
+        let job = JobEvent::Control(JobControl {
+            followup: JobFollowup {
+                common: self.worker_common(request),
+                request_event_id: request.id.to_hex(),
+                prior_event_id: Some(prior.id.to_hex()),
+            },
+            action: JobControlAction::Cancelled,
+            reason: "quiesced".into(),
+            handoff_to: None,
+        });
+        signed_job_event(&job, &self.worker, KIND_JOB_CANCEL)
+    }
+
+    fn request_common_from_event(&self, request: &Event) -> JobCommon {
+        JobEvent::parse(request)
+            .expect("parse fixture request")
+            .common()
+            .clone()
     }
 }
 

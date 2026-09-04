@@ -136,6 +136,116 @@ const GNUPG_PREFIX: &str = "[GNUPG:] ";
 /// we read payload from it.
 const MIN_STATUS_FD: i32 = 1;
 
+/// Successful result from [`sign_payload`].
+///
+/// The private key is never retained in or returned from this value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedPayload {
+    /// Canonical NIP-GS signature, including the PEM-style armor markers.
+    pub armored_signature: String,
+    /// Lowercase hexadecimal BIP-340 public key that created the signature.
+    pub signer_public_key: String,
+}
+
+/// Result of validating an optional NIP-OA owner authorization embedded in a
+/// NIP-GS signature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnerAuthorizationStatus {
+    /// The signature does not contain an owner authorization.
+    Absent,
+    /// The owner authorization signature and applicable conditions are valid.
+    Valid,
+    /// The owner authorization signature is invalid. The NIP-GS payload
+    /// signature itself may still be valid.
+    InvalidSignature,
+    /// The owner authorization is authentic but contains a `kind=` condition,
+    /// which has no applicable event kind in the NIP-GS Git signing context.
+    KindNotApplicable,
+    /// The owner authorization is authentic but its time conditions are not
+    /// satisfied by the signature timestamp.
+    ConditionsViolated,
+}
+
+impl OwnerAuthorizationStatus {
+    /// Machine-readable value used by the GnuPG compatibility interface.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Absent => "none",
+            Self::Valid => "valid",
+            Self::InvalidSignature => "invalid_signature",
+            Self::KindNotApplicable => "kind_not_applicable",
+            Self::ConditionsViolated => "expired",
+        }
+    }
+}
+
+/// Successful result from [`verify_payload`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedPayload {
+    /// Lowercase hexadecimal BIP-340 public key that signed the payload.
+    pub signer_public_key: String,
+    /// Timestamp committed to by the NIP-GS signature envelope.
+    pub timestamp: u64,
+    /// Owner public key from the optional NIP-OA authorization.
+    pub owner_public_key: Option<String>,
+    /// Conditions from the optional NIP-OA authorization.
+    pub owner_conditions: Option<String>,
+    /// Validation result for the optional NIP-OA authorization.
+    pub owner_authorization_status: OwnerAuthorizationStatus,
+}
+
+/// Error returned by the in-process NIP-GS API.
+///
+/// Error messages intentionally never include private key material.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NipGsError {
+    message: String,
+    signer_public_key: Option<String>,
+    invalid_signature: bool,
+}
+
+impl NipGsError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            signer_public_key: None,
+            invalid_signature: false,
+        }
+    }
+
+    fn verification(
+        message: impl Into<String>,
+        signer_public_key: Option<String>,
+        invalid_signature: bool,
+    ) -> Self {
+        Self {
+            message: message.into(),
+            signer_public_key,
+            invalid_signature,
+        }
+    }
+
+    /// Best-effort signer identity recovered from a malformed or invalid
+    /// signature envelope.
+    pub fn signer_public_key(&self) -> Option<&str> {
+        self.signer_public_key.as_deref()
+    }
+
+    /// Whether the envelope was well formed but its payload signature failed
+    /// cryptographic verification.
+    pub fn is_invalid_signature(&self) -> bool {
+        self.invalid_signature
+    }
+}
+
+impl std::fmt::Display for NipGsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for NipGsError {}
+
 /// Top-level error type. All failures flow through here so `main()` can
 /// handle cleanup (zeroization, status-fd reporting) before exiting.
 #[derive(Debug)]
@@ -153,30 +263,6 @@ impl std::fmt::Display for Error {
             Error::Fatal(msg) => write!(f, "{msg}"),
             Error::VerifyFailed { pk: Some(pk), msg } => write!(f, "{msg} [key: {pk}]"),
             Error::VerifyFailed { pk: None, msg } => write!(f, "{msg}"),
-        }
-    }
-}
-
-/// Result of NIP-OA verification during signature verification.
-enum OaVerifyResult {
-    /// No OA present in the signature (optional field).
-    Absent,
-    /// OA present, signature valid, conditions satisfied.
-    Valid,
-    /// OA present but cryptographic verification failed.
-    InvalidSignature,
-    /// OA present, signature valid, but temporal conditions violated.
-    ConditionsViolated,
-}
-
-impl OaVerifyResult {
-    /// Return the machine-readable status string for NOTATION_DATA output.
-    fn as_status_str(&self) -> &'static str {
-        match self {
-            OaVerifyResult::Absent => "none",
-            OaVerifyResult::Valid => "valid",
-            OaVerifyResult::InvalidSignature => "invalid_signature",
-            OaVerifyResult::ConditionsViolated => "expired",
         }
     }
 }
@@ -464,13 +550,14 @@ fn load_auth_tag() -> Result<Option<(String, String, String)>, Error> {
     // NIP-GS spec: check env var first, then git config.
     // Use git_config_strict for auth tag to fail closed on read errors —
     // a configured-but-unreadable auth tag must not be silently omitted.
-    let json_str = match std::env::var("BUZZ_AUTH_TAG")
+    let json_str: Option<zeroize::Zeroizing<String>> = match std::env::var("BUZZ_AUTH_TAG")
         .ok()
         .filter(|s| !s.is_empty())
     {
-        Some(val) => Some(val),
+        Some(val) => Some(zeroize::Zeroizing::new(val)),
         None => git_config_strict("nostr.authtag")
-            .map_err(|e| Error::Fatal(format!("failed to read nostr.authtag: {e}")))?,
+            .map_err(|e| Error::Fatal(format!("failed to read nostr.authtag: {e}")))?
+            .map(zeroize::Zeroizing::new),
     };
 
     let json_str = match json_str {
@@ -478,51 +565,55 @@ fn load_auth_tag() -> Result<Option<(String, String, String)>, Error> {
         None => return Ok(None),
     };
 
+    parse_auth_tag_json(&json_str)
+        .map(Some)
+        .map_err(Error::Fatal)
+}
+
+/// Parse the external NIP-OA tag representation used by `BUZZ_AUTH_TAG` and
+/// `nostr.authtag`.
+///
+/// Keeping this parser independent of environment and git-config access lets
+/// the in-process API apply exactly the same validation as the CLI without
+/// placing authorization material in process-global state.
+fn parse_auth_tag_json(json_str: &str) -> Result<(String, String, String), String> {
     // Cap auth tag at 1024 bytes. A valid NIP-OA tag is ~300 bytes; 1024
     // allows generous headroom while bounding memory use from malformed input.
     const MAX_AUTH_TAG: usize = 1024;
     if json_str.len() > MAX_AUTH_TAG {
-        return Err(Error::Fatal(format!(
-            "auth tag exceeds {MAX_AUTH_TAG}-byte size limit"
-        )));
+        return Err(format!("auth tag exceeds {MAX_AUTH_TAG}-byte size limit"));
     }
 
     // Parse: ["auth", "<owner>", "<conditions>", "<sig>"]
-    let arr: serde_json::Value = serde_json::from_str(&json_str)
-        .map_err(|e| Error::Fatal(format!("BUZZ_AUTH_TAG is not valid JSON: {e}")))?;
+    let arr: serde_json::Value = serde_json::from_str(json_str)
+        .map_err(|e| format!("BUZZ_AUTH_TAG is not valid JSON: {e}"))?;
     let arr = arr
         .as_array()
-        .ok_or_else(|| Error::Fatal("BUZZ_AUTH_TAG must be a JSON array".to_string()))?;
+        .ok_or_else(|| "BUZZ_AUTH_TAG must be a JSON array".to_string())?;
     if arr.len() != 4 {
-        return Err(Error::Fatal(
-            "BUZZ_AUTH_TAG must have exactly 4 elements".to_string(),
-        ));
+        return Err("BUZZ_AUTH_TAG must have exactly 4 elements".to_string());
     }
     if arr[0].as_str() != Some("auth") {
-        return Err(Error::Fatal(
-            "BUZZ_AUTH_TAG[0] must be \"auth\"".to_string(),
-        ));
+        return Err("BUZZ_AUTH_TAG[0] must be \"auth\"".to_string());
     }
 
     let owner = arr[1]
         .as_str()
-        .ok_or_else(|| Error::Fatal("BUZZ_AUTH_TAG[1] must be a string".to_string()))?
+        .ok_or_else(|| "BUZZ_AUTH_TAG[1] must be a string".to_string())?
         .to_string();
     let conditions = arr[2]
         .as_str()
-        .ok_or_else(|| Error::Fatal("BUZZ_AUTH_TAG[2] must be a string".to_string()))?
+        .ok_or_else(|| "BUZZ_AUTH_TAG[2] must be a string".to_string())?
         .to_string();
     let sig = arr[3]
         .as_str()
-        .ok_or_else(|| Error::Fatal("BUZZ_AUTH_TAG[3] must be a string".to_string()))?
+        .ok_or_else(|| "BUZZ_AUTH_TAG[3] must be a string".to_string())?
         .to_string();
 
     // Validate conditions character class per NIP-OA: empty string is valid,
     // otherwise only ASCII alphanumeric + '_' + '=' + '<' + '>' + '&' allowed.
     if !validate_conditions(&conditions) {
-        return Err(Error::Fatal(
-            "BUZZ_AUTH_TAG conditions contain invalid characters".to_string(),
-        ));
+        return Err("BUZZ_AUTH_TAG conditions contain invalid characters".to_string());
     }
 
     // Validate hex fields
@@ -531,21 +622,17 @@ fn load_auth_tag() -> Result<Option<(String, String, String)>, Error> {
             .bytes()
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
     {
-        return Err(Error::Fatal(
-            "BUZZ_AUTH_TAG owner must be 64 lowercase hex chars".to_string(),
-        ));
+        return Err("BUZZ_AUTH_TAG owner must be 64 lowercase hex chars".to_string());
     }
     if sig.len() != 128
         || !sig
             .bytes()
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
     {
-        return Err(Error::Fatal(
-            "BUZZ_AUTH_TAG signature must be 128 lowercase hex chars".to_string(),
-        ));
+        return Err("BUZZ_AUTH_TAG signature must be 128 lowercase hex chars".to_string());
     }
 
-    Ok(Some((owner, conditions, sig)))
+    Ok((owner, conditions, sig))
 }
 
 /// Validate NIP-OA conditions string with structural parsing.
@@ -940,52 +1027,284 @@ fn armor(json_bytes: &[u8]) -> String {
     format!("{ARMOR_BEGIN}\n{b64}\n{ARMOR_END}\n")
 }
 
-fn do_sign(key_id: &str, status: &mut StatusWriter) -> Result<(), Error> {
-    // Load key (zeroized on drop)
-    let mut raw_key = load_key()?;
+fn validate_payload_size(payload: &[u8]) -> Result<(), NipGsError> {
+    if payload.len() > MAX_PAYLOAD {
+        return Err(NipGsError::new(format!(
+            "payload exceeds {} MB limit",
+            MAX_PAYLOAD / (1024 * 1024)
+        )));
+    }
+    Ok(())
+}
 
-    // Parse directly into SecretKey — avoids nostr::Keys which stores
-    // non-zeroizable copies of the secret material internally.
-    let mut secret_key = match SecretKey::parse(&raw_key) {
-        Ok(k) => k,
-        Err(e) => {
-            raw_key.zeroize();
-            return Err(Error::Fatal(format!("invalid nostr private key: {e}")));
-        }
-    };
-    raw_key.zeroize();
+fn current_nip_gs_timestamp() -> Result<u64, NipGsError> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| NipGsError::new("system clock is before Unix epoch"))?
+        .as_secs();
+    if timestamp > u32::MAX as u64 {
+        return Err(NipGsError::new(format!(
+            "timestamp {timestamp} exceeds NIP-GS u32 range (max {})",
+            u32::MAX
+        )));
+    }
+    Ok(timestamp)
+}
 
-    // Derive public key for envelope and key-id matching.
-    // Drop secret_key immediately after creating the keypair so it doesn't
-    // linger on the stack through the rest of the function.
-    // Wrapped in KeypairGuard so non_secure_erase() runs on ALL exit paths.
+fn sign_payload_at(
+    payload: &[u8],
+    private_key: &str,
+    auth_tag: Option<&(String, String, String)>,
+    timestamp: u64,
+) -> Result<SignedPayload, NipGsError> {
+    validate_payload_size(payload)?;
+    if private_key.len() > 128 {
+        return Err(NipGsError::new(
+            "nostr private key exceeds 128-byte size limit",
+        ));
+    }
+    if timestamp > u32::MAX as u64 {
+        return Err(NipGsError::new(format!(
+            "timestamp {timestamp} exceeds NIP-GS u32 range (max {})",
+            u32::MAX
+        )));
+    }
+
+    let private_key = private_key.trim();
+    if private_key.is_empty() {
+        return Err(NipGsError::new("nostr private key is empty"));
+    }
+
+    // Parse directly into SecretKey rather than nostr::Keys, which retains
+    // additional non-zeroizable copies of the secret.
+    let mut secret_key = SecretKey::parse(private_key)
+        .map_err(|e| NipGsError::new(format!("invalid nostr private key: {e}")))?;
     let keypair = KeypairGuard::new(Keypair::from_secret_key(SECP256K1, &secret_key));
-    // Explicitly zero the SecretKey stack slot before dropping. nostr::SecretKey's
-    // Drop calls inner.non_secure_erase(), but that operates on the moved value.
-    // This write_bytes targets our local copy to minimize residual secret material.
-    // SAFETY: We have exclusive mutable access to `secret_key` on the stack.
-    // write_bytes zeroes size_of::<SecretKey>() bytes at the local's address.
-    // The subsequent drop is a no-op on zeroed memory (non_secure_erase on zeros).
+    // Match the CLI's best-effort stack erasure once the keypair exists.
+    // SAFETY: `secret_key` is exclusively borrowed and no later code reads it.
     unsafe {
         let ptr = &mut secret_key as *mut SecretKey as *mut u8;
         std::ptr::write_bytes(ptr, 0, std::mem::size_of::<SecretKey>());
     }
     drop(secret_key);
-    let (xonly_pk, _parity) = keypair.inner().x_only_public_key();
-    let pk_hex = hex::encode(xonly_pk.serialize());
 
-    // Verify key matches the -u argument. Fail closed: if the key_id is
-    // non-empty and in a recognized format, it MUST match the loaded key.
-    // If the format is unrecognized, we also fail — better to reject than
-    // to silently sign with the wrong key.
+    let (xonly_pk, _parity) = keypair.inner().x_only_public_key();
+    let signer_public_key = hex::encode(xonly_pk.serialize());
+
+    if let Some(auth_tag) = auth_tag {
+        if PublicKey::from_hex(&auth_tag.0).is_err() {
+            return Err(NipGsError::new(
+                "auth tag owner (oa[0]) is not a valid BIP-340 public key",
+            ));
+        }
+        if auth_tag.0 == signer_public_key {
+            return Err(NipGsError::new(
+                "auth tag owner (oa[0]) must not equal signing key (self-attestation)",
+            ));
+        }
+        if !verify_oa(&signer_public_key, auth_tag) {
+            return Err(NipGsError::new(
+                "auth tag owner signature (oa[2]) verification failed — the configured \
+                 BUZZ_AUTH_TAG is invalid or stale",
+            ));
+        }
+        enforce_conditions(&auth_tag.1, timestamp).map_err(|message| {
+            NipGsError::new(format!("auth tag conditions not satisfied: {message}"))
+        })?;
+    }
+
+    let hash = compute_signing_hash(timestamp, auth_tag, payload);
+    let message = Message::from_digest(hash);
+    let signature = SECP256K1.sign_schnorr(&message, keypair.inner());
+    let signature_hex = hex::encode(signature.serialize());
+    drop(keypair);
+
+    let json = build_envelope(&signer_public_key, &signature_hex, timestamp, auth_tag);
+    Ok(SignedPayload {
+        armored_signature: armor(json.as_bytes()),
+        signer_public_key,
+    })
+}
+
+/// Sign an arbitrary payload with NIP-GS without using process environment,
+/// command-line arguments, helper executables, or secret files.
+///
+/// `private_key` may be a lowercase hexadecimal secret key or an `nsec`
+/// string. `auth_tag_json`, when present, must use the same four-element JSON
+/// representation accepted by `BUZZ_AUTH_TAG`. An empty auth-tag string is
+/// treated as absent, matching the CLI environment/config behavior.
+pub fn sign_payload(
+    payload: &[u8],
+    private_key: &str,
+    auth_tag_json: Option<&str>,
+) -> Result<SignedPayload, NipGsError> {
+    let auth_tag = match auth_tag_json.filter(|value| !value.is_empty()) {
+        Some(value) => Some(parse_auth_tag_json(value).map_err(NipGsError::new)?),
+        None => None,
+    };
+    sign_payload_at(
+        payload,
+        private_key,
+        auth_tag.as_ref(),
+        current_nip_gs_timestamp()?,
+    )
+}
+
+fn decode_signature(armored_signature: &str) -> Result<Envelope, NipGsError> {
+    if armored_signature.len() > MAX_SIG_FILE {
+        return Err(NipGsError::new(format!(
+            "signature exceeds {MAX_SIG_FILE}-byte size limit"
+        )));
+    }
+
+    let base64 = parse_armor(armored_signature).map_err(NipGsError::new)?;
+    if base64.len() > MAX_BASE64_LINE {
+        return Err(NipGsError::new(format!(
+            "base64 line exceeds {MAX_BASE64_LINE} bytes"
+        )));
+    }
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(base64.as_bytes())
+        .map_err(|e| NipGsError::new(format!("invalid base64: {e}")))?;
+    if decoded.len() > MAX_JSON_DECODED {
+        return Err(NipGsError::new(format!(
+            "decoded JSON exceeds {MAX_JSON_DECODED} bytes"
+        )));
+    }
+    let json = std::str::from_utf8(&decoded)
+        .map_err(|_| NipGsError::new("decoded bytes are not valid UTF-8"))?;
+    let early_signer = extract_pk_best_effort(json);
+    if has_non_string_whitespace(json) {
+        return Err(NipGsError::verification(
+            "JSON contains whitespace outside string values",
+            early_signer,
+            false,
+        ));
+    }
+    let envelope = parse_envelope(json)
+        .map_err(|message| NipGsError::verification(message, early_signer.clone(), false))?;
+    let reconstructed = build_envelope(
+        &envelope.pk,
+        &envelope.sig,
+        envelope.t,
+        envelope.oa.as_ref(),
+    );
+    if reconstructed != json {
+        return Err(NipGsError::verification(
+            "JSON is not in canonical form",
+            Some(envelope.pk),
+            false,
+        ));
+    }
+    Ok(envelope)
+}
+
+fn verify_decoded_payload(
+    payload: &[u8],
+    envelope: &Envelope,
+) -> Result<VerifiedPayload, NipGsError> {
+    validate_payload_size(payload)?;
+    let public_key = PublicKey::from_hex(&envelope.pk).map_err(|e| {
+        NipGsError::verification(
+            format!("pk is not a valid BIP-340 public key: {e}"),
+            Some(envelope.pk.clone()),
+            false,
+        )
+    })?;
+    let hash = compute_signing_hash(envelope.t, envelope.oa.as_ref(), payload);
+    let message = Message::from_digest(hash);
+    let signature_bytes = hex::decode(&envelope.sig).map_err(|_| {
+        NipGsError::verification("invalid signature hex", Some(envelope.pk.clone()), true)
+    })?;
+    let signature = Signature::from_slice(&signature_bytes).map_err(|_| {
+        NipGsError::verification("invalid BIP-340 signature", Some(envelope.pk.clone()), true)
+    })?;
+    let xonly = public_key.xonly().map_err(|_| {
+        NipGsError::verification(
+            "invalid public key xonly conversion",
+            Some(envelope.pk.clone()),
+            false,
+        )
+    })?;
+    if SECP256K1
+        .verify_schnorr(&signature, &message, &xonly)
+        .is_err()
+    {
+        return Err(NipGsError::verification(
+            "BIP-340 signature verification failed",
+            Some(envelope.pk.clone()),
+            true,
+        ));
+    }
+
+    let owner_authorization_status = match envelope.oa.as_ref() {
+        None => OwnerAuthorizationStatus::Absent,
+        Some(auth_tag) if !verify_oa(&envelope.pk, auth_tag) => {
+            OwnerAuthorizationStatus::InvalidSignature
+        }
+        Some(auth_tag) if has_kind_clause(&auth_tag.1) => {
+            OwnerAuthorizationStatus::KindNotApplicable
+        }
+        Some(auth_tag) if enforce_conditions(&auth_tag.1, envelope.t).is_err() => {
+            OwnerAuthorizationStatus::ConditionsViolated
+        }
+        Some(_) => OwnerAuthorizationStatus::Valid,
+    };
+    let owner_public_key = envelope.oa.as_ref().map(|auth_tag| auth_tag.0.clone());
+    let owner_conditions = envelope.oa.as_ref().map(|auth_tag| auth_tag.1.clone());
+
+    Ok(VerifiedPayload {
+        signer_public_key: envelope.pk.clone(),
+        timestamp: envelope.t,
+        owner_public_key,
+        owner_conditions,
+        owner_authorization_status,
+    })
+}
+
+/// Verify an armored NIP-GS signature over an arbitrary payload entirely in
+/// process.
+///
+/// Malformed envelopes and invalid payload signatures return an error. An
+/// An invalid, expired, or Git-inapplicable optional NIP-OA authorization is
+/// reported separately in [`VerifiedPayload::owner_authorization_status`],
+/// matching the CLI rule that owner authorization does not change the payload
+/// signature's validity.
+pub fn verify_payload(
+    payload: &[u8],
+    armored_signature: &str,
+) -> Result<VerifiedPayload, NipGsError> {
+    let envelope = decode_signature(armored_signature)?;
+    verify_decoded_payload(payload, &envelope)
+}
+
+fn do_sign(key_id: &str, status: &mut StatusWriter) -> Result<(), Error> {
+    // Load key into a zeroizing buffer. The shared in-process implementation
+    // only borrows it and never places it in argv, env, or a file.
+    let mut raw_key = load_key()?;
+    let payload = read_payload_stdin()?;
+    let timestamp = current_nip_gs_timestamp().map_err(|error| Error::Fatal(error.to_string()))?;
+    let oa = load_auth_tag()?;
+    if let Some(ref oa_val) = oa {
+        if has_kind_clause(&oa_val.1) {
+            eprintln!("warning: auth tag contains kind= constraints which are not enforced in git signing context");
+        }
+    }
+
+    let signed = sign_payload_at(&payload, &raw_key, oa.as_ref(), timestamp);
+    raw_key.zeroize();
+    let signed = signed.map_err(|error| Error::Fatal(error.to_string()))?;
+
+    // Verify key matches the -u argument. Fail closed for unknown key formats
+    // and mismatches, just as the original CLI-only path did.
     if !key_id.is_empty() {
         match normalize_key_id(key_id) {
-            Some(expected_hex) => {
-                if expected_hex != pk_hex {
-                    return Err(Error::Fatal(format!(
-                        "signing key argument ({key_id}) does not match loaded key ({pk_hex})"
-                    )));
-                }
+            Some(expected_hex) if expected_hex == signed.signer_public_key => {}
+            Some(_) => {
+                return Err(Error::Fatal(format!(
+                    "signing key argument ({key_id}) does not match loaded key ({})",
+                    signed.signer_public_key
+                )));
             }
             None => {
                 return Err(Error::Fatal(format!(
@@ -996,77 +1315,11 @@ fn do_sign(key_id: &str, status: &mut StatusWriter) -> Result<(), Error> {
         }
     }
 
-    // Read payload from stdin (bounded)
-    let payload = read_payload_stdin()?;
-
-    // Get timestamp — capped at u32::MAX per NIP-GS spec range [0, 4294967295]
-    let t = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| Error::Fatal("system clock is before Unix epoch".to_string()))?
-        .as_secs();
-    if t > u32::MAX as u64 {
-        return Err(Error::Fatal(format!(
-            "timestamp {t} exceeds NIP-GS u32 range (max {})",
-            u32::MAX
-        )));
-    }
-
-    // Load optional auth tag — fails closed if configured but malformed.
-    // Validate the credential before embedding: check owner key validity,
-    // reject self-attestation, and verify the owner's signature.
-    let oa = load_auth_tag()?;
-    if let Some(ref oa_val) = oa {
-        // Owner pubkey must be a valid BIP-340 key
-        if PublicKey::from_hex(&oa_val.0).is_err() {
-            return Err(Error::Fatal(
-                "auth tag owner (oa[0]) is not a valid BIP-340 public key".to_string(),
-            ));
-        }
-        // Owner must not be the signer (self-attestation is meaningless)
-        if oa_val.0 == pk_hex {
-            return Err(Error::Fatal(
-                "auth tag owner (oa[0]) must not equal signing key (self-attestation)".to_string(),
-            ));
-        }
-        // Verify the owner's signature over the auth credential
-        if !verify_oa(&pk_hex, oa_val) {
-            return Err(Error::Fatal(
-                "auth tag owner signature (oa[2]) verification failed — \
-                 the configured BUZZ_AUTH_TAG is invalid or stale"
-                    .to_string(),
-            ));
-        }
-    }
-
-    // Enforce time constraints from auth tag conditions against signing timestamp.
-    // This prevents embedding a stale/expired auth tag into a new signature.
-    if let Some(ref oa_val) = oa {
-        enforce_conditions(&oa_val.1, t)
-            .map_err(|msg| Error::Fatal(format!("auth tag conditions not satisfied: {msg}")))?;
-        if has_kind_clause(&oa_val.1) {
-            eprintln!("warning: auth tag contains kind= constraints which are not enforced in git signing context");
-        }
-    }
-
-    // Compute signing hash
-    let hash = compute_signing_hash(t, oa.as_ref(), &payload);
-    let message = Message::from_digest(hash);
-
-    // Sign with BIP-340 Schnorr using the keypair (guarded — erased on drop).
-    let sig = SECP256K1.sign_schnorr(&message, keypair.inner());
-    let sig_hex = hex::encode(sig.serialize());
-    // Keypair is erased by KeypairGuard::drop; drop it now that signing is done.
-    drop(keypair);
-
-    // Build envelope and armor
-    let json = build_envelope(&pk_hex, &sig_hex, t, oa.as_ref());
-    let armored = armor(json.as_bytes());
-
     // Write signature to stdout — errors are fatal because git reads
     // the signature from our stdout. Use write_all (not print!) to avoid
     // panicking on broken pipe.
     io::stdout()
-        .write_all(armored.as_bytes())
+        .write_all(signed.armored_signature.as_bytes())
         .and_then(|_| io::stdout().flush())
         .map_err(|e| Error::Fatal(format!("failed to write signature to stdout: {e}")))?;
 
@@ -1074,7 +1327,10 @@ fn do_sign(key_id: &str, status: &mut StatusWriter) -> Result<(), Error> {
     // - SIG_CREATED: D=detached, 8=algo(EdDSA placeholder), 1=hash(SHA256),
     //   00=class, timestamp, fingerprint
     status.write_line("BEGIN_SIGNING");
-    status.write_line(&format!("SIG_CREATED D 8 1 00 {t} {pk_hex}"));
+    status.write_line(&format!(
+        "SIG_CREATED D 8 1 00 {timestamp} {}",
+        signed.signer_public_key
+    ));
 
     Ok(())
 }
@@ -1097,183 +1353,53 @@ fn extract_pk_best_effort(json_str: &str) -> Option<String> {
 }
 
 fn do_verify(sig_file: &str, status: &mut StatusWriter) -> Result<(), Error> {
-    // Read signature file with size bound
-    let sig_content = read_bounded_file(sig_file, MAX_SIG_FILE).inspect_err(|_e| {
+    let sig_content = read_bounded_file(sig_file, MAX_SIG_FILE).inspect_err(|_error| {
         write_errsig(status, None);
     })?;
-
-    // Parse armor
-    let b64 = parse_armor(&sig_content).map_err(|e| {
-        write_errsig(status, None);
+    let envelope = decode_signature(&sig_content).map_err(|error| {
+        write_errsig(status, error.signer_public_key());
         Error::VerifyFailed {
-            pk: None,
-            msg: e.to_string(),
+            pk: error.signer_public_key().map(str::to_owned),
+            msg: error.to_string(),
         }
     })?;
-
-    // Validate base64 line length
-    if b64.len() > MAX_BASE64_LINE {
-        write_errsig(status, None);
-        return Err(Error::VerifyFailed {
-            pk: None,
-            msg: format!("base64 line exceeds {MAX_BASE64_LINE} bytes"),
-        });
-    }
-
-    // Decode base64
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(b64.as_bytes())
-        .map_err(|e| {
-            write_errsig(status, None);
-            Error::VerifyFailed {
-                pk: None,
-                msg: format!("invalid base64: {e}"),
+    let payload = read_payload_stdin().inspect_err(|_error| {
+        write_errsig(status, Some(&envelope.pk));
+    })?;
+    let verified = verify_decoded_payload(&payload, &envelope).map_err(|error| {
+        if error.is_invalid_signature() {
+            if let Some(public_key) = error.signer_public_key() {
+                status.write_line("NEWSIG");
+                status.write_line(&format!("BADSIG {public_key} {public_key}"));
+            } else {
+                write_errsig(status, None);
             }
-        })?;
-
-    // Check decoded size limit
-    if decoded.len() > MAX_JSON_DECODED {
-        write_errsig(status, None);
-        return Err(Error::VerifyFailed {
-            pk: None,
-            msg: format!("decoded JSON exceeds {MAX_JSON_DECODED} bytes"),
-        });
-    }
-
-    // Validate UTF-8
-    let json_str = std::str::from_utf8(&decoded).map_err(|_| {
-        write_errsig(status, None);
-        Error::VerifyFailed {
-            pk: None,
-            msg: "decoded bytes are not valid UTF-8".to_string(),
-        }
-    })?;
-
-    // Reject whitespace outside string values (compact JSON check)
-    if has_non_string_whitespace(json_str) {
-        let early_pk = extract_pk_best_effort(json_str);
-        write_errsig(status, early_pk.as_deref());
-        return Err(Error::VerifyFailed {
-            pk: early_pk,
-            msg: "JSON contains whitespace outside string values".to_string(),
-        });
-    }
-
-    // Best-effort pk extraction for ERRSIG before full parse
-    let early_pk = extract_pk_best_effort(json_str);
-
-    // Parse JSON envelope
-    let envelope = parse_envelope(json_str).map_err(|e| {
-        write_errsig(status, early_pk.as_deref());
-        Error::VerifyFailed {
-            pk: early_pk.clone(),
-            msg: e.to_string(),
-        }
-    })?;
-
-    // Canonical JSON reconstruction check — ensures no field reordering or
-    // extra whitespace was present in the original.
-    let reconstructed = build_envelope(
-        &envelope.pk,
-        &envelope.sig,
-        envelope.t,
-        envelope.oa.as_ref(),
-    );
-    if reconstructed != json_str {
-        write_errsig(status, Some(&envelope.pk));
-        return Err(Error::VerifyFailed {
-            pk: Some(envelope.pk),
-            msg: "JSON is not in canonical form".to_string(),
-        });
-    }
-
-    // Validate pk is a valid BIP-340 x-only public key
-    let pk = PublicKey::from_hex(&envelope.pk).map_err(|e| {
-        write_errsig(status, Some(&envelope.pk));
-        Error::VerifyFailed {
-            pk: Some(envelope.pk.clone()),
-            msg: format!("pk is not a valid BIP-340 public key: {e}"),
-        }
-    })?;
-
-    // Read payload from stdin (bounded). Emit ERRSIG on failure since we
-    // already have the pk from the envelope.
-    let payload = read_payload_stdin().inspect_err(|_e| {
-        write_errsig(status, Some(&envelope.pk));
-    })?;
-
-    // Compute signing hash
-    let hash = compute_signing_hash(envelope.t, envelope.oa.as_ref(), &payload);
-    let message = Message::from_digest(hash);
-
-    // Parse signature
-    let sig_bytes = hex::decode(&envelope.sig).map_err(|_| {
-        write_errsig(status, Some(&envelope.pk));
-        Error::VerifyFailed {
-            pk: Some(envelope.pk.clone()),
-            msg: "invalid signature hex".to_string(),
-        }
-    })?;
-    let sig = Signature::from_slice(&sig_bytes).map_err(|_| {
-        write_errsig(status, Some(&envelope.pk));
-        Error::VerifyFailed {
-            pk: Some(envelope.pk.clone()),
-            msg: "invalid BIP-340 signature".to_string(),
-        }
-    })?;
-
-    // Verify BIP-340 signature
-    let xonly = pk.xonly().map_err(|_| {
-        write_errsig(status, Some(&envelope.pk));
-        Error::VerifyFailed {
-            pk: Some(envelope.pk.clone()),
-            msg: "invalid public key xonly conversion".to_string(),
-        }
-    })?;
-    if SECP256K1.verify_schnorr(&sig, &message, &xonly).is_err() {
-        status.write_line("NEWSIG");
-        status.write_line(&format!("BADSIG {} {}", envelope.pk, envelope.pk));
-        return Err(Error::VerifyFailed {
-            pk: Some(envelope.pk),
-            msg: "BIP-340 signature verification failed".to_string(),
-        });
-    }
-
-    // Signature is valid — check NIP-OA if present and track result.
-    let oa_result = if let Some(ref oa) = envelope.oa {
-        // Validate oa[0] is a valid BIP-340 public key. Per NIP-GS spec,
-        // an invalid owner pubkey is a structural error → ERRSIG.
-        if PublicKey::from_hex(&oa.0).is_err() {
-            write_errsig(status, Some(&envelope.pk));
-            return Err(Error::VerifyFailed {
-                pk: Some(envelope.pk),
-                msg: "oa[0] owner pubkey is not a valid BIP-340 key".to_string(),
-            });
-        }
-
-        if !verify_oa(&envelope.pk, oa) {
-            eprintln!(
-                "warning: NIP-OA owner attestation verification failed (signature still valid)"
-            );
-            OaVerifyResult::InvalidSignature
-        } else if let Err(msg) = enforce_conditions(&oa.1, envelope.t) {
-            eprintln!("warning: NIP-OA conditions not satisfied: {msg}");
-            OaVerifyResult::ConditionsViolated
         } else {
-            // kind= clauses are valid NIP-OA but not enforceable in NIP-GS.
-            // We still report Valid here — callers check nostr-oa-status for
-            // the full picture. The kind_not_applicable status is preserved
-            // via the NOTATION_DATA line below.
-            if has_kind_clause(&oa.1) {
-                eprintln!(
-                    "warning: auth tag contains kind= constraints which are not enforced in git signing context"
-                );
-            }
-            OaVerifyResult::Valid
+            write_errsig(status, error.signer_public_key());
         }
-    } else {
-        OaVerifyResult::Absent
-    };
+        Error::VerifyFailed {
+            pk: error.signer_public_key().map(str::to_owned),
+            msg: error.to_string(),
+        }
+    })?;
+
+    match verified.owner_authorization_status {
+        OwnerAuthorizationStatus::InvalidSignature => eprintln!(
+            "warning: NIP-OA owner attestation verification failed (signature still valid)"
+        ),
+        OwnerAuthorizationStatus::KindNotApplicable => eprintln!(
+            "warning: auth tag contains kind= constraints which are not applicable in git signing context"
+        ),
+        OwnerAuthorizationStatus::ConditionsViolated => {
+            if let Some(conditions) = verified.owner_conditions.as_deref() {
+                if let Err(message) = enforce_conditions(conditions, verified.timestamp) {
+                    eprintln!("warning: NIP-OA conditions not satisfied: {message}");
+                }
+            }
+        }
+        OwnerAuthorizationStatus::Valid => {}
+        OwnerAuthorizationStatus::Absent => {}
+    }
 
     // Determine trust level.
     //
@@ -1286,10 +1412,10 @@ fn do_verify(sig_file: &str, status: &mut StatusWriter) -> Result<(), Error> {
     // key I expect for this repo." A proper trust model would use a keyring or
     // web-of-trust, but git's signing interface only supports TRUST_FULLY /
     // TRUST_UNDEFINED.
-    let trust = determine_trust(&envelope.pk);
+    let trust = determine_trust(&verified.signer_public_key);
 
     // Format date from timestamp (for VALIDSIG status line)
-    let date_str = timestamp_to_date(envelope.t);
+    let date_str = timestamp_to_date(verified.timestamp);
 
     // Write GnuPG success status lines:
     // - NEWSIG: signals start of a new signature check
@@ -1300,14 +1426,19 @@ fn do_verify(sig_file: &str, status: &mut StatusWriter) -> Result<(), Error> {
     // These are critical — git reads them to determine signature validity.
     // Use status_or_fail! so a broken status-fd is surfaced as an error.
     status_or_fail!(status, "NEWSIG");
-    status_or_fail!(status, "GOODSIG {} {}", envelope.pk, envelope.pk);
+    status_or_fail!(
+        status,
+        "GOODSIG {} {}",
+        verified.signer_public_key,
+        verified.signer_public_key
+    );
     status_or_fail!(
         status,
         "VALIDSIG {} {} {} 0 - - - - - {}",
-        envelope.pk,
+        verified.signer_public_key,
         date_str,
-        envelope.t,
-        envelope.pk
+        verified.timestamp,
+        verified.signer_public_key
     );
     status_or_fail!(status, "{} 0 shell", trust);
     // Clarify that TRUST_FULLY is advisory — it only means the verified key
@@ -1321,11 +1452,15 @@ fn do_verify(sig_file: &str, status: &mut StatusWriter) -> Result<(), Error> {
     // This allows callers to distinguish "valid sig + valid OA" from
     // "valid sig + invalid/missing OA" without parsing stderr warnings.
     // NOTATION_NAME/NOTATION_DATA pairs are part of the GnuPG status protocol.
-    if let Some(ref oa) = envelope.oa {
+    if let Some(owner_public_key) = verified.owner_public_key.as_deref() {
         status_or_fail!(status, "NOTATION_NAME nostr-oa-status");
-        status_or_fail!(status, "NOTATION_DATA {}", oa_result.as_status_str());
+        status_or_fail!(
+            status,
+            "NOTATION_DATA {}",
+            verified.owner_authorization_status.as_str()
+        );
         status_or_fail!(status, "NOTATION_NAME nostr-oa-owner");
-        status_or_fail!(status, "NOTATION_DATA {}", oa.0);
+        status_or_fail!(status, "NOTATION_DATA {}", owner_public_key);
     } else {
         status_or_fail!(status, "NOTATION_NAME nostr-oa-status");
         status_or_fail!(status, "NOTATION_DATA none");
@@ -1421,6 +1556,7 @@ fn parse_envelope(json_str: &str) -> Result<Envelope, String> {
 
         // Validate oa[0] is a valid BIP-340 x-only public key (not just hex)
         PublicKey::from_hex(owner)
+            .and_then(|public_key| public_key.xonly().map(|_| ()))
             .map_err(|e| format!("oa[0] is not a valid BIP-340 public key: {e}"))?;
 
         // Self-attestation is meaningless — owner must differ from signer
@@ -2010,7 +2146,7 @@ Initial commit"
     }
 
     /// Helper: sign a payload and return the armored signature
-    fn sign_payload(secret_hex: &str, payload: &[u8], t: u64) -> String {
+    fn legacy_test_signature(secret_hex: &str, payload: &[u8], t: u64) -> String {
         let keypair = Keypair::from_seckey_str(SECP256K1, secret_hex).unwrap();
         let (xonly, _) = keypair.x_only_public_key();
         let pk_hex = hex::encode(xonly.serialize());
@@ -2019,6 +2155,50 @@ Initial commit"
         let sig = SECP256K1.sign_schnorr(&message, &keypair);
         let sig_hex = hex::encode(sig.serialize());
         let json = build_envelope(&pk_hex, &sig_hex, t, None);
+        armor(json.as_bytes())
+    }
+
+    fn test_owner_auth_tag(
+        agent_public_key: &str,
+        owner_secret: &str,
+        conditions: &str,
+    ) -> ((String, String, String), String) {
+        let owner_keypair = Keypair::from_seckey_str(SECP256K1, owner_secret).unwrap();
+        let (owner_xonly, _) = owner_keypair.x_only_public_key();
+        let owner_public_key = hex::encode(owner_xonly.serialize());
+        let preimage = format!("nostr:agent-auth:{agent_public_key}:{conditions}");
+        let digest = Sha256Hash::hash(preimage.as_bytes());
+        let message = Message::from_digest(digest.to_byte_array());
+        let owner_signature =
+            hex::encode(SECP256K1.sign_schnorr(&message, &owner_keypair).serialize());
+        let auth_tag = (
+            owner_public_key.clone(),
+            conditions.to_owned(),
+            owner_signature.clone(),
+        );
+        let auth_tag_json =
+            format!(r#"["auth","{owner_public_key}","{conditions}","{owner_signature}"]"#);
+        (auth_tag, auth_tag_json)
+    }
+
+    fn test_signature_with_auth(
+        secret_hex: &str,
+        payload: &[u8],
+        t: u64,
+        auth_tag: &(String, String, String),
+    ) -> String {
+        let keypair = Keypair::from_seckey_str(SECP256K1, secret_hex).unwrap();
+        let (xonly, _) = keypair.x_only_public_key();
+        let pk_hex = hex::encode(xonly.serialize());
+        let hash = compute_signing_hash(t, Some(auth_tag), payload);
+        let message = Message::from_digest(hash);
+        let signature = SECP256K1.sign_schnorr(&message, &keypair);
+        let json = build_envelope(
+            &pk_hex,
+            &hex::encode(signature.serialize()),
+            t,
+            Some(auth_tag),
+        );
         armor(json.as_bytes())
     }
 
@@ -2052,11 +2232,144 @@ Initial commit"
     }
 
     #[test]
+    fn test_in_process_api_round_trip_returns_signer_identity() {
+        let secret = "0000000000000000000000000000000000000000000000000000000000000003";
+        let payload = test_payload();
+
+        let signed =
+            super::sign_payload(&payload, secret, None).expect("in-process signing should succeed");
+        assert_eq!(signed.signer_public_key, TEST_PK);
+        assert!(signed.armored_signature.starts_with(ARMOR_BEGIN));
+
+        let verified = super::verify_payload(&payload, &signed.armored_signature)
+            .expect("in-process verification should succeed");
+        assert_eq!(verified.signer_public_key, TEST_PK);
+        assert_eq!(
+            verified.owner_authorization_status,
+            OwnerAuthorizationStatus::Absent
+        );
+        assert!(verified.owner_public_key.is_none());
+    }
+
+    #[test]
+    fn test_in_process_api_rejects_wrong_payload() {
+        let secret = "0000000000000000000000000000000000000000000000000000000000000003";
+        let payload = test_payload();
+        let signed =
+            super::sign_payload(&payload, secret, None).expect("in-process signing should succeed");
+
+        let error = super::verify_payload(b"different payload", &signed.armored_signature)
+            .expect_err("signature must be bound to the exact payload");
+        assert!(error.is_invalid_signature());
+        assert_eq!(error.signer_public_key(), Some(TEST_PK));
+        assert!(error.to_string().contains("signature verification failed"));
+    }
+
+    #[test]
+    fn test_in_process_api_rejects_malformed_auth_tag_json() {
+        let secret = "0000000000000000000000000000000000000000000000000000000000000003";
+        let payload = test_payload();
+        let malformed_tags = [
+            "{",
+            r#"["not-auth","owner","","signature"]"#,
+            r#"["auth","owner","created_at<2000000000;rm","signature"]"#,
+        ];
+
+        for malformed in malformed_tags {
+            let error = super::sign_payload(&payload, secret, Some(malformed))
+                .expect_err("malformed auth tags must fail closed");
+            assert!(
+                error.to_string().contains("BUZZ_AUTH_TAG"),
+                "unexpected error for {malformed:?}: {error}"
+            );
+            assert!(!error.to_string().contains(secret));
+        }
+    }
+
+    #[test]
+    fn test_in_process_api_round_trip_with_owner_authorization() {
+        let agent_secret = "0000000000000000000000000000000000000000000000000000000000000003";
+        let owner_secret = "0000000000000000000000000000000000000000000000000000000000000004";
+        let conditions = "created_at<4294967295";
+        let ((owner_public_key, _, _), auth_tag_json) =
+            test_owner_auth_tag(TEST_PK, owner_secret, conditions);
+        let payload = test_payload();
+
+        let signed = super::sign_payload(&payload, agent_secret, Some(&auth_tag_json))
+            .expect("valid owner authorization should be accepted");
+        let verified = super::verify_payload(&payload, &signed.armored_signature)
+            .expect("signature with valid owner authorization should verify");
+        assert_eq!(
+            verified.owner_authorization_status,
+            OwnerAuthorizationStatus::Valid
+        );
+        assert_eq!(
+            verified.owner_public_key.as_deref(),
+            Some(owner_public_key.as_str())
+        );
+        assert_eq!(verified.owner_conditions.as_deref(), Some(conditions));
+    }
+
+    #[test]
+    fn test_in_process_api_reports_kind_not_applicable_for_kind_constraint() {
+        let agent_secret = "0000000000000000000000000000000000000000000000000000000000000003";
+        let owner_secret = "0000000000000000000000000000000000000000000000000000000000000004";
+        let conditions = "kind=9";
+        let ((owner_public_key, _, _), auth_tag_json) =
+            test_owner_auth_tag(TEST_PK, owner_secret, conditions);
+        let payload = test_payload();
+
+        let signed = super::sign_payload(&payload, agent_secret, Some(&auth_tag_json))
+            .expect("kind-constrained authorization remains signable for CLI compatibility");
+        let verified = super::verify_payload(&payload, &signed.armored_signature)
+            .expect("payload signature with authentic owner authorization should verify");
+
+        assert_eq!(
+            verified.owner_authorization_status,
+            OwnerAuthorizationStatus::KindNotApplicable
+        );
+        assert_eq!(
+            verified.owner_authorization_status.as_str(),
+            "kind_not_applicable"
+        );
+        assert_eq!(
+            verified.owner_public_key.as_deref(),
+            Some(owner_public_key.as_str())
+        );
+        assert_eq!(verified.owner_conditions.as_deref(), Some(conditions));
+    }
+
+    #[test]
+    fn test_kind_not_applicable_precedes_violated_time_condition() {
+        let agent_secret = "0000000000000000000000000000000000000000000000000000000000000003";
+        let owner_secret = "0000000000000000000000000000000000000000000000000000000000000004";
+        let conditions = "kind=9&created_at<1";
+        let (auth_tag, _) = test_owner_auth_tag(TEST_PK, owner_secret, conditions);
+        let payload = test_payload();
+        let armored = test_signature_with_auth(agent_secret, &payload, 1_700_000_000, &auth_tag);
+
+        let verified = super::verify_payload(&payload, &armored)
+            .expect("payload signature with authentic owner authorization should verify");
+        assert_eq!(
+            verified.owner_authorization_status,
+            OwnerAuthorizationStatus::KindNotApplicable
+        );
+    }
+
+    #[test]
+    fn test_in_process_api_rejects_malformed_signature() {
+        let error = super::verify_payload(b"payload", "not an armored signature")
+            .expect_err("malformed armor must fail closed");
+        assert!(!error.is_invalid_signature());
+        assert!(error.signer_public_key().is_none());
+    }
+
+    #[test]
     fn test_sign_verify_round_trip() {
         // secret key = 0x03 (spec test key)
         let secret = "0000000000000000000000000000000000000000000000000000000000000003";
         let payload = test_payload();
-        let armored = sign_payload(secret, &payload, 1700000000);
+        let armored = legacy_test_signature(secret, &payload, 1700000000);
         let envelope = verify_sig(&armored, &payload).expect("round-trip should verify");
         assert_eq!(envelope.pk, TEST_PK);
         assert_eq!(envelope.t, 1700000000);
@@ -2067,7 +2380,7 @@ Initial commit"
     fn test_verify_rejects_wrong_payload() {
         let secret = "0000000000000000000000000000000000000000000000000000000000000003";
         let payload = test_payload();
-        let armored = sign_payload(secret, &payload, 1700000000);
+        let armored = legacy_test_signature(secret, &payload, 1700000000);
         let wrong_payload = b"wrong payload";
         let result = verify_sig(&armored, wrong_payload);
         assert!(result.is_err());
@@ -2080,7 +2393,7 @@ Initial commit"
     fn test_verify_rejects_tampered_sig() {
         let secret = "0000000000000000000000000000000000000000000000000000000000000003";
         let payload = test_payload();
-        let armored = sign_payload(secret, &payload, 1700000000);
+        let armored = legacy_test_signature(secret, &payload, 1700000000);
         // Tamper with the base64 content (flip a character in the signature)
         let tampered = armored.replace(&armored.lines().nth(1).unwrap()[..10], "AAAAAAAAAA");
         // This should either fail to parse or fail verification

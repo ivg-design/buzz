@@ -2,14 +2,17 @@ use buzz_core::job::{JobRequest, JobSponsor};
 use buzz_core::job_authorization::{
     JobAuthorizationRequest, JobAuthorizationResponse, JOB_AUTHORIZATION_SCHEMA_VERSION,
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 
 use super::ReceiverError;
 use crate::relay::{AuthenticatedContext, RestClient};
 
 const AUTHORIZATION_PATH: &str = "/api/jobs/authorize";
 
-/// Revalidate server-owned authority immediately before the local durable claim.
+/// Revalidate server-owned authority and return its parsed absolute deadline.
+///
+/// Callers enforce that deadline at their own durable claim or process-start
+/// boundary rather than treating a successful response as timeless authority.
 pub async fn authorize(
     rest: &RestClient,
     tenant: &AuthenticatedContext,
@@ -18,7 +21,7 @@ pub async fn authorize(
     semantic_digest: &str,
     recipient_sponsor: &JobSponsor,
     allow_insecure_loopback: bool,
-) -> Result<(), ReceiverError> {
+) -> Result<DateTime<Utc>, ReceiverError> {
     require_secure_transport(&rest.base_url, allow_insecure_loopback)?;
     let authorization = JobAuthorizationRequest {
         schema_version: JOB_AUTHORIZATION_SCHEMA_VERSION.into(),
@@ -54,7 +57,15 @@ pub async fn authorize(
                 .into(),
         ));
     }
-    Ok(())
+    let expires_at = DateTime::parse_from_rfc3339(&response.expires_at)
+        .map_err(|_| ReceiverError::Tenant("job authorization expiry is invalid".into()))?
+        .with_timezone(&Utc);
+    if expires_at <= Utc::now() {
+        return Err(ReceiverError::Tenant(
+            "job authorization expired before privileged operation start".into(),
+        ));
+    }
+    Ok(expires_at)
 }
 
 fn require_secure_transport(

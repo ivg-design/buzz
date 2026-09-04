@@ -11,6 +11,7 @@ pub struct Shim {
     _dir: TempDir,
     pub path_env: String,
     pub git_env: Vec<(String, String)>,
+    read_roots: Vec<PathBuf>,
 }
 
 impl Shim {
@@ -23,19 +24,70 @@ impl Shim {
             symlink(&self_exe, &dir.path().join(name))?;
         }
 
-        let original = std::env::var_os("PATH").unwrap_or_default();
         let mut entries = vec![PathBuf::from(dir.path())];
-        entries.extend(std::env::split_paths(&original));
+        // Never relay the ambient PATH into the model shell. It may contain a
+        // checkout-local bin directory or an auth-helper directory chosen by
+        // the launching application. System locations come first; a small set
+        // of canonical operator toolchain bins follows for cargo/node workflows.
+        #[cfg(unix)]
+        {
+            for candidate in [
+                PathBuf::from("/usr/bin"),
+                PathBuf::from("/bin"),
+                PathBuf::from("/usr/sbin"),
+                PathBuf::from("/sbin"),
+                PathBuf::from("/opt/homebrew/bin"),
+                PathBuf::from("/usr/local/bin"),
+            ] {
+                push_canonical_directory(&mut entries, candidate);
+            }
+            if let Some(home) = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .and_then(|path| path.canonicalize().ok())
+            {
+                for relative in [".cargo/bin", ".local/bin"] {
+                    push_canonical_directory(&mut entries, home.join(relative));
+                }
+                if let Some(original) = std::env::var_os("PATH") {
+                    let nvm_root = home.join(".nvm/versions");
+                    for candidate in std::env::split_paths(&original) {
+                        if candidate.starts_with(&nvm_root)
+                            && candidate.file_name().is_some_and(|name| name == "bin")
+                        {
+                            push_canonical_directory(&mut entries, candidate);
+                        }
+                    }
+                }
+            }
+        }
         let path_env = std::env::join_paths(entries)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?
             .to_string_lossy()
             .into_owned();
 
+        let mut read_roots = vec![dir.path().canonicalize()?];
+        if let Some(parent) = self_exe.parent().and_then(|path| path.canonicalize().ok()) {
+            read_roots.push(parent);
+        }
         Ok(Self {
             _dir: dir,
             path_env,
             git_env: Vec::new(),
+            read_roots,
         })
+    }
+
+    pub(crate) fn read_roots(&self) -> &[PathBuf] {
+        &self.read_roots
+    }
+}
+
+#[cfg(unix)]
+fn push_canonical_directory(entries: &mut Vec<PathBuf>, candidate: PathBuf) {
+    if let Ok(canonical) = candidate.canonicalize() {
+        if canonical.is_dir() && !entries.contains(&canonical) {
+            entries.push(canonical);
+        }
     }
 }
 

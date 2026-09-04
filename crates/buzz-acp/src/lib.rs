@@ -142,6 +142,66 @@ fn emit_runtime_lifecycle(
     }
 }
 
+#[derive(Clone)]
+enum DeferredJobTerminal {
+    Cancellation(job_receiver::CancellationTerminal),
+    Outcome(job_receiver::TerminalDisposition),
+}
+
+fn spawn_job_terminal_finisher(
+    privileges: job_receiver::JobPrivilegeRegistry,
+    scope: scope::SessionScope,
+    terminal: Option<(job_receiver::JobEmitter, DeferredJobTerminal)>,
+) {
+    tokio::spawn(async move {
+        let mut retry_delay = Duration::from_millis(250);
+        loop {
+            match privileges.revoke_and_wait(&scope).await {
+                Ok(()) => break,
+                Err(error) => {
+                    tracing::warn!(
+                        scope = %scope.telemetry_label(),
+                        "agent-job cancellation terminal remains deferred until privileged operations drain: {error}"
+                    );
+                    tokio::time::sleep(retry_delay).await;
+                    retry_delay = (retry_delay * 2).min(Duration::from_secs(30));
+                }
+            }
+        }
+
+        if let Some((emitter, terminal)) = terminal {
+            match emitter.is_terminal().await {
+                Ok(true) => {}
+                Ok(false) => {
+                    let publish = match terminal {
+                        DeferredJobTerminal::Cancellation(terminal) => {
+                            terminal.publish(&emitter).await
+                        }
+                        DeferredJobTerminal::Outcome(disposition) => {
+                            let disposition = job_receiver::guard_terminal_with_git_effect(
+                                disposition,
+                                privileges.git_effect_summary(&scope),
+                            );
+                            emitter.terminal(disposition).await
+                        }
+                    };
+                    if let Err(error) = publish {
+                        tracing::warn!(
+                            scope = %scope.telemetry_label(),
+                            "publishing drained agent-job terminal failed: {error}"
+                        );
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    scope = %scope.telemetry_label(),
+                    "reading drained agent-job terminal state failed: {error}"
+                ),
+            }
+        }
+        privileges.remove(&scope);
+    });
+}
+
 /// Cache for the agent's owner pubkey.
 ///
 /// Owner is now provided via `--agent-owner` config flag (no REST lookup).
@@ -217,6 +277,7 @@ async fn is_owner_or_sibling(
 
 async fn admit_job_to_queue(
     receiver: &job_receiver::JobReceiver,
+    privileges: &job_receiver::JobPrivilegeRegistry,
     queue: &mut EventQueue,
     channel_id: Uuid,
     event: nostr::Event,
@@ -259,6 +320,11 @@ async fn admit_job_to_queue(
                     scope = %scope.telemetry_label(),
                     "agent-job start progress remains pending: {error}"
                 );
+            }
+            if let Err(error) = privileges.register(scope.clone(), dispatch.privilege) {
+                queue.remove_event(&scope, &event_id);
+                queue.clear_job_working_directory(&scope);
+                return Err(job_receiver::ReceiverError::Privilege(error));
             }
             Ok(Some((scope, dispatch.emitter)))
         }
@@ -2730,6 +2796,57 @@ async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
             .await;
     }
 
+    // Resolve the exact operator-granted checkouts and any repository-scoped
+    // GitHub credentials before the first model-controlled provider process is
+    // launched. No helper command or operator HOME path survives this capture.
+    let cwd = current_working_directory()?;
+    let prepared_job_sources = job_receiver::prepare_job_sources(
+        std::path::Path::new(&cwd),
+        grants_json,
+        grants_file,
+        ledger_dir,
+    )
+    .map_err(|error| anyhow::anyhow!("agent job startup configuration error: {error}"))?;
+    let grants_json = prepared_job_sources.grants_json;
+    let grant_source_file = prepared_job_sources.grant_source_file;
+    let ledger_dir = prepared_job_sources.ledger_root;
+    let mut protected_mcp_paths = vec![std::path::Path::new(&cwd)
+        .canonicalize()
+        .context("failed to canonicalize the MCP checkout root")?
+        .join(".buzz/agent-job-grants.json")];
+    if let Some(path) = grant_source_file {
+        protected_mcp_paths.push(path);
+    }
+    if let Some(path) = prepared_job_sources.protected_ledger_root {
+        protected_mcp_paths.push(path);
+    }
+    let job_privileges = job_receiver::JobPrivilegeRegistry::default();
+    let trusted_mcp_factory = {
+        let identity = buzz_dev_mcp::HarnessTrustedIdentity::new_with_operator_git_credentials(
+            std::path::Path::new(&cwd),
+            config.relay_url.clone(),
+            config.keys.clone(),
+            relay_auth_tag.clone(),
+            owner_github_login.clone(),
+            grants_json.clone(),
+            None,
+            allow_insecure_loopback,
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("trusted MCP configuration error: {error}"))?;
+        let lifetime = Duration::from_secs(config.max_turn_duration_secs)
+            .saturating_mul(2)
+            .saturating_add(Duration::from_secs(300));
+        Some(
+            trusted_mcp::TrustedMcpFactory::with_job_privileges(
+                identity,
+                lifetime,
+                job_privileges.clone(),
+            )
+            .map_err(|error| anyhow::anyhow!("trusted MCP configuration error: {error}"))?,
+        )
+    };
+
     tracing::info!("buzz-acp starting: {}", config.summary());
 
     let observer = config
@@ -2984,38 +3101,16 @@ async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
     }
 
     let base_prompt_content = config.base_prompt_content.take();
-    let cwd = current_working_directory()?;
     let receiver_grants_json = grants_json.clone();
-    let receiver_grants_file = grants_file.clone();
     let receiver_owner_github_login = owner_github_login.clone();
     let receiver_sources = job_receiver::ReceiverSources {
         grants_json: receiver_grants_json,
-        grants_file: receiver_grants_file,
+        grants_file: None,
         ledger_root: ledger_dir,
         allow_insecure_loopback,
     };
-    let trusted_mcp_factory = {
-        let identity = buzz_dev_mcp::HarnessTrustedIdentity::new(
-            std::path::Path::new(&cwd),
-            config.relay_url.clone(),
-            config.keys.clone(),
-            relay_auth_tag,
-            owner_github_login,
-            grants_json,
-            grants_file,
-            allow_insecure_loopback,
-        )
-        .map_err(|error| anyhow::anyhow!("trusted MCP configuration error: {error}"))?;
-        let lifetime = Duration::from_secs(config.max_turn_duration_secs)
-            .saturating_mul(2)
-            .saturating_add(Duration::from_secs(300));
-        Some(
-            trusted_mcp::TrustedMcpFactory::new(identity, lifetime)
-                .map_err(|error| anyhow::anyhow!("trusted MCP configuration error: {error}"))?,
-        )
-    };
     let ctx = Arc::new(PromptContext {
-        mcp_servers: build_mcp_servers(&config),
+        mcp_servers: build_mcp_servers(&config, &protected_mcp_paths),
         trusted_mcp_factory,
         initial_message: config.initial_message.clone(),
         idle_timeout: Duration::from_secs(config.idle_timeout_secs),
@@ -3102,7 +3197,8 @@ async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
         );
     }
     let mut job_emitters: HashMap<scope::SessionScope, job_receiver::JobEmitter> = HashMap::new();
-    let mut job_cancellations: HashSet<scope::SessionScope> = HashSet::new();
+    let mut job_cancellations: HashMap<scope::SessionScope, job_receiver::CancellationTerminal> =
+        HashMap::new();
     if let Some(receiver) = job_receiver.as_ref() {
         relay
             .subscribe_agent_jobs(&receiver.subscription_channels())
@@ -3142,7 +3238,16 @@ async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
         let Some(receiver) = job_receiver.as_ref() else {
             break;
         };
-        match admit_job_to_queue(receiver, &mut queue, channel_id, event, project).await {
+        match admit_job_to_queue(
+            receiver,
+            &job_privileges,
+            &mut queue,
+            channel_id,
+            event,
+            project,
+        )
+        .await
+        {
             Ok(Some((scope, emitter))) => {
                 job_emitters.insert(scope, emitter);
             }
@@ -3688,6 +3793,37 @@ async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
                                 } else {
                                     subscribed_channel_ids.remove(&ch);
                                     tracing::info!(channel_id = %ch, "membership notification: unsubscribing from channel");
+                                    let revoked_job_scopes = job_emitters
+                                        .keys()
+                                        .filter(|scope| scope.channel_id() == ch)
+                                        .cloned()
+                                        .collect::<Vec<_>>();
+                                    // Signal both privilege leases and their owning turns
+                                    // before waiting on an operation lock. A terminal must
+                                    // never overtake a privileged child that is still being
+                                    // reaped. The registry applies one bounded deadline to
+                                    // the entire channel drain.
+                                    job_privileges.revoke_channel(ch);
+                                    for scope in &revoked_job_scopes {
+                                        let _ = signal_in_flight_task_for_scope(
+                                            &mut pool,
+                                            scope,
+                                            ControlSignal::Cancel,
+                                        );
+                                    }
+                                    let privileges_drained = match job_privileges
+                                        .revoke_channel_and_wait(ch)
+                                        .await
+                                    {
+                                        Ok(()) => true,
+                                        Err(error) => {
+                                            tracing::warn!(
+                                                channel_id = %ch,
+                                                "membership-revoked job terminal deferred until privileged operations drain: {error}"
+                                            );
+                                            false
+                                        }
+                                    };
                                     if job_receiver
                                         .as_ref()
                                         .is_some_and(|receiver| receiver.subscribes_to_channel(ch))
@@ -3713,27 +3849,30 @@ async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
                                     // Drop every thread scope's typing entry for
                                     // the removed channel.
                                     typing_channels.retain(|scope, _| scope.channel_id() != ch);
-                                    let revoked_job_scopes = job_emitters
-                                        .keys()
-                                        .filter(|scope| scope.channel_id() == ch)
-                                        .cloned()
-                                        .collect::<Vec<_>>();
-                                    if let Some(receiver) = job_receiver.as_ref() {
-                                        if let Err(error) = receiver.terminate_channel(ch).await {
-                                            tracing::warn!(
-                                                channel_id = %ch,
-                                                "membership-revoked job terminals are frozen for retry: {error}"
-                                            );
+                                    let job_terminals_ready = if privileges_drained {
+                                        if let Some(receiver) = job_receiver.as_ref() {
+                                            match receiver.terminate_channel(ch).await {
+                                                Ok(_) => true,
+                                                Err(error) => {
+                                                    tracing::warn!(
+                                                        channel_id = %ch,
+                                                        "membership-revoked job terminals are frozen for retry: {error}"
+                                                    );
+                                                    false
+                                                }
+                                            }
+                                        } else {
+                                            true
                                         }
-                                    }
+                                    } else {
+                                        false
+                                    };
                                     for scope in revoked_job_scopes {
-                                        let _ = signal_in_flight_task_for_scope(
-                                            &mut pool,
-                                            &scope,
-                                            ControlSignal::Cancel,
-                                        );
-                                        job_cancellations.remove(&scope);
-                                        job_emitters.remove(&scope);
+                                        if job_terminals_ready {
+                                            job_cancellations.remove(&scope);
+                                            job_emitters.remove(&scope);
+                                            job_privileges.remove(&scope);
+                                        }
                                     }
                                     // Best-effort: clean up 👀 on drained events.
                                     // Note: the relay revokes membership before
@@ -3777,40 +3916,41 @@ async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
                                 if kind_u32 == KIND_JOB_CANCEL {
                                     match receiver
                                         .handle_cancel(
+                                            &job_privileges,
                                             buzz_event.channel_id,
                                             buzz_event.event,
                                         )
                                         .await
                                     {
                                         Ok(job_receiver::CancelOutcome::Cancel(cancel)) => {
-                                            let scope = cancel.scope;
+                                            let job_receiver::JobCancel {
+                                                scope,
+                                                request_event_id,
+                                                emitter,
+                                                terminal,
+                                            } = *cancel;
                                             let running = job_runtime::quiesce_for_cancel(
                                                 &mut pool,
                                                 &mut queue,
                                                 &scope,
-                                                &cancel.request_event_id,
+                                                &request_event_id,
                                             );
                                             if running {
-                                                job_emitters.insert(scope.clone(), cancel.emitter);
-                                                job_cancellations.insert(scope.clone());
+                                                job_emitters.insert(scope.clone(), emitter.clone());
+                                                job_cancellations
+                                                    .insert(scope.clone(), terminal.clone());
                                             } else {
                                                 job_emitters.remove(&scope);
                                                 queue.clear_job_working_directory(&scope);
-                                                if let Err(error) = cancel
-                                                    .emitter
-                                                    .control(
-                                                        buzz_core::job::JobControlAction::Cancelled,
-                                                        "requester_cancelled".into(),
-                                                        None,
-                                                    )
-                                                    .await
-                                                {
-                                                    tracing::warn!(
-                                                        scope = %scope.telemetry_label(),
-                                                        "publishing queued agent-job cancellation failed: {error}"
-                                                    );
-                                                }
                                             }
+                                            spawn_job_terminal_finisher(
+                                                job_privileges.clone(),
+                                                scope,
+                                                Some((
+                                                    emitter,
+                                                    DeferredJobTerminal::Cancellation(terminal),
+                                                )),
+                                            );
                                         }
                                         Ok(job_receiver::CancelOutcome::Consumed) => {}
                                         Err(error) => tracing::warn!(
@@ -3844,6 +3984,7 @@ async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
                                     .and_then(|info| info.project.as_ref());
                                 match admit_job_to_queue(
                                     receiver,
+                                    &job_privileges,
                                     &mut queue,
                                     buzz_event.channel_id,
                                     buzz_event.event,
@@ -4260,9 +4401,16 @@ async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
                     .scope()
                     .filter(|scope| scope.is_job())
                     .cloned();
-                let job_was_cancelled = job_scope
-                    .as_ref()
-                    .is_some_and(|scope| job_cancellations.remove(scope));
+                if let Some(scope) = &job_scope {
+                    // A provider can return while a separately served HTTP tool
+                    // request is still running. Revoke the operation token and
+                    // drop the session capability immediately. A detached
+                    // finisher retains the checkout fence until the tool handler
+                    // reaps its child, then derives the terminal from durable
+                    // receipt state without blocking the relay event loop.
+                    job_privileges.revoke(scope);
+                    result.agent.state.invalidate_scope(scope);
+                }
                 let captured_job_text = job_scope
                     .as_ref()
                     .map(|_| result.agent.acp.take_turn_text());
@@ -4275,35 +4423,32 @@ async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
                         } => (operation_id.as_str(), request_event_id.as_str()),
                         _ => return None,
                     };
+                    let cancellation = job_cancellations.remove(scope);
                     let emitter = job_emitters.remove(scope)?;
-                    let disposition = if job_was_cancelled {
-                        None
-                    } else {
-                        Some(match &result.outcome {
-                            PromptOutcome::Ok(_) => job_receiver::parse_terminal_outcome(
-                                captured_job_text.flatten(),
-                                operation_id,
-                                request_event_id,
-                                emitter.scope_digest(),
-                            ),
-                            _ => job_receiver::TerminalDisposition::Indeterminate {
-                                code: "worker_turn_interrupted".into(),
-                                message: "Worker turn ended without a proven terminal outcome"
-                                    .into(),
-                            },
-                        })
+                    let terminal = match cancellation {
+                        Some(cancellation) => DeferredJobTerminal::Cancellation(cancellation),
+                        None => {
+                            let disposition = match &result.outcome {
+                                PromptOutcome::Ok(_) => job_receiver::parse_terminal_outcome(
+                                    captured_job_text.flatten(),
+                                    operation_id,
+                                    request_event_id,
+                                    emitter.scope_digest(),
+                                ),
+                                _ => job_receiver::TerminalDisposition::Indeterminate {
+                                    code: "worker_turn_interrupted".into(),
+                                    message: "Worker turn ended without a proven terminal outcome"
+                                        .into(),
+                                },
+                            };
+                            DeferredJobTerminal::Outcome(disposition)
+                        }
                     };
-                    Some((emitter, disposition))
+                    Some((emitter, terminal))
                 });
                 // Once a durable job prompt starts, never re-run its side effects.
                 if job_scope.is_some() {
                     result.batch = None;
-                }
-                // Job scopes are one-shot. Drop their provider session and
-                // bearer-backed loopback MCP before returning the worker to the
-                // pool, regardless of how the turn ended.
-                if let Some(scope) = &job_scope {
-                    result.agent.state.invalidate_scope(scope);
                 }
                 // Stop the typing indicator for the completed turn's exact scope,
                 // not the whole channel — a sibling thread still running in the
@@ -4329,23 +4474,11 @@ async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
                     // of the provider session on an idle worker.
                     pool.invalidate_scope_session(scope);
                     queue.clear_job_working_directory(scope);
-                }
-                if let Some((emitter, disposition)) = job_terminal {
-                    let publish = match disposition {
-                        Some(disposition) => emitter.terminal(disposition).await,
-                        None => {
-                            emitter
-                                .control(
-                                    buzz_core::job::JobControlAction::Cancelled,
-                                    "requester_cancelled".into(),
-                                    None,
-                                )
-                                .await
-                        }
-                    };
-                    if let Err(error) = publish {
-                        tracing::warn!("publishing agent-job terminal event failed: {error}");
-                    }
+                    spawn_job_terminal_finisher(
+                        job_privileges.clone(),
+                        scope.clone(),
+                        job_terminal,
+                    );
                 }
                 if loop_action == LoopAction::Exit {
                     break;
@@ -4390,7 +4523,15 @@ async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
                     let project = project_context
                         .as_ref()
                         .and_then(|info| info.project.as_ref());
-                    match admit_job_to_queue(receiver, &mut queue, channel_id, event, project).await
+                    match admit_job_to_queue(
+                        receiver,
+                        &job_privileges,
+                        &mut queue,
+                        channel_id,
+                        event,
+                        project,
+                    )
+                    .await
                     {
                         Ok(Some((scope, emitter))) => {
                             job_emitters.insert(scope, emitter);
@@ -4418,11 +4559,25 @@ async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
                     .and_then(|meta| meta.scope.as_ref())
                     .filter(|scope| scope.is_job())
                     .cloned();
+                if let Some(scope) = &panic_scope {
+                    job_privileges.revoke(scope);
+                }
                 let panic_terminal = panic_scope.as_ref().and_then(|scope| {
-                    let cancelled = job_cancellations.remove(scope);
-                    job_emitters
-                        .remove(scope)
-                        .map(|emitter| (emitter, cancelled))
+                    let cancellation = job_cancellations.remove(scope);
+                    job_emitters.remove(scope).map(|emitter| {
+                        let terminal = match cancellation {
+                            Some(cancellation) => DeferredJobTerminal::Cancellation(cancellation),
+                            None => DeferredJobTerminal::Outcome(
+                                job_receiver::TerminalDisposition::Indeterminate {
+                                    code: "worker_panicked".into(),
+                                    message:
+                                        "Worker process stopped before recording a terminal outcome"
+                                            .into(),
+                                },
+                            ),
+                        };
+                        (emitter, terminal)
+                    })
                 });
                 recover_panicked_agent(
                     &mut pool,
@@ -4437,26 +4592,12 @@ async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
                     &mut respawn_tasks,
                     observer.clone(),
                 );
-                if let Some((emitter, cancelled)) = panic_terminal {
-                    let publish = if cancelled {
-                        emitter
-                            .control(
-                                buzz_core::job::JobControlAction::Cancelled,
-                                "requester_cancelled".into(),
-                                None,
-                            )
-                            .await
-                    } else {
-                        emitter
-                            .indeterminate(
-                                "worker_panicked".into(),
-                                "Worker process stopped before recording a terminal outcome".into(),
-                            )
-                            .await
-                    };
-                    if let Err(error) = publish {
-                        tracing::warn!("publishing panicked agent-job terminal failed: {error}");
-                    }
+                if let Some(scope) = &panic_scope {
+                    spawn_job_terminal_finisher(
+                        job_privileges.clone(),
+                        scope.clone(),
+                        panic_terminal,
+                    );
                 }
                 if pool.live_count() == 0 && !any_respawn_in_flight(&crash_history) {
                     tracing::error!("all agents dead — exiting");
@@ -6453,7 +6594,7 @@ async fn run_models(args: ModelsArgs) -> Result<()> {
     Ok(())
 }
 
-fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
+fn build_mcp_servers(config: &Config, protected_paths: &[std::path::PathBuf]) -> Vec<McpServer> {
     if config.mcp_command.is_empty() {
         return vec![];
     }
@@ -6464,6 +6605,27 @@ fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
                 name: "BUZZ_ACP_DISPLAY_NAME".into(),
                 value: display_name,
             });
+        }
+    }
+    if !protected_paths.is_empty() {
+        let protected = protected_paths
+            .iter()
+            .map(|path| {
+                ensure!(path.is_absolute(), "protected MCP path must be absolute");
+                Ok(path.to_string_lossy().into_owned())
+            })
+            .collect::<Result<Vec<_>>>();
+        if let Ok(protected) = protected.and_then(|paths| {
+            serde_json::to_string(&paths).context("serializing protected MCP paths")
+        }) {
+            env.push(EnvVar {
+                name: "BUZZ_MCP_PROTECTED_PATHS_JSON".into(),
+                value: protected,
+            });
+        } else {
+            // A malformed internal path must not be downgraded to an
+            // unprotected generic MCP server.
+            return vec![];
         }
     }
     vec![McpServer::stdio(
@@ -9640,7 +9802,7 @@ mod build_mcp_servers_tests {
     #[test]
     fn generic_mcp_server_is_stdio_and_credential_free() {
         let config = test_config();
-        let servers = build_mcp_servers(&config);
+        let servers = build_mcp_servers(&config, &[]);
         assert_eq!(servers.len(), 1);
         let server = &servers[0];
         assert_eq!(server.name(), "test-mcp-server");
@@ -9658,7 +9820,7 @@ mod build_mcp_servers_tests {
         let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("BUZZ_AUTH_TAG", "test-attestation-tag");
         let config = test_config();
-        let servers = build_mcp_servers(&config);
+        let servers = build_mcp_servers(&config, &[]);
         std::env::remove_var("BUZZ_AUTH_TAG");
 
         let server = &servers[0];
@@ -9673,7 +9835,7 @@ mod build_mcp_servers_tests {
         let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("BUZZ_AUTH_TAG", "");
         let config = test_config();
-        let servers = build_mcp_servers(&config);
+        let servers = build_mcp_servers(&config, &[]);
         std::env::remove_var("BUZZ_AUTH_TAG");
 
         let server = &servers[0];
@@ -9686,7 +9848,7 @@ mod build_mcp_servers_tests {
         let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("BUZZ_ACP_DISPLAY_NAME", "Duncan");
         let config = test_config();
-        let servers = build_mcp_servers(&config);
+        let servers = build_mcp_servers(&config, &[]);
         std::env::remove_var("BUZZ_ACP_DISPLAY_NAME");
 
         let entry = servers[0]
@@ -9705,7 +9867,7 @@ mod build_mcp_servers_tests {
         let _guard = ENV_LOCK.lock().unwrap();
         std::env::remove_var("BUZZ_ACP_DISPLAY_NAME");
         let config = test_config();
-        let servers = build_mcp_servers(&config);
+        let servers = build_mcp_servers(&config, &[]);
 
         // Absent, not empty-valued: dev-mcp distinguishes the two and only
         // falls back to the npub when the key is missing or blank.
@@ -9723,7 +9885,7 @@ mod build_mcp_servers_tests {
         let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("BUZZ_ACP_DISPLAY_NAME", "");
         let config = test_config();
-        let servers = build_mcp_servers(&config);
+        let servers = build_mcp_servers(&config, &[]);
         std::env::remove_var("BUZZ_ACP_DISPLAY_NAME");
 
         assert!(
@@ -9741,7 +9903,7 @@ mod build_mcp_servers_tests {
         std::env::set_var("BUZZ_ACP_JOB_GRANTS_JSON", r#"{"version":1,"grants":[]}"#);
         std::env::set_var("BUZZ_ACP_JOB_GRANTS_FILE", "/tmp/ignored-grants.json");
         let config = test_config();
-        let servers = build_mcp_servers(&config);
+        let servers = build_mcp_servers(&config, &[]);
         std::env::remove_var("BUZZ_ACP_JOB_GRANTS_JSON");
         std::env::remove_var("BUZZ_ACP_JOB_GRANTS_FILE");
 
@@ -9752,10 +9914,37 @@ mod build_mcp_servers_tests {
     }
 
     #[test]
+    fn generic_mcp_receives_only_nonsecret_absolute_protected_paths() {
+        let config = test_config();
+        let protected = vec![
+            std::path::PathBuf::from("/operator/grants.json"),
+            std::path::PathBuf::from("/operator/job-ledger"),
+        ];
+        let servers = build_mcp_servers(&config, &protected);
+        let value = servers[0]
+            .stdio_env()
+            .iter()
+            .find(|entry| entry.name == "BUZZ_MCP_PROTECTED_PATHS_JSON")
+            .map(|entry| entry.value.as_str())
+            .expect("protected paths env");
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(value).unwrap(),
+            vec!["/operator/grants.json", "/operator/job-ledger"]
+        );
+        assert!(!value.contains("PRIVATE_KEY"));
+    }
+
+    #[test]
+    fn relative_protected_path_disables_generic_mcp() {
+        let config = test_config();
+        assert!(build_mcp_servers(&config, &["relative/path".into()]).is_empty());
+    }
+
+    #[test]
     fn empty_mcp_command_returns_no_servers() {
         let mut config = test_config();
         config.mcp_command = "".into();
-        let servers = build_mcp_servers(&config);
+        let servers = build_mcp_servers(&config, &[]);
         assert!(
             servers.is_empty(),
             "empty mcp_command should produce no MCP servers"
@@ -9766,7 +9955,7 @@ mod build_mcp_servers_tests {
     fn absolute_path_mcp_command_uses_file_stem_as_name() {
         let mut config = test_config();
         config.mcp_command = "/opt/bin/my-mcp-server".into();
-        let servers = build_mcp_servers(&config);
+        let servers = build_mcp_servers(&config, &[]);
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].name(), "my-mcp-server");
     }
@@ -9787,7 +9976,7 @@ mod build_mcp_servers_tests {
 
         // Confirm a non-empty command with no stem (e.g. just a dot) also falls back.
         config.mcp_command = ".".into();
-        let servers = build_mcp_servers(&config);
+        let servers = build_mcp_servers(&config, &[]);
         assert_eq!(servers.len(), 1);
         assert_eq!(
             servers[0].name(),

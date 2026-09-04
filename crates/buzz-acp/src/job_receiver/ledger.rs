@@ -155,6 +155,19 @@ impl JobLedger {
             .find(|claim| claim.request_event_id == request_event_id))
     }
 
+    /// Re-read the immutable claim record addressed by the frozen binding.
+    ///
+    /// Privileged-operation admission uses this instead of trusting the
+    /// in-memory dispatch clone retained since request handling.
+    pub(super) async fn reload_claim(
+        &self,
+        frozen: &StoredClaim,
+    ) -> Result<StoredClaim, LedgerError> {
+        let ledger = self.clone();
+        let frozen = frozen.clone();
+        tokio::task::spawn_blocking(move || ledger.reload_claim_blocking(&frozen)).await?
+    }
+
     fn claim_blocking(&self, candidate: StoredClaim) -> Result<ClaimDecision, LedgerError> {
         self.prepare_root()?;
         let key = ledger_key(
@@ -190,6 +203,22 @@ impl JobLedger {
                 Err(error.into())
             }
         }
+    }
+
+    fn reload_claim_blocking(&self, frozen: &StoredClaim) -> Result<StoredClaim, LedgerError> {
+        let key = ledger_key(
+            &frozen.community,
+            &frozen.requester,
+            &frozen.idempotency_key,
+        );
+        let path = self.root.join(format!("{key}.json"));
+        let stored: StoredClaim = serde_json::from_slice(&std::fs::read(path)?)?;
+        if !claims_match_exactly(&stored, frozen) {
+            return Err(LedgerError::Invalid(
+                "durable claim changed after admission".into(),
+            ));
+        }
+        Ok(stored)
     }
 
     fn mark_prompt_started_blocking(&self, claim: &StoredClaim) -> Result<bool, LedgerError> {
@@ -307,6 +336,18 @@ fn receipt_event(claim: &StoredClaim, kind: ReceiptKind) -> &Event {
         ReceiptKind::Processed => &claim.processed,
         ReceiptKind::Accepted => &claim.accepted,
     }
+}
+
+fn claims_match_exactly(left: &StoredClaim, right: &StoredClaim) -> bool {
+    left.version == right.version
+        && left.community == right.community
+        && left.requester == right.requester
+        && left.idempotency_key == right.idempotency_key
+        && left.digest == right.digest
+        && left.request_event_id == right.request_event_id
+        && left.request_event == right.request_event
+        && left.processed == right.processed
+        && left.accepted == right.accepted
 }
 
 fn compare_existing(path: &Path, candidate: &StoredClaim) -> Result<ClaimDecision, LedgerError> {

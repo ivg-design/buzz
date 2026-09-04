@@ -12,7 +12,7 @@ import {
   SettingsOptionRow,
 } from "./SettingsOptionGroup";
 import { SettingsSectionHeader } from "./SettingsSectionHeader";
-import { A2aGrantsSettingsCard } from "@/features/agents/ui/A2aGrantsSettingsCard";
+import { NemoWorkspaceSettingsCard } from "@/features/agents/ui/NemoWorkspaceSettingsCard";
 
 export function AgentsSettingsPanel() {
   const automaticallyMentionAgents = useKeepMentionedAgentsPinned();
@@ -50,7 +50,7 @@ export function AgentsSettingsPanel() {
           </SettingsOptionRow>
         </SettingsOptionGroup>
         <PreventSleepSettingsCard />
-        <A2aGrantsSettingsCard />
+        <NemoWorkspaceSettingsCard />
         <HarnessesSettingsPanel />
         <AgentDefaultsSettingsCard />
       </SettingsOptionGroupList>

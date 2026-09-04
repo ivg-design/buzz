@@ -5788,30 +5788,56 @@ fn dispatch_heartbeat(
 
 #[cfg(test)]
 mod agent_draft_prompt_tests {
+    fn assert_managed_prompt_safe(label: &str, prompt: &str) {
+        for forbidden in [
+            "BUZZ_PRIVATE_KEY",
+            "BUZZ_PRIVATE_KEY_FILE",
+            "BUZZ_AUTH_TAG",
+            "BUZZ_AUTH_TAG_FILE",
+            "`buzz ",
+            "| buzz ",
+            " buzz messages ",
+            " buzz feed ",
+            " buzz workflows ",
+            " buzz channels ",
+            " buzz projects ",
+            " buzz issues ",
+            " buzz repos ",
+            " buzz agents ",
+            " buzz jobs ",
+            " buzz mem ",
+        ] {
+            assert!(
+                !prompt.contains(forbidden),
+                "{label} exposed forbidden managed-agent guidance {forbidden:?}"
+            );
+        }
+    }
+
     #[test]
     fn shared_base_prompt_teaches_portable_agent_drafts() {
         let prompt = include_str!("base_prompt.md");
-        assert!(prompt.contains("buzz agents draft-create"));
         assert!(prompt.contains("ask for at most two things"));
         assert!(prompt.contains("what it should do day-to-day"));
         assert!(prompt.contains("owner saves it"));
         assert!(prompt.contains("Do not ask about runtime, provider, model, credentials"));
+        assert!(prompt.contains("owner or operator to create the agent"));
     }
 
     #[test]
     fn shared_base_prompt_names_current_context_framing() {
         let prompt = include_str!("base_prompt.md");
-        assert!(prompt.contains("UUID from `<context>`"));
+        assert!(prompt.contains("`<context>` includes project fields"));
         assert!(prompt.contains("reply destination supplied in the `<context>` block"));
         assert!(!prompt.contains("`[Context]`"));
     }
 
     #[test]
-    fn shared_base_prompt_teaches_real_newlines_for_multiline_messages() {
+    fn shared_base_prompt_teaches_typed_multiline_messages() {
         let prompt = include_str!("base_prompt.md");
-        assert!(prompt.contains("pass real newline bytes through stdin"));
-        assert!(prompt.contains("single-quoted shell strings preserve `\\n` literally"));
-        assert!(prompt.contains("buzz messages send ... --content -"));
+        assert!(prompt.contains("Pass multiline chat content directly"));
+        assert!(prompt.contains("`buzz_chat_send.content`"));
+        assert!(prompt.contains("preserves real newline characters"));
     }
 
     #[test]
@@ -5830,28 +5856,67 @@ mod agent_draft_prompt_tests {
     #[test]
     fn shared_base_prompt_teaches_not_to_duplicate_projects() {
         let prompt = include_str!("base_prompt.md");
-        assert!(prompt.contains("do **not** run `buzz projects create`"));
-        assert!(prompt.contains("buzz issues create --channel"));
-        assert!(prompt.contains("is not a Buzz repository"));
+        assert!(prompt.contains("produces a duplicate card"));
+        assert!(prompt.contains("requires a typed tool"));
+        assert!(prompt.contains("does not prove that a Buzz repository exists"));
     }
 
     #[test]
-    fn shared_base_prompt_teaches_single_command_mentions_and_preflight() {
+    fn shared_base_prompt_teaches_typed_chat_mention_limits() {
         let prompt = include_str!("base_prompt.md");
         assert!(prompt.contains("use the person's **exact display name as shown in Buzz**"));
         assert!(prompt.contains("Do not expand a short display name, infer a surname"));
         assert!(prompt.contains("Preserve it exactly; do not infer, expand, or look up a surname"));
-        assert!(prompt.contains("--mention <hex-or-npub>"));
-        assert!(prompt.contains("every presentation-only name that should notify"));
-        assert!(
-            prompt.contains("permits unresolved or ambiguous `@Name` text as presentation-only")
-        );
-        assert!(prompt.contains("success JSON's `mention_pubkeys`"));
-        assert!(prompt.contains("no follow-up verification command is needed"));
-        assert!(prompt.contains("stops before sending"));
-        assert!(prompt
-            .contains("add them explicitly with `buzz channels add-member` only when authorized"));
-        assert!(prompt.contains("never changes membership automatically"));
+        assert!(prompt.contains("`buzz_chat_send` accepts message content only"));
+        assert!(prompt.contains("do not claim it created a notification or recipient tag"));
+        assert!(prompt.contains("Use `buzz_a2a_dispatch` for a direct agent work request"));
+        assert!(prompt.contains("typed chat tool never changes channel membership"));
+    }
+
+    #[test]
+    fn all_managed_prompt_producers_exclude_credentials_and_shell_cli_guidance() {
+        let mut existing_thread = String::new();
+        crate::reply_placement::append_thread_instruction(&mut existing_thread, "a");
+        let mut new_thread = String::new();
+        crate::reply_placement::append_new_thread_instruction(&mut new_thread, "b");
+        let mut timeline = String::new();
+        crate::reply_placement::append_timeline_instruction(&mut timeline);
+
+        let queue_production = include_str!("queue.rs")
+            .split_once("#[cfg(test)]")
+            .map_or(include_str!("queue.rs"), |(production, _)| production);
+        let job_prompt_production = include_str!("job_receiver/prompt.rs")
+            .split_once("#[cfg(test)]")
+            .map_or(include_str!("job_receiver/prompt.rs"), |(production, _)| {
+                production
+            });
+        let heartbeat = super::default_heartbeat_prompt();
+        for (label, prompt) in [
+            ("base prompt", include_str!("base_prompt.md")),
+            ("heartbeat", heartbeat.as_str()),
+            ("core onboarding", crate::engram_fetch::ONBOARDING_NUDGE),
+            ("existing-thread routing", existing_thread.as_str()),
+            ("new-thread routing", new_thread.as_str()),
+            ("timeline routing", timeline.as_str()),
+            ("queue prompt production", queue_production),
+            ("job prompt production", job_prompt_production),
+        ] {
+            assert_managed_prompt_safe(label, prompt);
+        }
+
+        let base = include_str!("base_prompt.md");
+        for required in [
+            "buzz_chat_send",
+            "buzz_a2a_dispatch",
+            "buzz_a2a_inbox",
+            "buzz_a2a_status",
+            "buzz_a2a_cancel",
+            "buzz_a2a_handoff",
+        ] {
+            assert!(base.contains(required), "base prompt omitted {required}");
+        }
+        assert!(base.contains("Buzz CLI is unavailable"));
+        assert!(base.contains("reserved for an authenticated human operator"));
     }
 }
 
@@ -5861,16 +5926,9 @@ fn default_heartbeat_prompt() -> String {
         "[System: Heartbeat]\nTime: {now}\n\n\
          You have been awakened for a routine heartbeat. You have NO incoming messages or\n\
          active channel context for this turn.\n\n\
-         Your tasks:\n\
-         1. Run `buzz feed get --types needs_action` to check for pending workflow approvals or\n\
-            high-priority requests addressed to you.\n\
-         2. Run `buzz feed get --types mentions` to check for unanswered @mentions.\n\
-         3. If you find actionable items, address them using the appropriate CLI commands\n\
-            (e.g., `buzz workflows approve --token <UUID>`, `buzz messages send`,\n\
-            `buzz messages send --reply-to <event-id>`).\n\
-         4. If there are no pending actions or mentions, end your turn immediately.\n\n\
-         Do not run `buzz channels list` or `buzz messages search` unless you have a specific reason.\n\
-         Do not invent work — only act on items surfaced by the feed commands."
+         Managed agents do not poll Buzz through shell. Incoming chat and A2A work is\n\
+         delivered by the harness with a trusted session scope. Do not invent work or\n\
+         attempt an operator-only command; end your turn immediately."
     )
 }
 

@@ -1583,7 +1583,11 @@ fn append_channel_description(s: &mut String, channel_info: Option<&PromptChanne
 }
 
 /// Append project-home identity so create operations target this project.
-fn append_project_home(s: &mut String, channel_info: Option<&PromptChannelInfo>, channel_id: Uuid) {
+fn append_project_home(
+    s: &mut String,
+    channel_info: Option<&PromptChannelInfo>,
+    _channel_id: Uuid,
+) {
     let Some(project) = channel_info.and_then(|ci| ci.project.as_ref()) else {
         return;
     };
@@ -1614,9 +1618,12 @@ fn append_project_home(s: &mut String, channel_info: Option<&PromptChannelInfo>,
         }
         _ => s.push_str("\nDefault repository: none yet"),
     }
-    s.push_str(&format!(
-        "\nThis channel is that project's home. Tasks, repositories, and files created here belong to this project. Do not run `buzz projects create`. Create a repository with `buzz repos create --id <id> --name \"…\" --channel {channel_id}`. Create tasks with `buzz issues create --channel {channel_id} --subject \"…\" --content \"…\"`."
-    ));
+    s.push_str(
+        "\nThis channel is that project's home. Tasks, repositories, and files \
+         created here belong to this project. Do not create a duplicate project. \
+         Project administration is operator-only unless a typed tool explicitly \
+         exposes the requested operation.",
+    );
 }
 
 /// Format a `<context>` section from the resolved session scope and turn routing.
@@ -1659,17 +1666,17 @@ fn format_context_hints(
         } else if complete_conversation_context {
             "Conversation context included below."
         } else if has_conversation_context && is_reply {
-            "Thread context included below. Use `buzz messages thread --channel <UUID> --event <ID>` for full history if truncated."
+            "Thread context included below; it may be truncated. Do not fetch relay history through shell."
         } else if has_conversation_context {
-            "Conversation context included below. Use `buzz messages get --channel <UUID>` for full history if truncated."
+            "Conversation context included below; it may be truncated. Do not fetch relay history through shell."
         } else if conversation_context_had_delivered_events && is_reply {
-            "Earlier thread context was already delivered in this session. Use `buzz messages thread --channel <UUID> --event <ID>` to re-read the reply chain."
+            "Earlier thread context was already delivered in this session."
         } else if conversation_context_had_delivered_events {
-            "Earlier conversation context was already delivered in this session. Use `buzz messages get --channel <UUID>` to re-read it."
+            "Earlier conversation context was already delivered in this session."
         } else if is_reply {
-            "Use `buzz messages thread --channel <UUID> --event <ID>` to fetch the reply chain."
+            "No additional reply-chain history is available in this turn."
         } else {
-            "Use `buzz messages get --channel <UUID>` for conversation context."
+            "No additional conversation history is available in this turn."
         };
         let mut s = format!(
             "Scope: dm\n\
@@ -1702,11 +1709,11 @@ fn format_context_hints(
         let ctx_hint = if complete_conversation_context {
             "Thread context included below."
         } else if has_conversation_context {
-            "Thread context included below. Use `buzz messages thread --channel <UUID> --event <ID>` for full history if truncated."
+            "Thread context included below; it may be truncated. Do not fetch relay history through shell."
         } else if conversation_context_had_delivered_events {
-            "Earlier thread context was already delivered in this session. Use `buzz messages thread --channel <UUID> --event <ID>` to re-read it."
+            "Earlier thread context was already delivered in this session."
         } else {
-            "Use `buzz messages thread --channel <UUID> --event <ID>` to fetch thread context."
+            "No additional thread history is available in this turn."
         };
         let session_scope = if scope.is_thread() {
             "thread"
@@ -1745,9 +1752,7 @@ fn format_context_hints(
         );
         append_channel_description(&mut s, channel_info);
         append_project_home(&mut s, channel_info, channel_id);
-        s.push_str(
-            "\nHint: Use `buzz messages get --channel <UUID>` for recent messages if needed.",
-        );
+        s.push_str("\nIncoming channel context is delivered by the harness; do not poll the relay through shell.");
         if reply_placement == ReplyPlacement::Timeline {
             append_timeline_instruction(&mut s);
         } else if let Some(event_id) = reply_anchor {
@@ -2624,7 +2629,9 @@ mod tests {
         let newest_id = batch.events[1].event.id.to_hex();
         let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
         assert!(
-            prompt.contains(&format!("--reply-to {newest_id}")),
+            prompt.contains(&format!(
+                "Trusted reply destination: new thread root {newest_id}"
+            )),
             "reply anchor must target the newest event; prompt was:\n{prompt}"
         );
     }
@@ -2933,11 +2940,15 @@ mod tests {
         // human-aware reply anchoring from PR #1281: for human-facing turns in
         // a thread, the anchor is always the thread root.
         assert!(
-            prompt.contains(&format!("--reply-to {thread_b}")),
+            prompt.contains(&format!(
+                "Trusted reply destination: thread root {thread_b}"
+            )),
             "reply instruction should target the steering thread root: {prompt}"
         );
         assert!(
-            !prompt.contains(&format!("--reply-to {thread_a}")),
+            !prompt.contains(&format!(
+                "Trusted reply destination: thread root {thread_a}"
+            )),
             "reply instruction must NOT target the original thread: {prompt}"
         );
         // Steer framing still frames the original as in-progress work to continue.
@@ -4124,8 +4135,9 @@ mod tests {
                             assert!(prompt.contains("Session scope: thread"));
                             assert!(prompt.contains("Scope: thread"));
                             assert!(prompt.contains(&format!("Thread root: {root}")));
-                            assert!(prompt.contains("buzz messages thread"));
-                            assert!(!prompt.contains("buzz messages get"));
+                            assert!(prompt.contains(
+                                "No additional thread history is available in this turn"
+                            ));
                         } else {
                             assert!(prompt.contains("Session scope: channel"));
                             assert!(prompt.contains(if is_reply {
@@ -4143,7 +4155,8 @@ mod tests {
                         } else {
                             root.clone()
                         };
-                        assert!(prompt.contains(&format!("--reply-to {anchor}")));
+                        assert!(prompt.contains("Trusted reply destination:"));
+                        assert!(prompt.contains(&anchor));
                     }
                 }
             }
@@ -4229,14 +4242,12 @@ mod tests {
         )
         .join("\n\n");
         assert!(complete_prompt.contains("Thread context included below."));
-        assert!(!complete_prompt.contains("buzz messages thread"));
+        assert!(!complete_prompt.contains("Do not fetch relay history through shell"));
         assert!(!complete_prompt.contains("full history"));
         assert!(complete_prompt
             .contains("<thread-context included=\"2\" total=\"2\" truncated=\"false\">"));
         assert!(complete_prompt.contains("Let's refactor auth"));
-        assert!(complete_prompt.contains(&format!(
-            "IMPORTANT: For ordinary replies in this turn, use `--reply-to {root}`"
-        )));
+        assert!(complete_prompt.contains(&format!("Trusted reply destination: thread root {root}")));
 
         let prompt_with_prior_delivery = format_prompt(
             &batch,
@@ -4247,7 +4258,7 @@ mod tests {
             },
         )
         .join("\n\n");
-        assert!(prompt_with_prior_delivery.contains("buzz messages thread"));
+        assert!(prompt_with_prior_delivery.contains("it may be truncated"));
         assert!(prompt_with_prior_delivery
             .contains("<thread-context included=\"2\" total=\"2\" truncated=\"false\">"));
         assert!(prompt_with_prior_delivery.contains("Let's refactor auth"));
@@ -4269,8 +4280,8 @@ mod tests {
         .join("\n\n");
         assert!(truncated_prompt
             .contains("<thread-context included=\"2\" total=\"5\" truncated=\"true\">"));
-        assert!(truncated_prompt.contains("buzz messages thread"));
-        assert!(truncated_prompt.contains("for full history if truncated"));
+        assert!(truncated_prompt.contains("it may be truncated"));
+        assert!(truncated_prompt.contains("Do not fetch relay history through shell"));
 
         if let ConversationContext::Thread {
             total,
@@ -4294,7 +4305,7 @@ mod tests {
         assert!(missing_root_prompt
             .contains("<thread-context included=\"2\" total=\"2\" truncated=\"false\">"));
         assert!(missing_root_prompt.contains("Let's refactor auth"));
-        assert!(missing_root_prompt.contains("buzz messages thread"));
+        assert!(missing_root_prompt.contains("it may be truncated"));
     }
 
     #[test]
@@ -4345,7 +4356,7 @@ mod tests {
         assert!(mixed_prompt.contains("thread B root question"));
         assert!(mixed_prompt.contains("older reply in thread A"));
         assert!(mixed_prompt.contains("newer reply in thread B"));
-        assert!(mixed_prompt.contains("buzz messages thread"));
+        assert!(mixed_prompt.contains("it may be truncated"));
 
         let same_thread_batch = FlushBatch {
             channel_id: ch,
@@ -4368,7 +4379,7 @@ mod tests {
         assert!(same_thread_prompt
             .contains("<thread-context included=\"1\" total=\"1\" truncated=\"false\">"));
         assert!(same_thread_prompt.contains("thread B root question"));
-        assert!(!same_thread_prompt.contains("buzz messages thread"));
+        assert!(!same_thread_prompt.contains("it may be truncated"));
     }
 
     #[test]
@@ -4414,7 +4425,7 @@ mod tests {
         .join("\n\n");
         assert!(prompt.contains("Scope: dm"));
         assert!(prompt.contains("Conversation context included below."));
-        assert!(!prompt.contains("buzz messages get"));
+        assert!(!prompt.contains("Do not fetch relay history through shell"));
         assert!(!prompt.contains("full history"));
         assert!(prompt
             .contains("<conversation-context included=\"1\" total=\"1\" truncated=\"false\">"));
@@ -4687,7 +4698,7 @@ mod tests {
             "DM reply should have Scope: dm, got:\n{prompt}"
         );
         assert!(prompt.contains("Thread context included below."));
-        assert!(!prompt.contains("buzz messages thread"));
+        assert!(!prompt.contains("Do not fetch relay history through shell"));
         assert!(!prompt.contains("full history"));
         // Thread structural info should be present.
         assert!(
@@ -4726,7 +4737,9 @@ mod tests {
         };
 
         let trigger_only_prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
-        assert!(trigger_only_prompt.contains("fetch thread context"));
+        assert!(
+            trigger_only_prompt.contains("No additional thread history is available in this turn")
+        );
         assert!(!trigger_only_prompt.contains("already delivered in this session"));
 
         let prompt = format_prompt(
@@ -4739,7 +4752,6 @@ mod tests {
         .join("\n\n");
 
         assert!(prompt.contains("Earlier thread context was already delivered in this session"));
-        assert!(prompt.contains("buzz messages thread"));
         assert!(!prompt.contains("Thread context included below"));
         assert!(!prompt.contains("<thread-context"));
     }
@@ -4773,7 +4785,8 @@ mod tests {
             },
         )
         .join("\n\n");
-        assert!(trigger_only_prompt.contains("for conversation context"));
+        assert!(trigger_only_prompt
+            .contains("No additional conversation history is available in this turn"));
         assert!(!trigger_only_prompt.contains("already delivered in this session"));
 
         let prompt = format_prompt(
@@ -4789,7 +4802,6 @@ mod tests {
         assert!(
             prompt.contains("Earlier conversation context was already delivered in this session")
         );
-        assert!(prompt.contains("buzz messages get"));
         assert!(!prompt.contains("Conversation context included below"));
         assert!(!prompt.contains("<conversation-context"));
     }
@@ -4826,14 +4838,8 @@ mod tests {
         )
         .join("\n\n");
         assert!(prompt.contains("Scope: dm"));
-        assert!(
-            prompt.contains("buzz messages get"),
-            "DM non-reply hint should mention `buzz messages get`"
-        );
-        assert!(
-            !prompt.contains("buzz messages thread"),
-            "DM non-reply should NOT mention `buzz messages thread`"
-        );
+        assert!(prompt.contains("No additional conversation history is available in this turn"));
+        assert!(!prompt.contains("fetch relay history"));
     }
 
     #[test]
@@ -5335,7 +5341,7 @@ mod tests {
         // triggering event id.
         let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
         assert!(
-            prompt.contains(&format!("--reply-to {root_id}")),
+            prompt.contains(&format!("Trusted reply destination: thread root {root_id}")),
             "human-facing thread reply should anchor to the thread root"
         );
         assert!(
@@ -5343,8 +5349,8 @@ mod tests {
             "channel thread reply should describe reply-to as the default"
         );
         assert!(
-            prompt.contains("send that message without `--reply-to`"),
-            "channel thread reply should allow explicit channel-root/top-level requests"
+            prompt.contains("this turn is scope-bound"),
+            "channel thread reply should explain its trusted destination boundary"
         );
         assert!(
             !prompt.contains("Do not broadcast to the channel"),
@@ -5388,10 +5394,12 @@ mod tests {
         )
         .join("\n\n");
         assert!(
-            prompt.contains(&format!("--reply-to {root_id}")),
+            prompt.contains(&format!("Trusted reply destination: thread root {root_id}")),
             "DM thread reply should anchor at the canonical root"
         );
-        assert!(!prompt.contains(&format!("--reply-to {event_id}")));
+        assert!(!prompt.contains(&format!(
+            "Trusted reply destination: thread root {event_id}"
+        )));
     }
 
     #[test]
@@ -5416,7 +5424,9 @@ mod tests {
         // stale older thread.
         let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
         assert!(
-            prompt.contains(&format!("--reply-to {event_id}")),
+            prompt.contains(&format!(
+                "Trusted reply destination: new thread root {event_id}"
+            )),
             "top-level human message should anchor a new thread at the triggering event"
         );
         assert!(
@@ -5457,7 +5467,9 @@ mod tests {
         )
         .join("\n\n");
         assert!(
-            prompt.contains(&format!("--reply-to {event_id}")),
+            prompt.contains(&format!(
+                "Trusted reply destination: new thread root {event_id}"
+            )),
             "thread placement should open a thread for a top-level DM"
         );
     }
@@ -5491,15 +5503,19 @@ mod tests {
         // keep the conversation flat — NOT the triggering event or parent.
         let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
         assert!(
-            prompt.contains(&format!("--reply-to {root_id}")),
+            prompt.contains(&format!("Trusted reply destination: thread root {root_id}")),
             "human-facing nested reply should anchor to the thread root"
         );
         assert!(
-            !prompt.contains(&format!("--reply-to {event_id}")),
+            !prompt.contains(&format!(
+                "Trusted reply destination: thread root {event_id}"
+            )),
             "instruction should NOT anchor to the triggering event id"
         );
         assert!(
-            !prompt.contains(&format!("--reply-to {parent_id}")),
+            !prompt.contains(&format!(
+                "Trusted reply destination: thread root {parent_id}"
+            )),
             "instruction should NOT anchor to the parent event id"
         );
     }
@@ -5526,16 +5542,16 @@ mod tests {
 
         let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
         assert!(
-            prompt.contains(&format!("--reply-to {root_id}")),
+            prompt.contains(&format!("Trusted reply destination: thread root {root_id}")),
             "human-facing thread reply should anchor to the thread root"
         );
         assert!(
-            prompt.contains("channel-root, top-level"),
-            "instruction should tell agents to honor explicit root/top-level requests"
+            prompt.contains("different destination"),
+            "instruction should identify an explicit destination change"
         );
         assert!(
-            !prompt.contains("on EVERY `buzz messages send` call"),
-            "instruction should not make reply-to absolute for every send"
+            prompt.contains("owner or operator"),
+            "instruction should route destination changes to an authenticated operator"
         );
     }
 
@@ -5571,7 +5587,7 @@ mod tests {
         // to that thread's root.
         let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
         assert!(
-            prompt.contains(&format!("--reply-to {root_id}")),
+            prompt.contains(&format!("Trusted reply destination: thread root {root_id}")),
             "batched prompt should anchor to the last (threaded) event's root"
         );
     }
@@ -5609,7 +5625,9 @@ mod tests {
         // anchored to that top-level event (NOT the earlier thread's root).
         let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
         assert!(
-            prompt.contains(&format!("--reply-to {plain_id}")),
+            prompt.contains(&format!(
+                "Trusted reply destination: new thread root {plain_id}"
+            )),
             "batched top-level-last prompt should anchor to the last (top-level) event"
         );
         assert!(
@@ -6611,11 +6629,8 @@ mod tests {
         assert!(s.contains("Project slug: space-invaders-3d"));
         assert!(s.contains(&format!("Project owner: {owner}")));
         assert!(s.contains("Default repository: none yet"));
-        assert!(
-            s.contains("do not run `buzz projects create`")
-                || s.contains("Do not run `buzz projects create`")
-        );
-        assert!(s.contains("buzz issues create --channel 11111111-1111-4111-8111-111111111111"));
+        assert!(s.contains("Do not create a duplicate project"));
+        assert!(s.contains("Project administration is operator-only"));
         assert_eq!(
             s.lines()
                 .filter(|line| line.starts_with("Project:"))

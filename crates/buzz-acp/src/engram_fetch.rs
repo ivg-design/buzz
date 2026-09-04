@@ -19,11 +19,13 @@ use crate::relay::RestClient;
 
 /// Onboarding nudge for new agents with no core yet.
 ///
-/// Wording is from Tyler's brief: "No core memory found. Use `buzz mem`
-/// to create a core memory. Ask your user about yourself."
+/// The managed agent has no credentialed memory command, so onboarding asks
+/// the owner to define and persist the initial identity through an
+/// authenticated surface.
 pub const ONBOARDING_NUDGE: &str = "No core memory found. \
-Use `buzz mem set core \"…\"` to create one (it will hold your identity, \
-rules, and goals across sessions). Ask your user about yourself.";
+Ask your user to define your identity, durable rules, and goals. Preserve the \
+answer in workspace documentation, then ask the owner or operator to save it \
+through an authenticated memory surface.";
 
 /// Build the rendered prompt section for the agent's core.
 ///

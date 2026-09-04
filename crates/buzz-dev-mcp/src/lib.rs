@@ -219,7 +219,7 @@ mod tool_inventory_tests {
     use super::*;
 
     #[test]
-    fn generic_and_trusted_tool_names_do_not_collide() {
+    fn generic_and_trusted_tool_names_are_separate_and_secret_free() {
         let generic: HashSet<String> = DevMcp::tool_router()
             .list_all()
             .into_iter()
@@ -245,5 +245,20 @@ mod tool_inventory_tests {
             )
         );
         assert!(generic.contains("view_image"));
+        assert!(!generic.iter().any(|name| name.starts_with("buzz_")));
+        let inventory = serde_json::to_string(&DevMcp::tool_router().list_all())
+            .expect("serialize generic MCP tool inventory");
+        for forbidden in [
+            "BUZZ_PRIVATE_KEY",
+            "BUZZ_PRIVATE_KEY_FILE",
+            "BUZZ_AUTH_TAG",
+            "BUZZ_AUTH_TAG_FILE",
+            "`buzz ",
+        ] {
+            assert!(
+                !inventory.contains(forbidden),
+                "MCP tool inventory exposed forbidden guidance {forbidden:?}"
+            );
+        }
     }
 }

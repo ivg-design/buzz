@@ -59,9 +59,10 @@ fn timeline_places_top_level_channel_response_in_main_timeline() {
     )
     .join("\n\n");
 
-    assert!(prompt.contains("response appears directly in the current timeline"));
-    assert!(prompt.contains("without `--reply-to`"));
-    assert!(!prompt.contains(&format!("--reply-to {event_id}")));
+    assert!(prompt.contains("Trusted reply destination: current timeline"));
+    assert!(!prompt.contains(&format!(
+        "Trusted reply destination: thread root {event_id}"
+    )));
 }
 
 #[test]
@@ -86,8 +87,10 @@ fn timeline_top_level_response_remains_direct_with_thread_scoped_session() {
     )
     .join("\n\n");
 
-    assert!(prompt.contains("response appears directly in the current timeline"));
-    assert!(!prompt.contains(&format!("--reply-to {event_id}")));
+    assert!(prompt.contains("Trusted reply destination: current timeline"));
+    assert!(!prompt.contains(&format!(
+        "Trusted reply destination: thread root {event_id}"
+    )));
 }
 
 #[test]
@@ -113,9 +116,13 @@ fn timeline_keeps_existing_thread_response_at_canonical_root() {
     )
     .join("\n\n");
 
-    assert!(prompt.contains(&format!("--reply-to {root_id}")));
-    assert!(!prompt.contains(&format!("--reply-to {parent_id}")));
-    assert!(!prompt.contains(&format!("--reply-to {event_id}")));
+    assert!(prompt.contains(&format!("Trusted reply destination: thread root {root_id}")));
+    assert!(!prompt.contains(&format!(
+        "Trusted reply destination: thread root {parent_id}"
+    )));
+    assert!(!prompt.contains(&format!(
+        "Trusted reply destination: thread root {event_id}"
+    )));
 }
 
 #[test]
@@ -137,13 +144,16 @@ fn top_level_dm_honors_reply_placement_matrix() {
         assert!(prompt.contains("Scope: dm"));
         match placement {
             ReplyPlacement::Thread => {
-                assert!(prompt.contains(&format!("--reply-to {event_id}")));
-                assert!(!prompt.contains("response appears directly in the current timeline"));
+                assert!(prompt.contains(&format!(
+                    "Trusted reply destination: new thread root {event_id}"
+                )));
+                assert!(!prompt.contains("Trusted reply destination: current timeline"));
             }
             ReplyPlacement::Timeline => {
-                assert!(prompt.contains("without `--reply-to`"));
-                assert!(prompt.contains("response appears directly in the current timeline"));
-                assert!(!prompt.contains(&format!("--reply-to {event_id}")));
+                assert!(prompt.contains("Trusted reply destination: current timeline"));
+                assert!(!prompt.contains(&format!(
+                    "Trusted reply destination: new thread root {event_id}"
+                )));
             }
         }
     }
@@ -174,9 +184,13 @@ fn dm_event_already_in_thread_stays_at_canonical_root_under_both_policies() {
         )
         .join("\n\n");
 
-        assert!(prompt.contains(&format!("--reply-to {root_id}")));
-        assert!(!prompt.contains(&format!("--reply-to {parent_id}")));
-        assert!(!prompt.contains(&format!("--reply-to {event_id}")));
-        assert!(!prompt.contains("response appears directly in the current timeline"));
+        assert!(prompt.contains(&format!("Trusted reply destination: thread root {root_id}")));
+        assert!(!prompt.contains(&format!(
+            "Trusted reply destination: thread root {parent_id}"
+        )));
+        assert!(!prompt.contains(&format!(
+            "Trusted reply destination: thread root {event_id}"
+        )));
+        assert!(!prompt.contains("Trusted reply destination: current timeline"));
     }
 }

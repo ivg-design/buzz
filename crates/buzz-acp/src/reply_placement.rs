@@ -25,11 +25,11 @@ impl std::fmt::Display for ReplyPlacement {
 /// Keep a reply to an existing thread flat at its canonical root.
 pub(crate) fn append_thread_instruction(prompt: &mut String, event_id: &str) {
     prompt.push_str(&format!(
-        "\nIMPORTANT: For ordinary replies in this turn, use `--reply-to {event_id}` \
-         on `buzz messages send` so the conversation stays threaded. \
-         If the human explicitly asks for a channel-root, top-level, \
-         or broadcast post, send that message without `--reply-to`. \
-         If the requested destination is ambiguous, ask before sending."
+        "\nIMPORTANT: For ordinary replies in this turn, use `buzz_chat_send`. \
+         Its trusted session scope fixes the reply destination. Trusted reply \
+         destination: thread root {event_id}. Do not supply or reconstruct it. \
+         If the human asks for a different destination, explain that this turn \
+         is scope-bound and ask the owner or operator to perform that action."
     ));
 }
 
@@ -37,10 +37,9 @@ pub(crate) fn append_thread_instruction(prompt: &mut String, event_id: &str) {
 pub(crate) fn append_new_thread_instruction(prompt: &mut String, event_id: &str) {
     prompt.push_str(&format!(
         "\nIMPORTANT: This is a new top-level message. For ordinary replies in \
-         this turn, use `--reply-to {event_id}` on `buzz messages send` — the \
-         triggering message is the thread root. Do NOT reply into any other \
-         (older) thread. If the human explicitly asks for a channel-root, \
-         top-level, or broadcast post, send that message without `--reply-to`."
+         this turn, use `buzz_chat_send`. Its trusted session scope fixes the \
+         destination. Trusted reply destination: new thread root {event_id}. \
+         Do not supply or reconstruct it, and do not reply into an older thread."
     ));
 }
 
@@ -48,9 +47,11 @@ pub(crate) fn append_new_thread_instruction(prompt: &mut String, event_id: &str)
 pub(crate) fn append_timeline_instruction(prompt: &mut String) {
     prompt.push_str(
         "\nIMPORTANT: This is a top-level message. For ordinary replies \
-         in this turn, use `buzz messages send` without `--reply-to` so the \
-         response appears directly in the current timeline. If the human \
-         explicitly asks to start or use a thread, honor that request.",
+         in this turn, use `buzz_chat_send`. Its trusted session scope places \
+         the response directly in the current timeline. Trusted reply \
+         destination: current timeline. Do not supply or \
+         reconstruct a destination. If the human asks for a thread, explain \
+         that this turn is scope-bound and ask the owner or operator to start it.",
     );
 }
 

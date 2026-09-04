@@ -41,7 +41,7 @@ pub fn render(request: &JobRequest, request_event_id: &str) -> Option<String> {
          Task summary:\n{}\n\
          Acceptance criteria:\n{}\n\
          Required contracts:\n{}\n\
-         Do not invoke `buzz jobs` or publish lifecycle events yourself. The harness is the sole lifecycle authority.\n\
+         Do not publish job lifecycle events through chat or dispatch/cancel tools. The harness is the sole lifecycle authority. `buzz_a2a_handoff` is the only model-facing lifecycle control available while executing this request.\n\
          Your final assistant message must be exactly one JSON object with schema_version `buzz.job-outcome.v1`, this exact operation_id, request_event_id, and scope_digest, and outcome `success`, `failed`, or `indeterminate`. Success also requires summary, artifacts, and evidence (at least one inert artifact/evidence reference). Failed requires code, reason, and retryable. Indeterminate requires code, reason, and retryable=false. Do not wrap the object in a code fence or add prose.\n\
          </agent-job>",
         request.common.operation_id,

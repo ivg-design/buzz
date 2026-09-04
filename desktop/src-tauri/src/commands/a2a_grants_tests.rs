@@ -1,5 +1,22 @@
 use super::*;
 
+#[cfg(unix)]
+fn executable_script(root: &Path, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = root.join("fake-git");
+    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write fake git");
+    let mut permissions = path.metadata().expect("fake git metadata").permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(&path, permissions).expect("make fake git executable");
+    path
+}
+
+#[cfg(unix)]
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+}
+
 #[derive(Default)]
 struct MemoryAuthorityStore {
     value: Mutex<Option<String>>,
@@ -85,6 +102,44 @@ fn github_remote_canonicalization_accepts_https_and_ssh_only() {
     ] {
         assert!(canonical_github_remote(input).is_err(), "{input}");
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn local_git_inspection_kills_descendants_at_its_deadline() {
+    let temp = tempfile::tempdir().expect("temp root");
+    let marker = temp.path().join("escaped-descendant");
+    let script = executable_script(
+        temp.path(),
+        &format!(
+            "(sleep 1; printf escaped > {}) &\nsleep 30",
+            shell_quote(&marker)
+        ),
+    );
+    let started = std::time::Instant::now();
+
+    let error = git_output_with_limits(&script, temp.path(), &[], Duration::from_millis(75), 1024)
+        .expect_err("deadline must stop fake git");
+
+    assert_eq!(
+        error,
+        "local Git inspection exceeded its wall-clock deadline"
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
+    std::thread::sleep(Duration::from_millis(1_100));
+    assert!(!marker.exists(), "the background descendant survived");
+}
+
+#[cfg(unix)]
+#[test]
+fn local_git_inspection_stops_streaming_output_at_its_capture_limit() {
+    let temp = tempfile::tempdir().expect("temp root");
+    let script = executable_script(temp.path(), "while :; do printf 0123456789abcdef; done");
+
+    let error = git_output_with_limits(&script, temp.path(), &[], Duration::from_secs(2), 512)
+        .expect_err("capture limit must stop fake git");
+
+    assert_eq!(error, "local Git inspection exceeded its output limit");
 }
 
 #[test]

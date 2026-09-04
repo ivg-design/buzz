@@ -15,11 +15,18 @@ use std::{
     path::{Component, Path, PathBuf},
     process::Command,
     sync::{Mutex, OnceLock},
+    time::Duration,
 };
 use tauri::State;
 use zeroize::Zeroizing;
 
-use crate::{app_state::AppState, managed_agents::RelayAgentInfo};
+use crate::{
+    app_state::AppState,
+    managed_agents::{
+        bounded_command::{output_with_limits, BoundedCommandError, BoundedCommandLimits},
+        RelayAgentInfo,
+    },
+};
 
 use super::{
     agent_discovery::list_relay_agents_for_selection, project_repo_paths::canonical_repos_roots,
@@ -34,7 +41,8 @@ const MAX_CAPABILITIES_PER_GRANT: usize = 64;
 const MAX_DOCUMENT_BYTES: usize = 512 * 1024;
 const MAX_REPOSITORIES_SCANNED: usize = 512;
 const MAX_VALUES_PER_GRANT: usize = 128;
-const MAX_GIT_OUTPUT_BYTES: usize = 16 * 1024;
+const GIT_INSPECTION_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_GIT_OUTPUT_BYTES: u64 = 16 * 1024;
 
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -533,8 +541,25 @@ fn inspect_checkout(root: &Path) -> Result<InspectedCheckout, String> {
 }
 
 fn git_output(root: &Path, args: &[&str]) -> Result<String, String> {
+    git_output_with_limits(
+        Path::new("git"),
+        root,
+        args,
+        GIT_INSPECTION_TIMEOUT,
+        MAX_GIT_OUTPUT_BYTES,
+    )
+}
+
+fn git_output_with_limits(
+    program: &Path,
+    root: &Path,
+    args: &[&str],
+    timeout: Duration,
+    capture_limit: u64,
+) -> Result<String, String> {
     let null_config = if cfg!(windows) { "NUL" } else { "/dev/null" };
-    let output = Command::new("git")
+    let mut command = Command::new(program);
+    command
         .args(args)
         .current_dir(root)
         .env_clear()
@@ -546,12 +571,34 @@ fn git_output(root: &Path, args: &[&str]) -> Result<String, String> {
         .env("GIT_CONFIG_GLOBAL", null_config)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_PAGER", "cat")
-        .env("LC_ALL", "C")
-        .output()
-        .map_err(|error| format!("inspect local Git checkout: {error}"))?;
-    if output.stdout.len() > MAX_GIT_OUTPUT_BYTES || output.stderr.len() > MAX_GIT_OUTPUT_BYTES {
-        return Err("local Git inspection exceeded its output limit".into());
-    }
+        .env("LC_ALL", "C");
+    let output = output_with_limits(
+        command,
+        BoundedCommandLimits {
+            timeout,
+            capture_limit,
+            storage_root: None,
+        },
+    )
+    .map_err(|error| match error {
+        BoundedCommandError::Spawn => "could not spawn local Git inspection".to_string(),
+        BoundedCommandError::Setup => {
+            "could not establish bounded local Git process ownership".to_string()
+        }
+        BoundedCommandError::Timeout => {
+            "local Git inspection exceeded its wall-clock deadline".to_string()
+        }
+        BoundedCommandError::OutputLimit(_) => {
+            "local Git inspection exceeded its output limit".to_string()
+        }
+        BoundedCommandError::StorageLimit(_) => {
+            "local Git inspection exceeded an unexpected storage limit".to_string()
+        }
+        BoundedCommandError::Wait => "could not wait for local Git inspection".to_string(),
+        BoundedCommandError::Read => {
+            "could not read bounded local Git inspection output".to_string()
+        }
+    })?;
     if !output.status.success() || !output.stderr.is_empty() {
         return Err("local Git inspection failed".into());
     }

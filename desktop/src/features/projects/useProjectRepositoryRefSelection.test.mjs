@@ -93,3 +93,20 @@ test("selections survive option refreshes within the same repository", async () 
   assert.equal(result.current.activeBranch, "release");
   assert.equal(result.current.selectedTag, "v1");
 });
+
+test("a local-only branch stays selected across remote option refreshes", async () => {
+  const { act, rerender, result } = await renderSelection({
+    ...REPO_A,
+    branchOptions: ["main"],
+  });
+
+  // The dropdown merges local Git branches with these remote options.
+  // An unpublished branch is a valid user selection too.
+  act(() => result.current.selectBranch("GHproject_and_issue_triage"));
+  rerender({ ...REPO_A, branchOptions: ["main"], tags: [] });
+  assert.equal(result.current.activeBranch, "GHproject_and_issue_triage");
+
+  // Repository identity still bounds the selection.
+  rerender(REPO_B);
+  assert.equal(result.current.activeBranch, "trunk");
+});

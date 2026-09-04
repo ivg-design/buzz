@@ -42,10 +42,12 @@ export function useProjectRepositoryRefSelection(input: {
       return;
     }
     setSelectedBranch((currentBranch) => {
-      if (currentBranch && input.branchOptions.includes(currentBranch)) {
-        return currentBranch;
-      }
-      return input.defaultBranch ?? input.branchOptions[0] ?? null;
+      // Remote options are not authoritative for local-only branches offered
+      // by the dropdown. Preserve explicit choices through refetches; repo
+      // changes and branch deletion actions already reset the selection.
+      return (
+        currentBranch ?? input.defaultBranch ?? input.branchOptions[0] ?? null
+      );
     });
     setSelectedTag((currentTag) => {
       if (currentTag && input.tags.some((tag) => tag.name === currentTag)) {

@@ -172,7 +172,13 @@ impl TrustedRelay {
         }
         let content = job.canonical_json().map_err(|error| error.to_string())?;
         let tags = build_job_tags(&job).map_err(|error| error.to_string())?;
-        let event = self.sign(EventBuilder::new(Kind::Custom(kind as u16), content).tags(tags))?;
+        // The owner authorization travels as the trusted `x-auth-tag` HTTP
+        // header. Job envelopes have a closed routing-tag schema and must not
+        // inherit that authorization tag from ordinary chat signing.
+        let event = EventBuilder::new(Kind::Custom(kind as u16), content)
+            .tags(tags)
+            .sign_with_keys(&self.keys)
+            .map_err(|_| "event signing failed".to_owned())?;
         JobEvent::parse(&event).map_err(|error| error.to_string())?;
         Ok(event)
     }

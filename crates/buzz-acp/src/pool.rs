@@ -32,8 +32,8 @@ use uuid::Uuid;
 
 use crate::acp::{
     extract_model_config_options, extract_model_state, extract_thought_level_config_id,
-    model_in_catalog, resolve_model_switch_method, AcpClient, AcpError, EnvVar, McpServer,
-    ModelSwitchMethod, StopReason, SystemPromptTransport,
+    model_in_catalog, resolve_model_switch_method, AcpClient, AcpError, EnvVar, JobSessionPolicy,
+    McpServer, ModelSwitchMethod, StopReason, SystemPromptTransport,
 };
 use crate::config::{compose_scoped_session_title, DedupMode, PermissionMode};
 use crate::observer;
@@ -1485,7 +1485,21 @@ async fn create_session_and_apply_model_at(
             channel.scope.and_then(SessionScope::root_event_id),
         )
     });
-    let mut mcp_servers = mcp_servers_with_git_origin(
+    let job_policy = channel
+        .scope
+        .filter(|scope| scope.is_job())
+        .map(JobSessionPolicy::for_scope)
+        .transpose()?;
+    if job_policy.is_some() && !agent.acp.job_policy_supported() {
+        return Err(AcpError::Protocol(format!(
+            "agent '{}' is chat-only: no checksum-qualified native-tool-off JobPolicyV1 executor is available",
+            agent.agent_name
+        )));
+    }
+    // A Job receives no ambient or generic stdio MCP. Its one allowed server
+    // is appended below only after the signer-bound scope starts a fresh,
+    // ephemeral trusted HTTP capability.
+    let mut mcp_servers = mcp_servers_for_scope(
         &ctx.mcp_servers,
         channel.scope,
         channel.channel_type,
@@ -1511,24 +1525,43 @@ async fn create_session_and_apply_model_at(
                 scope.telemetry_label()
             )));
         }
+        (None, Some(scope), _) if scope.is_job() => {
+            return Err(AcpError::Protocol(
+                "job sessions require the harness-owned trusted MCP factory".into(),
+            ));
+        }
         _ => None,
     };
 
-    let resp = agent
-        .acp
-        .session_new_full(
-            working_directory,
-            mcp_servers,
-            session_new_system_prompt(
-                is_goose,
-                agent.protocol_version,
-                &agent.agent_name,
-                agent.acp.developer_instructions_append_supported(),
-                combined_system_prompt.as_deref(),
-            ),
-            session_title.as_deref(),
-        )
-        .await?;
+    let system_prompt = session_new_system_prompt(
+        is_goose,
+        agent.protocol_version,
+        &agent.agent_name,
+        agent.acp.developer_instructions_append_supported(),
+        combined_system_prompt.as_deref(),
+    );
+    let resp = if let Some(policy) = job_policy.as_ref() {
+        agent
+            .acp
+            .session_new_job_full(
+                working_directory,
+                mcp_servers,
+                system_prompt,
+                session_title.as_deref(),
+                policy,
+            )
+            .await?
+    } else {
+        agent
+            .acp
+            .session_new_full(
+                working_directory,
+                mcp_servers,
+                system_prompt,
+                session_title.as_deref(),
+            )
+            .await?
+    };
 
     if is_goose && agent.goose_system_prompt_supported != Some(false) {
         if let Some(prompt) = combined_system_prompt.as_deref() {
@@ -1728,9 +1761,7 @@ async fn create_session_and_apply_model_at(
     // advertises the requested mode in session/new. Agents that don't support
     // the mode (e.g., goose crashes on unrecognized set_config_option values)
     // are safely skipped — the harness auto-approves via handle_permission_request.
-    if !ctx.permission_mode.is_default()
-        && agent_supports_mode(&resp.raw, ctx.permission_mode.as_wire_str())
-    {
+    if should_apply_permission_mode(channel.scope, &ctx.permission_mode, &resp.raw) {
         apply_permission_mode(&mut agent.acp, &resp.session_id, &ctx.permission_mode).await?;
     }
 
@@ -1770,6 +1801,33 @@ fn mcp_servers_with_git_origin(
         }
     }
     servers
+}
+
+fn mcp_servers_for_scope(
+    servers: &[McpServer],
+    scope: Option<&SessionScope>,
+    channel_type: Option<&str>,
+    agent_name: Option<&str>,
+) -> Vec<McpServer> {
+    if scope.is_some_and(SessionScope::is_job) {
+        Vec::new()
+    } else {
+        mcp_servers_with_git_origin(servers, scope, channel_type, agent_name)
+    }
+}
+
+fn should_apply_permission_mode(
+    scope: Option<&SessionScope>,
+    permission_mode: &PermissionMode,
+    session_new: &serde_json::Value,
+) -> bool {
+    !scope.is_some_and(SessionScope::is_job)
+        && !permission_mode.is_default()
+        && agent_supports_mode(session_new, permission_mode.as_wire_str())
+}
+
+fn should_send_initial_message(source: &PromptSource, is_new_session: bool) -> bool {
+    is_new_session && !source.scope().is_some_and(SessionScope::is_job)
 }
 
 /// Outcome of a live model-switch RPC returned by [`apply_model_switch`].
@@ -2932,7 +2990,7 @@ pub async fn run_prompt_task(
         PromptSource::Heartbeat => agent.state.heartbeat_standing_context_sent,
     };
 
-    if is_new_session {
+    if should_send_initial_message(&source, is_new_session) {
         if let (PromptSource::Channel(scope), Some(ref initial_msg)) =
             (&source, &ctx.initial_message)
         {
@@ -5729,6 +5787,41 @@ mod tests {
     }
 
     #[test]
+    fn job_session_skips_global_permission_mode_even_when_advertised() {
+        let scope = SessionScope::Job {
+            channel_id: Uuid::new_v4(),
+            operation_id: Uuid::new_v4().to_string(),
+            request_event_id: "a".repeat(64),
+        };
+        let session_new = json!({
+            "modes": {"availableModes": [{"id": "bypassPermissions"}]}
+        });
+        assert!(!should_apply_permission_mode(
+            Some(&scope),
+            &PermissionMode::BypassPermissions,
+            &session_new,
+        ));
+        assert!(should_apply_permission_mode(
+            Some(&conv(Uuid::new_v4())),
+            &PermissionMode::BypassPermissions,
+            &session_new,
+        ));
+    }
+
+    #[test]
+    fn job_session_never_receives_configured_initial_message() {
+        let job = PromptSource::Channel(SessionScope::Job {
+            channel_id: Uuid::new_v4(),
+            operation_id: Uuid::new_v4().to_string(),
+            request_event_id: "a".repeat(64),
+        });
+        let chat = PromptSource::Channel(conv(Uuid::new_v4()));
+        assert!(!should_send_initial_message(&job, true));
+        assert!(should_send_initial_message(&chat, true));
+        assert!(!should_send_initial_message(&chat, false));
+    }
+
+    #[test]
     fn public_session_forwards_channel_origin_to_mcp() {
         let channel_id = Uuid::new_v4();
         let scope = SessionScope::Conversation { channel_id };
@@ -5771,12 +5864,11 @@ mod tests {
             request_event_id: "a".repeat(64),
         };
         let servers =
-            mcp_servers_with_git_origin(&[test_mcp_server()], Some(&scope), Some("stream"), None);
-        let env = servers[0].stdio_env();
-        assert!(env
-            .iter()
-            .any(|entry| entry.name == "BUZZ_GIT_ORIGIN_CHANNEL_ID"));
-        assert!(!env.iter().any(|entry| entry.name.starts_with("BUZZ_MCP_")));
+            mcp_servers_for_scope(&[test_mcp_server()], Some(&scope), Some("stream"), None);
+        assert!(
+            servers.is_empty(),
+            "a Job must not inherit generic stdio or ambient MCP servers"
+        );
     }
 
     // These pin the initial_message dispatch path (run_prompt_task, ~line 855):
@@ -10737,7 +10829,7 @@ done"#;
     }
 
     #[tokio::test]
-    async fn job_session_new_uses_receiver_verified_working_directory() {
+    async fn job_session_never_reaches_unqualified_provider() {
         let (acp, capture) = scripted_agent(Some(true)).await;
         let mut agent = owned(acp);
         let ctx = tests::make_prompt_context_no_owner();
@@ -10747,7 +10839,7 @@ done"#;
             request_event_id: "a".repeat(64),
         };
         let verified = "/tmp/buzz-receiver-verified-checkout";
-        create_session_and_apply_model_at(
+        let error = create_session_and_apply_model_at(
             &mut agent,
             &ctx,
             verified,
@@ -10762,12 +10854,12 @@ done"#;
             },
         )
         .await
-        .expect("job session creation");
-        let wire: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&capture).expect("captured session/new"))
-                .expect("session/new JSON");
-        assert_eq!(wire["params"]["cwd"], verified);
-        let _ = std::fs::remove_file(capture);
+        .expect_err("unqualified provider must remain chat-only");
+        assert!(error.to_string().contains("chat-only"));
+        assert!(
+            !capture.exists(),
+            "an unqualified provider must receive neither session/new nor session/prompt"
+        );
         agent.acp.shutdown().await;
     }
 

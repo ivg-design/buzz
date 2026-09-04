@@ -8,7 +8,10 @@
 //! 4. [`AcpClient::session_prompt_with_idle_timeout`] — send prompt with idle/hard deadline, return stop reason
 //! 5. [`AcpClient::session_cancel`] / [`AcpClient::cancel_with_cleanup`] — cancel in-flight turn
 
+use std::collections::HashMap;
+
 use futures_util::StreamExt;
+use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
@@ -57,6 +60,89 @@ pub struct McpServerHttp {
 pub struct HttpHeader {
     pub name: String,
     pub value: String,
+}
+
+/// Immutable harness policy for one admitted agent-job session.
+///
+/// The digest commits to the signed request event and fixed execution policy.
+/// Adapters must advertise support and echo the exact digest before Buzz sends
+/// any job prompt.
+#[derive(Clone)]
+pub(crate) struct JobSessionPolicy {
+    digest: String,
+}
+
+impl JobSessionPolicy {
+    pub(crate) fn new(digest: String) -> Result<Self, AcpError> {
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(AcpError::Protocol(
+                "job session policy digest must be lowercase SHA-256".into(),
+            ));
+        }
+        Ok(Self { digest })
+    }
+
+    /// Bind the immutable execution policy to the signed request event that
+    /// produced this admitted Job scope. The request event id commits to the
+    /// signed grant body; the remaining scope fields prevent cross-channel or
+    /// cross-operation replay of an otherwise valid acknowledgement.
+    pub(crate) fn for_scope(scope: &crate::scope::SessionScope) -> Result<Self, AcpError> {
+        let crate::scope::SessionScope::Job {
+            channel_id,
+            operation_id,
+            request_event_id,
+        } = scope
+        else {
+            return Err(AcpError::Protocol(
+                "job session policy requires an admitted Job scope".into(),
+            ));
+        };
+
+        let mut digest = Sha256::new();
+        digest.update(b"buzz-job-session-policy-v1\0");
+        digest.update(channel_id.as_bytes());
+        update_digest_field(&mut digest, operation_id.as_bytes());
+        update_digest_field(&mut digest, request_event_id.as_bytes());
+        digest.update(b"native-tools=disabled\0");
+        digest.update(b"ambient-mcp=disabled\0");
+        digest.update(b"permission-requests=deny\0");
+        digest.update(b"mcp=buzz-trusted-session\0");
+        Self::new(hex::encode(digest.finalize()))
+    }
+
+    fn wire(&self) -> serde_json::Value {
+        serde_json::json!({
+            "version": 1,
+            "digest": self.digest,
+            "nativeTools": "disabled",
+            "ambientMcp": "disabled",
+            "permissionRequests": "deny",
+        })
+    }
+
+    fn acknowledged_by(&self, result: &serde_json::Value) -> bool {
+        let Some(ack) = result.pointer("/_meta/buzz/jobPolicy") else {
+            return false;
+        };
+        ack.get("version").and_then(serde_json::Value::as_u64) == Some(1)
+            && ack.get("applied").and_then(serde_json::Value::as_bool) == Some(true)
+            && ack.get("digest").and_then(serde_json::Value::as_str) == Some(self.digest.as_str())
+    }
+}
+
+fn update_digest_field(digest: &mut Sha256, value: &[u8]) {
+    digest.update((value.len() as u64).to_be_bytes());
+    digest.update(value);
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SessionPermissionPolicy {
+    Interactive,
+    Deny,
 }
 
 impl McpServer {
@@ -258,6 +344,65 @@ fn build_initialize_params() -> serde_json::Value {
     })
 }
 
+fn advertises_job_policy(result: &serde_json::Value) -> bool {
+    let Some(policy) = result.pointer("/_meta/buzz/jobPolicy") else {
+        return false;
+    };
+    policy.get("version").and_then(serde_json::Value::as_u64) == Some(1)
+        && policy
+            .get("nativeTools")
+            .and_then(serde_json::Value::as_str)
+            == Some("disabled")
+        && policy.get("mcp").and_then(serde_json::Value::as_str) == Some("explicitOnly")
+        && policy
+            .get("permissionRequests")
+            .and_then(serde_json::Value::as_str)
+            == Some("deny")
+        && policy
+            .get("methods")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|methods| methods.iter().any(|method| method == "session/new"))
+}
+
+fn exact_trusted_job_mcp(servers: &[McpServer]) -> bool {
+    let [McpServer::Http(server)] = servers else {
+        return false;
+    };
+    if server.server_type != "http" || server.name != crate::trusted_mcp::SERVER_NAME {
+        return false;
+    }
+    let Ok(url) = url::Url::parse(&server.url) else {
+        return false;
+    };
+    let loopback = match url.host() {
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        _ => false,
+    };
+    if url.scheme() != "http"
+        || !loopback
+        || url.port().is_none()
+        || url.path() != "/mcp"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return false;
+    }
+    let [header] = server.headers.as_slice() else {
+        return false;
+    };
+    let Some(token) = header.value.strip_prefix("Bearer ") else {
+        return false;
+    };
+    header.name == "Authorization"
+        && token.len() == 64
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 /// ACP client that owns an agent subprocess and communicates over its stdio.
 ///
 /// One `AcpClient` per agent process. Multiple sessions can be created on the
@@ -330,6 +475,20 @@ pub struct AcpClient {
     /// Whether the adapter explicitly advertises the ACP v1 append-only system
     /// prompt extension targeting Codex `developerInstructions` on session/new.
     developer_instructions_append_supported: bool,
+    /// True only for the recognized Claude adapter when it advertises the
+    /// exact immutable Buzz job-policy extension. Codex and unknown adapters
+    /// remain chat-only because they cannot disable ambient native reads.
+    job_policy_supported: bool,
+    /// Harness-owned qualification for an immutable, checksum-pinned adapter.
+    /// No production spawn path enables this yet: Desktop must first bundle and
+    /// verify the patched Claude adapter. Adapter self-reporting alone is never
+    /// an authority signal.
+    job_policy_adapter_qualified: bool,
+    /// Permission behavior is bound to the harness-created session ID. Unknown
+    /// IDs deny by default; an active Job turn also denies regardless of what
+    /// session ID an adapter places in its callback.
+    session_permission_policies: HashMap<String, SessionPermissionPolicy>,
+    active_prompt_session_id: Option<String>,
     /// Per-turn channel for receiving goose-native non-cancelling steer
     /// requests from the main loop. Installed by
     /// [`install_steer_rx`](Self::install_steer_rx) at dispatch and
@@ -351,6 +510,7 @@ pub struct AcpClient {
 }
 
 const MAX_CAPTURED_TURN_TEXT_BYTES: usize = 128 * 1024;
+const CLAUDE_JOB_POLICY_ADAPTER_NAME: &str = "@agentclientprotocol/claude-agent-acp";
 const HARNESS_ONLY_ENV: &[&str] = &[
     "BUZZ_PRIVATE_KEY",
     "BUZZ_ACP_PRIVATE_KEY",
@@ -794,6 +954,10 @@ impl AcpClient {
             steering_supported: false,
             http_mcp_supported: false,
             developer_instructions_append_supported: false,
+            job_policy_supported: false,
+            job_policy_adapter_qualified: false,
+            session_permission_policies: HashMap::new(),
+            active_prompt_session_id: None,
             steer_rx: None,
             goose_usage: UsageTracker::default(),
             standard_usage: StandardUsageTracker::default(),
@@ -860,8 +1024,24 @@ impl AcpClient {
             .unwrap_or(false);
         self.developer_instructions_append_supported =
             supports_developer_instructions_append(&result);
+        self.job_policy_supported = self.job_policy_adapter_qualified
+            && self.standard_adapter == Some(StandardAdapterKind::Claude)
+            && result
+                .pointer("/agentInfo/name")
+                .and_then(serde_json::Value::as_str)
+                == Some(CLAUDE_JOB_POLICY_ADAPTER_NAME)
+            && advertises_job_policy(&result);
         tracing::debug!(target: "acp::init", "initialize response: {result}");
         Ok(result)
+    }
+
+    /// Qualify a fake adapter for protocol-level tests. Production callers
+    /// cannot enable this; Desktop's checksum-pinned resolver will provide the
+    /// first real qualification path in a separate reviewed change.
+    #[cfg(test)]
+    pub(crate) fn qualify_claude_job_policy_adapter_for_test(&mut self) {
+        self.job_policy_adapter_qualified = true;
+        self.standard_adapter = Some(StandardAdapterKind::Claude);
     }
 
     /// Send the ACP `authenticate` request for an adapter-advertised method.
@@ -898,6 +1078,55 @@ impl AcpClient {
         system_prompt: Option<SystemPromptTransport<'_>>,
         session_title: Option<&str>,
     ) -> Result<SessionNewResponse, AcpError> {
+        self.session_new_full_with_policy(cwd, mcp_servers, system_prompt, session_title, None)
+            .await
+    }
+
+    /// Create an immutable job session. The adapter must have advertised the
+    /// exact JobPolicyV1 extension, must acknowledge this policy digest, and
+    /// receives only the one ephemeral trusted HTTP MCP.
+    pub(crate) async fn session_new_job_full(
+        &mut self,
+        cwd: &str,
+        mcp_servers: Vec<McpServer>,
+        system_prompt: Option<SystemPromptTransport<'_>>,
+        session_title: Option<&str>,
+        policy: &JobSessionPolicy,
+    ) -> Result<SessionNewResponse, AcpError> {
+        if !self.job_policy_supported {
+            let message = match self.standard_adapter {
+                Some(StandardAdapterKind::Codex) => {
+                    "Codex A2A execution is disabled: its adapter cannot enforce signed-path native-tool isolation"
+                }
+                _ => {
+                    "A2A execution is disabled for this adapter: immutable native-tool-off JobPolicyV1 was not advertised"
+                }
+            };
+            return Err(AcpError::Protocol(message.into()));
+        }
+        if !exact_trusted_job_mcp(&mcp_servers) {
+            return Err(AcpError::Protocol(
+                "job sessions require exactly one loopback buzz-trusted-session HTTP MCP".into(),
+            ));
+        }
+        self.session_new_full_with_policy(
+            cwd,
+            mcp_servers,
+            system_prompt,
+            session_title,
+            Some(policy),
+        )
+        .await
+    }
+
+    async fn session_new_full_with_policy(
+        &mut self,
+        cwd: &str,
+        mcp_servers: Vec<McpServer>,
+        system_prompt: Option<SystemPromptTransport<'_>>,
+        session_title: Option<&str>,
+        job_policy: Option<&JobSessionPolicy>,
+    ) -> Result<SessionNewResponse, AcpError> {
         let mut params = serde_json::json!({
             "cwd": cwd,
             "mcpServers": mcp_servers,
@@ -916,11 +1145,50 @@ impl AcpClient {
             // Merge — _meta may already carry systemPrompt from MetaAppend above.
             params["_meta"]["sessionTitle"] = serde_json::Value::String(title.to_owned());
         }
+        if let Some(policy) = job_policy {
+            params["_meta"]["buzz"]["jobPolicy"] = policy.wire();
+            // These fields are hard overrides for the recognized Claude ACP
+            // adapter. The adapter's attestation is still required because a
+            // client-supplied `_meta` object is not itself an enforcement
+            // boundary.
+            params["_meta"]["claudeCode"]["options"] = serde_json::json!({
+                "tools": [],
+                "disallowedTools": [
+                    "Bash", "Read", "Edit", "Write", "Glob", "Grep",
+                    "WebFetch", "WebSearch", "Task", "Agent", "Skill",
+                    "NotebookEdit", "TodoWrite", "AskUserQuestion",
+                    "EnterPlanMode", "ExitPlanMode", "KillShell", "TaskOutput"
+                ],
+                "settingSources": [],
+                "strictMcpConfig": true,
+                "permissionMode": "dontAsk",
+                "allowDangerouslySkipPermissions": false,
+                "agents": {},
+                "plugins": [],
+                "skills": [],
+                "hooks": {}
+            });
+        }
         let result = self.send_request("session/new", params).await?;
+        if let Some(policy) = job_policy {
+            if !policy.acknowledged_by(&result) {
+                return Err(AcpError::Protocol(
+                    "adapter did not acknowledge the exact immutable job policy digest".into(),
+                ));
+            }
+        }
         let session_id = result["sessionId"]
             .as_str()
             .ok_or_else(|| AcpError::Protocol("session/new response missing sessionId".into()))?
             .to_owned();
+        self.session_permission_policies.insert(
+            session_id.clone(),
+            if job_policy.is_some() {
+                SessionPermissionPolicy::Deny
+            } else {
+                SessionPermissionPolicy::Interactive
+            },
+        );
         tracing::info!(target: "acp::session", "session created: {session_id}");
         Ok(SessionNewResponse {
             session_id,
@@ -1024,6 +1292,10 @@ impl AcpClient {
         idle_timeout: std::time::Duration,
         max_duration: std::time::Duration,
     ) -> Result<StopReason, AcpError> {
+        // Bind every permission callback received while this prompt is active
+        // to the harness-created session policy. A malicious adapter cannot
+        // escape a Job denial by writing a different sessionId in its request.
+        self.active_prompt_session_id = Some(session_id.to_owned());
         self.turn_text.clear();
         self.turn_text_overflowed = false;
         let params = build_prompt_params(session_id, prompt_blocks);
@@ -1051,6 +1323,7 @@ impl AcpClient {
         if let Err(e) = self.write_ndjson(&msg).await {
             self.last_prompt_id = None;
             self.current_hard_deadline = None;
+            self.clear_active_prompt(session_id);
             return Err(e);
         }
 
@@ -1070,6 +1343,7 @@ impl AcpClient {
             Ok(_) => {
                 self.last_prompt_id = None;
                 self.current_hard_deadline = None;
+                self.clear_active_prompt(session_id);
             }
             Err(AcpError::IdleTimeout(_) | AcpError::HardTimeout { .. }) => {
                 // Leave last_prompt_id and current_hard_deadline set —
@@ -1078,6 +1352,7 @@ impl AcpClient {
             Err(_) => {
                 self.last_prompt_id = None;
                 self.current_hard_deadline = None;
+                self.clear_active_prompt(session_id);
             }
         }
         self.parse_prompt_response(session_id, &result?)
@@ -1142,6 +1417,12 @@ impl AcpClient {
     /// Whether the initialized adapter accepts Streamable HTTP MCP servers.
     pub fn http_mcp_supported(&self) -> bool {
         self.http_mcp_supported
+    }
+
+    /// Whether this exact initialized adapter positively advertises the
+    /// native-tool-off JobPolicyV1 contract. This never returns true for Codex.
+    pub(crate) fn job_policy_supported(&self) -> bool {
+        self.job_policy_supported
     }
 
     /// Consume per-turn usage for NIP-AM publishing. Goose/buzz-agent is an
@@ -1248,8 +1529,11 @@ impl AcpClient {
             }
         };
 
-        self.cancel_with_cleanup_until(session_id, hard_deadline)
-            .await
+        let result = self
+            .cancel_with_cleanup_until(session_id, hard_deadline)
+            .await;
+        self.clear_active_prompt(session_id);
+        result
     }
 
     /// Cancel a user-interrupted turn with a bounded grace window.
@@ -1272,12 +1556,20 @@ impl AcpClient {
     ) -> Result<StopReason, AcpError> {
         let _ = self.current_hard_deadline.take();
         let hard_deadline = tokio::time::Instant::now() + grace;
-        match self
+        let result = match self
             .cancel_with_cleanup_until(session_id, hard_deadline)
             .await
         {
             Err(AcpError::HardTimeout { .. }) => Err(AcpError::CancelDrainTimeout(grace)),
             other => other,
+        };
+        self.clear_active_prompt(session_id);
+        result
+    }
+
+    fn clear_active_prompt(&mut self, session_id: &str) {
+        if self.active_prompt_session_id.as_deref() == Some(session_id) {
+            self.active_prompt_session_id = None;
         }
     }
 
@@ -2199,10 +2491,13 @@ impl AcpClient {
         }
     }
 
-    /// Auto-approve a `session/request_permission` request from the agent.
+    /// Handle a `session/request_permission` request under the harness-owned
+    /// per-session policy.
     ///
-    /// Finds the option with `kind == "allow_once"` and responds with its `optionId`.
-    /// If no `allow_once` option exists, falls back to `reject_once`.
+    /// Interactive sessions preserve the existing allow-once behavior. Job and
+    /// unknown sessions deny: select `reject_once` when offered, otherwise send
+    /// a protocol-level cancelled outcome. While a Job prompt is active, its
+    /// denial wins even if the adapter claims a different session ID.
     ///
     /// **Critical:** Never hardcode `optionId` — always find it dynamically by `kind`.
     ///
@@ -2229,6 +2524,43 @@ impl AcpClient {
             "session/request_permission id={id}, {} options",
             options.len()
         );
+
+        let active_policy = self
+            .active_prompt_session_id
+            .as_deref()
+            .and_then(|session_id| self.session_permission_policies.get(session_id))
+            .copied();
+        let claimed_policy = msg
+            .pointer("/params/sessionId")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|session_id| self.session_permission_policies.get(session_id))
+            .copied();
+        let deny = active_policy == Some(SessionPermissionPolicy::Deny)
+            || claimed_policy == Some(SessionPermissionPolicy::Deny)
+            || (active_policy != Some(SessionPermissionPolicy::Interactive)
+                && claimed_policy != Some(SessionPermissionPolicy::Interactive));
+
+        if deny {
+            let response = options
+                .iter()
+                .find(|option| {
+                    option.get("kind").and_then(serde_json::Value::as_str) == Some("reject_once")
+                })
+                .and_then(|option| option.get("optionId"))
+                .and_then(serde_json::Value::as_str)
+                .map_or_else(
+                    || permission_response_cancelled(&id),
+                    |option_id| permission_response_selected(&id, option_id),
+                );
+            tracing::warn!(
+                target: "acp::permission",
+                "denying permission id={id} under job-or-unknown session policy"
+            );
+            self.write_ndjson(&response).await?;
+            self.permission_responded = true;
+            self.pending_permission_id = None;
+            return Ok(());
+        }
 
         // Find allow_once by kind — NEVER hardcode optionId.
         let allow_once = options
@@ -2400,6 +2732,7 @@ fn permission_response_cancelled(id: &serde_json::Value) -> serde_json::Value {
 /// Full `session/new` response — session ID plus the raw JSON result.
 ///
 /// Callers use the extractor helpers to pull model info from `raw`.
+#[derive(Debug)]
 pub struct SessionNewResponse {
     pub session_id: String,
     /// The full `result` value from the JSON-RPC response.
@@ -3433,6 +3766,340 @@ mod tests {
         AcpClient::spawn("bash", &["-c".into(), script.into()], &[], false)
             .await
             .expect("failed to spawn test script")
+    }
+
+    fn job_policy_capability_result() -> serde_json::Value {
+        serde_json::json!({
+            "protocolVersion": 2,
+            "agentCapabilities": {"mcpCapabilities": {"http": true}},
+            "agentInfo": {
+                "name": CLAUDE_JOB_POLICY_ADAPTER_NAME,
+                "version": "test"
+            },
+            "_meta": {"buzz": {"jobPolicy": {
+                "version": 1,
+                "methods": ["session/new"],
+                "nativeTools": "disabled",
+                "mcp": "explicitOnly",
+                "permissionRequests": "deny"
+            }}}
+        })
+    }
+
+    fn trusted_job_server() -> McpServer {
+        McpServer::http(
+            crate::trusted_mcp::SERVER_NAME,
+            "http://127.0.0.1:32123/mcp",
+            vec![HttpHeader {
+                name: "Authorization".into(),
+                value: format!("Bearer {}", "b".repeat(64)),
+            }],
+        )
+    }
+
+    #[test]
+    fn job_policy_digest_is_scope_bound_and_stable() {
+        let channel_id = uuid::Uuid::parse_str("28dc2bc3-30d6-4ab2-b845-c1d9a42ba065").unwrap();
+        let first = crate::scope::SessionScope::Job {
+            channel_id,
+            operation_id: "operation-one".into(),
+            request_event_id: "a".repeat(64),
+        };
+        let same = first.clone();
+        let second = crate::scope::SessionScope::Job {
+            channel_id,
+            operation_id: "operation-two".into(),
+            request_event_id: "a".repeat(64),
+        };
+        let first = JobSessionPolicy::for_scope(&first).unwrap();
+        let same = JobSessionPolicy::for_scope(&same).unwrap();
+        let second = JobSessionPolicy::for_scope(&second).unwrap();
+        assert_eq!(first.digest, same.digest);
+        assert_ne!(first.digest, second.digest);
+    }
+
+    #[test]
+    fn job_mcp_validator_accepts_only_exact_loopback_capability() {
+        assert!(exact_trusted_job_mcp(&[trusted_job_server()]));
+
+        let invalid = [
+            McpServer::stdio("buzz-trusted-session", "server", vec![], vec![]),
+            McpServer::http(
+                "buzz-trusted-session",
+                "https://127.0.0.1:32123/mcp",
+                vec![HttpHeader {
+                    name: "Authorization".into(),
+                    value: format!("Bearer {}", "b".repeat(64)),
+                }],
+            ),
+            McpServer::http(
+                "buzz-trusted-session",
+                "http://example.test:32123/mcp",
+                vec![HttpHeader {
+                    name: "Authorization".into(),
+                    value: format!("Bearer {}", "b".repeat(64)),
+                }],
+            ),
+            McpServer::http(
+                "buzz-trusted-session",
+                "http://127.0.0.1:32123/mcp?escape=1",
+                vec![HttpHeader {
+                    name: "Authorization".into(),
+                    value: format!("Bearer {}", "b".repeat(64)),
+                }],
+            ),
+        ];
+        for server in invalid {
+            assert!(!exact_trusted_job_mcp(&[server]));
+        }
+        assert!(!exact_trusted_job_mcp(&[
+            trusted_job_server(),
+            trusted_job_server()
+        ]));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn qualified_claude_job_session_sends_locked_policy_and_exact_mcp() {
+        let capture =
+            std::env::temp_dir().join(format!("buzz-acp-job-policy-{}.json", uuid::Uuid::new_v4()));
+        let policy = JobSessionPolicy::new("a".repeat(64)).unwrap();
+        let init = job_policy_capability_result();
+        let script = format!(
+            r#"read -r _init
+printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{init}}}'
+read -r session_new
+printf '%s' "$session_new" > {capture:?}
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"sessionId":"job-session","_meta":{{"buzz":{{"jobPolicy":{{"version":1,"applied":true,"digest":"{digest}"}}}}}}}}}}'
+sleep 10"#,
+            init = init,
+            capture = capture,
+            digest = policy.digest,
+        );
+        let (mut client, dir) = spawn_named_script("claude-agent-acp", &script).await;
+        client.qualify_claude_job_policy_adapter_for_test();
+        client.initialize().await.unwrap();
+        assert!(client.job_policy_supported());
+        let response = client
+            .session_new_job_full(
+                "/tmp/verified-checkout",
+                vec![trusted_job_server()],
+                Some(SystemPromptTransport::ClaudeMeta("job instructions")),
+                Some("job"),
+                &policy,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.session_id, "job-session");
+
+        let wire: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&capture).unwrap()).unwrap();
+        assert_eq!(wire["method"], "session/new");
+        assert_eq!(wire["params"]["mcpServers"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            wire["params"]["mcpServers"][0]["name"],
+            crate::trusted_mcp::SERVER_NAME
+        );
+        assert_eq!(
+            wire["params"]["_meta"]["buzz"]["jobPolicy"]["digest"],
+            policy.digest
+        );
+        let options = &wire["params"]["_meta"]["claudeCode"]["options"];
+        assert_eq!(options["tools"], serde_json::json!([]));
+        assert_eq!(options["settingSources"], serde_json::json!([]));
+        assert_eq!(options["strictMcpConfig"], true);
+        assert_eq!(options["permissionMode"], "dontAsk");
+        assert_eq!(options["allowDangerouslySkipPermissions"], false);
+        for tool in ["Bash", "Read", "Edit", "Write", "WebFetch", "Task", "Agent"] {
+            assert!(options["disallowedTools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry == tool));
+        }
+        client.shutdown().await;
+        let _ = std::fs::remove_file(capture);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn adapter_self_report_without_harness_qualification_cannot_receive_job_session() {
+        let init = job_policy_capability_result();
+        let script = format!(
+            "read -r _init; printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{init}}}'; sleep 10"
+        );
+        let (mut client, dir) = spawn_named_script("claude-agent-acp", &script).await;
+        client.initialize().await.unwrap();
+        assert!(!client.job_policy_supported());
+        let before = client.next_id;
+        let error = client
+            .session_new_job_full(
+                "/tmp/verified-checkout",
+                vec![trusted_job_server()],
+                None,
+                None,
+                &JobSessionPolicy::new("a".repeat(64)).unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("JobPolicyV1"));
+        assert_eq!(client.next_id, before, "session/new must stay off the wire");
+        client.shutdown().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_cannot_claim_job_policy_support() {
+        let init = job_policy_capability_result();
+        let script = format!(
+            "read -r _init; printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{init}}}'; sleep 10"
+        );
+        let (mut client, dir) = spawn_named_script("codex-acp", &script).await;
+        client.job_policy_adapter_qualified = true;
+        client.initialize().await.unwrap();
+        assert!(!client.job_policy_supported());
+        let before = client.next_id;
+        let error = client
+            .session_new_job_full(
+                "/tmp/verified-checkout",
+                vec![trusted_job_server()],
+                None,
+                None,
+                &JobSessionPolicy::new("a".repeat(64)).unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Codex A2A execution is disabled"));
+        assert_eq!(client.next_id, before, "session/new must stay off the wire");
+        client.shutdown().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wrong_job_policy_ack_stops_before_prompt() {
+        let init = job_policy_capability_result();
+        let script = format!(
+            r#"read -r _init
+printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{init}}}'
+read -r _session_new
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"sessionId":"job-session","_meta":{{"buzz":{{"jobPolicy":{{"version":1,"applied":true,"digest":"{wrong}"}}}}}}}}}}'
+sleep 10"#,
+            wrong = "f".repeat(64),
+        );
+        let (mut client, dir) = spawn_named_script("claude-agent-acp", &script).await;
+        client.qualify_claude_job_policy_adapter_for_test();
+        client.initialize().await.unwrap();
+        let error = client
+            .session_new_job_full(
+                "/tmp/verified-checkout",
+                vec![trusted_job_server()],
+                None,
+                None,
+                &JobSessionPolicy::new("a".repeat(64)).unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("did not acknowledge"));
+        assert_eq!(
+            client.next_id, 2,
+            "a rejected session must never advance to session/prompt"
+        );
+        client.shutdown().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn job_permission_denial_cannot_leak_into_or_be_bypassed_by_chat() {
+        let capture = std::env::temp_dir().join(format!(
+            "buzz-acp-permission-policy-{}.ndjson",
+            uuid::Uuid::new_v4()
+        ));
+        let script = format!(
+            "read -r first; printf '%s\\n' \"$first\" >> {capture:?}; \
+             read -r second; printf '%s\\n' \"$second\" >> {capture:?}",
+            capture = capture,
+        );
+        let mut client = spawn_script(&script).await;
+        client
+            .session_permission_policies
+            .insert("job".into(), SessionPermissionPolicy::Deny);
+        client
+            .session_permission_policies
+            .insert("chat".into(), SessionPermissionPolicy::Interactive);
+
+        client.active_prompt_session_id = Some("job".into());
+        client
+            .handle_permission_request(&serde_json::json!({
+                "jsonrpc":"2.0", "id": 71, "method":"session/request_permission",
+                "params":{"sessionId":"chat", "options":[
+                    {"kind":"allow_once", "optionId":"allow"},
+                    {"kind":"reject_once", "optionId":"reject"}
+                ]}
+            }))
+            .await
+            .unwrap();
+        client.active_prompt_session_id = Some("chat".into());
+        client
+            .handle_permission_request(&serde_json::json!({
+                "jsonrpc":"2.0", "id":"permission-72", "method":"session/request_permission",
+                "params":{"sessionId":"chat", "options":[
+                    {"kind":"allow_once", "optionId":"allow"},
+                    {"kind":"reject_once", "optionId":"reject"}
+                ]}
+            }))
+            .await
+            .unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), client.child.wait())
+            .await
+            .expect("capture child exits")
+            .expect("capture child status");
+        let responses = std::fs::read_to_string(&capture).unwrap();
+        let responses = responses
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(responses[0]["id"], 71);
+        assert_eq!(responses[0]["result"]["outcome"]["optionId"], "reject");
+        assert_eq!(responses[1]["id"], "permission-72");
+        assert_eq!(responses[1]["result"]["outcome"]["optionId"], "allow");
+        let _ = std::fs::remove_file(capture);
+    }
+
+    #[tokio::test]
+    async fn unknown_permission_without_reject_option_is_cancelled() {
+        let capture = std::env::temp_dir().join(format!(
+            "buzz-acp-permission-cancel-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let script = format!(
+            "read -r response; printf '%s' \"$response\" > {capture:?}",
+            capture = capture,
+        );
+        let mut client = spawn_script(&script).await;
+        client
+            .handle_permission_request(&serde_json::json!({
+                "jsonrpc":"2.0", "id":"unknown", "method":"session/request_permission",
+                "params":{"sessionId":"unregistered", "options":[
+                    {"kind":"allow_once", "optionId":"allow"}
+                ]}
+            }))
+            .await
+            .unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), client.child.wait())
+            .await
+            .expect("capture child exits")
+            .expect("capture child status");
+        let response: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&capture).unwrap()).unwrap();
+        assert_eq!(response["id"], "unknown");
+        assert_eq!(response["result"]["outcome"]["outcome"], "cancelled");
+        assert!(response["result"]["outcome"].get("optionId").is_none());
+        let _ = std::fs::remove_file(capture);
     }
 
     #[cfg(unix)]

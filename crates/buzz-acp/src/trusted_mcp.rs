@@ -27,7 +27,7 @@ use crate::acp::{HttpHeader, McpServer};
 use crate::job_receiver::JobPrivilegeRegistry;
 use crate::scope::SessionScope;
 
-const SERVER_NAME: &str = "buzz-trusted-session";
+pub(crate) const SERVER_NAME: &str = "buzz-trusted-session";
 const MIN_TOKEN_BYTES: usize = 32;
 
 /// Immutable harness identity used to create a fresh capability for each ACP

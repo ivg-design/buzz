@@ -5,6 +5,7 @@ import * as React from "react";
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import { useChannelsQuery } from "@/features/channels/hooks";
 import { ChannelScreenLoadingFallback } from "@/features/channels/ui/ChannelScreenLoadingFallback";
+import { useCommunities } from "@/features/communities/useCommunities";
 import { useProfileQuery } from "@/features/profile/hooks";
 import type { Project } from "@/features/projects/hooks";
 import {
@@ -100,6 +101,7 @@ export function ProjectChannelHome({
   targetMessageId?: string | null;
 }) {
   const { goChannel, goProject, goProjects } = useAppNavigation();
+  const { activeCommunity } = useCommunities();
   const sidebar = useOptionalSidebar();
   const identityQuery = useIdentityQuery();
   const profileQuery = useProfileQuery();
@@ -242,6 +244,7 @@ export function ProjectChannelHome({
         project={project}
         projects={projects}
         repository={workspaceRepository}
+        reposDir={activeCommunity?.reposDir}
         tab={workspaceSheetTab}
       />
     ) : null;
@@ -433,6 +436,7 @@ export function ProjectChannelHome({
                 onRepositoryChange={handleRepositoryChange}
                 project={project}
                 projects={projects}
+                reposDir={activeCommunity?.reposDir}
               />
             </ProjectHomeColumn>
           ) : null}

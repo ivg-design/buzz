@@ -41,7 +41,7 @@ fn clone_url_owner_repo_name(clone_url: &str) -> Option<String> {
     ))
 }
 
-fn normalized_clone_url(value: &str) -> &str {
+pub(crate) fn normalized_clone_url(value: &str) -> &str {
     value.trim().trim_end_matches('/').trim_end_matches(".git")
 }
 

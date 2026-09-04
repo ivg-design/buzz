@@ -211,7 +211,9 @@ export function WorkspaceTabs({
     ownerProfile?.nip05Handle?.trim() ||
     undefined;
   const externalHost =
-    repoSource === "remote" && repoHost.kind === "external"
+    repoSource === "remote" &&
+    repoHost.kind === "external" &&
+    repoHost.host !== "github.com"
       ? repoHost.host
       : undefined;
   const gitDataState: GitDataState = displayedSnapshot

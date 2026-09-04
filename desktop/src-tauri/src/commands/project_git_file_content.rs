@@ -1,13 +1,63 @@
 use super::project_git::first_output_line;
 use super::project_git_exec::{
-    build_git_auth_config, clean_branch, clean_target_ref, run_git, validate_workspace_clone_url,
-    GitAuthConfig,
+    build_git_clone_auth_config, clean_branch, clean_target_ref, run_git_in_request,
+    validate_local_clone_url_for_workspace, GitAuthConfig, GitRequestBudget,
 };
 use super::project_repo_paths::find_local_repo_dir;
 use crate::app_state::AppState;
 use tauri::State;
 
 const MAX_PREVIEW_BYTES: u64 = 64 * 1024;
+const REMOTE_HISTORY_DEPTH_ARG: &str = "--depth=100";
+const REMOTE_SEED_DEPTH_ARG: &str = "--depth=1";
+
+#[derive(Clone, Copy)]
+pub(crate) enum RemoteBlobFilter {
+    MetadataOnly,
+    PreviewContent,
+    DiffContent,
+}
+
+impl RemoteBlobFilter {
+    fn argument(self) -> &'static str {
+        match self {
+            Self::MetadataOnly => "--filter=blob:none",
+            Self::PreviewContent => "--filter=blob:limit=65536",
+            Self::DiffContent => "--filter=blob:limit=1048576",
+        }
+    }
+}
+
+/// Arguments shared by every temporary remote checkout used for repository
+/// browsing. The clone is partial, shallow, single-branch, tag-free, and does
+/// not materialize a worktree. Callers fetch an explicit target afterward when
+/// the one-commit seed is sufficient.
+pub(crate) fn bounded_remote_clone_args<'a>(
+    clone_url: &'a str,
+    repo_path: &'a str,
+    branch: Option<&'a str>,
+    seed_only: bool,
+    blob_filter: RemoteBlobFilter,
+) -> Vec<&'a str> {
+    let mut args = vec![
+        "clone",
+        blob_filter.argument(),
+        if seed_only {
+            REMOTE_SEED_DEPTH_ARG
+        } else {
+            REMOTE_HISTORY_DEPTH_ARG
+        },
+        "--single-branch",
+        "--no-tags",
+        "--no-checkout",
+    ];
+    if let Some(branch) = branch {
+        args.push("--branch");
+        args.push(branch);
+    }
+    args.extend(["--", clone_url, repo_path]);
+    args
+}
 
 pub(crate) fn read_preview_content(
     repo_dir: &std::path::Path,
@@ -54,6 +104,7 @@ pub(crate) fn validate_repo_file_path(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn checkout_project_repo(
     repo_dir: &std::path::Path,
     clone_url: &str,
@@ -61,6 +112,8 @@ pub(crate) fn checkout_project_repo(
     target_ref: Option<&str>,
     target_commit: Option<&str>,
     auth: &GitAuthConfig,
+    budget: &mut GitRequestBudget,
+    blob_filter: RemoteBlobFilter,
 ) -> Result<(), String> {
     let repo_path = repo_dir
         .to_str()
@@ -68,24 +121,25 @@ pub(crate) fn checkout_project_repo(
     let explicit_target = target_ref.or(target_commit);
 
     if let Some(fetch_ref) = explicit_target {
-        run_git(
+        let clone_args =
+            bounded_remote_clone_args(clone_url, repo_path, None, true, blob_filter);
+        run_git_in_request(&clone_args, None, auth, budget)?;
+        run_git_in_request(
             &[
-                "clone",
-                "--filter=blob:none",
-                "--no-checkout",
-                clone_url,
-                repo_path,
+                "fetch",
+                "--depth=100",
+                "--no-tags",
+                "--end-of-options",
+                "origin",
+                fetch_ref,
             ],
-            None,
-            auth,
-        )?;
-        run_git(
-            &["fetch", "--depth=100", "origin", fetch_ref],
             Some(repo_dir),
             auth,
+            budget,
         )?;
         if let Some(expected_commit) = target_commit {
-            let fetched_commit = run_git(&["rev-parse", "FETCH_HEAD"], Some(repo_dir), auth)
+            let fetched_commit =
+                run_git_in_request(&["rev-parse", "FETCH_HEAD"], Some(repo_dir), auth, budget)
                 .ok()
                 .and_then(|output| first_output_line(&output))
                 .map(|commit| commit.to_ascii_lowercase())
@@ -96,27 +150,24 @@ pub(crate) fn checkout_project_repo(
                 );
             }
         }
-        run_git(
-            &["checkout", "--detach", "FETCH_HEAD"],
+        run_git_in_request(
+            &["update-ref", "--no-deref", "HEAD", "FETCH_HEAD"],
             Some(repo_dir),
             auth,
+            budget,
         )?;
         return Ok(());
     }
 
-    let mut clone_args = vec!["clone", "--filter=blob:none"];
-    if let Some(branch) = branch {
-        clone_args.push("--branch");
-        clone_args.push(branch);
-    }
-    clone_args.push(clone_url);
-    clone_args.push(repo_path);
-    if run_git(&clone_args, None, auth).is_err() && branch.is_some() {
-        run_git(
-            &["clone", "--filter=blob:none", clone_url, repo_path],
-            None,
-            auth,
-        )?;
+    let clone_args = bounded_remote_clone_args(clone_url, repo_path, branch, false, blob_filter);
+    if run_git_in_request(&clone_args, None, auth, budget).is_err() && branch.is_some() {
+        if repo_dir.exists() {
+            std::fs::remove_dir_all(repo_dir)
+                .map_err(|error| format!("reset temporary repository: {error}"))?;
+        }
+        let fallback_args =
+            bounded_remote_clone_args(clone_url, repo_path, None, false, blob_filter);
+        run_git_in_request(&fallback_args, None, auth, budget)?;
     }
     Ok(())
 }
@@ -130,9 +181,9 @@ pub async fn get_project_repo_file_content(
     path: String,
     state: State<'_, AppState>,
 ) -> Result<Option<String>, String> {
-    validate_workspace_clone_url(&clone_url, &state)?;
+    validate_local_clone_url_for_workspace(&clone_url, &state)?;
     validate_repo_file_path(&path)?;
-    let auth = build_git_auth_config(&state)?;
+    let auth = build_git_clone_auth_config(&clone_url, &state)?;
     let branch = clean_branch(default_branch);
     let target_ref = clean_target_ref(target_ref);
     let target_commit = target_commit
@@ -143,6 +194,7 @@ pub async fn get_project_repo_file_content(
     tauri::async_runtime::spawn_blocking(move || {
         let temp_dir = tempfile::tempdir().map_err(|error| format!("create temp dir: {error}"))?;
         let repo_dir = temp_dir.path().join("repo");
+        let mut budget = GitRequestBudget::remote(temp_dir.path());
         checkout_project_repo(
             &repo_dir,
             &clone_url,
@@ -150,8 +202,56 @@ pub async fn get_project_repo_file_content(
             target_ref.as_deref(),
             target_commit.as_deref(),
             &auth,
+            &mut budget,
+            RemoteBlobFilter::PreviewContent,
         )?;
-        Ok(read_preview_content(&repo_dir, &path, None))
+        let tree_entry = run_git_in_request(
+            &["ls-tree", "HEAD", "--", path.as_str()],
+            Some(&repo_dir),
+            &auth,
+            &mut budget,
+        )?;
+        let object = tree_entry
+            .split_once('\t')
+            .and_then(|(metadata, listed_path)| {
+                (listed_path == path).then_some(metadata.split_whitespace().collect::<Vec<_>>())
+            })
+            .filter(|parts| parts.first().copied() == Some("100644"))
+            .and_then(|parts| parts.get(2).copied())
+            .ok_or_else(|| "Requested repository path is not a regular file.".to_string())?;
+        if run_git_in_request(
+            &["cat-file", "-e", object],
+            Some(&repo_dir),
+            &auth,
+            &mut budget,
+        )
+        .is_err()
+        {
+            return Err("Requested repository file exceeds the remote preview limit.".to_string());
+        }
+        let size = run_git_in_request(
+            &["cat-file", "-s", object],
+            Some(&repo_dir),
+            &auth,
+            &mut budget,
+        )?
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| "Requested repository file size was malformed.".to_string())?;
+        if size > MAX_PREVIEW_BYTES {
+            return Err("Requested repository file exceeds the remote preview limit.".to_string());
+        }
+        if run_git_in_request(
+            &["checkout", "--quiet", "HEAD", "--", path.as_str()],
+            Some(&repo_dir),
+            &auth,
+            &mut budget,
+        )
+        .is_err()
+        {
+            return Ok(None);
+        }
+        Ok(read_preview_content(&repo_dir, &path, Some(size)))
     })
     .await
     .map_err(|error| format!("repo file content task failed: {error}"))?
@@ -175,4 +275,55 @@ pub async fn get_project_local_repo_file_content(
     })
     .await
     .map_err(|error| format!("local repo file content task failed: {error}"))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bounded_remote_clone_args, RemoteBlobFilter};
+
+    #[test]
+    fn remote_clone_arguments_are_shallow_filtered_and_do_not_checkout() {
+        assert_eq!(
+            bounded_remote_clone_args(
+                "https://github.com/block/buzz.git",
+                "/tmp/buzz-repo",
+                Some("main"),
+                false,
+                RemoteBlobFilter::MetadataOnly,
+            ),
+            [
+                "clone",
+                "--filter=blob:none",
+                "--depth=100",
+                "--single-branch",
+                "--no-tags",
+                "--no-checkout",
+                "--branch",
+                "main",
+                "--",
+                "https://github.com/block/buzz.git",
+                "/tmp/buzz-repo",
+            ]
+        );
+        assert_eq!(
+            bounded_remote_clone_args(
+                "https://github.com/block/buzz.git",
+                "/tmp/buzz-repo",
+                None,
+                true,
+                RemoteBlobFilter::MetadataOnly,
+            ),
+            [
+                "clone",
+                "--filter=blob:none",
+                "--depth=1",
+                "--single-branch",
+                "--no-tags",
+                "--no-checkout",
+                "--",
+                "https://github.com/block/buzz.git",
+                "/tmp/buzz-repo",
+            ]
+        );
+    }
 }

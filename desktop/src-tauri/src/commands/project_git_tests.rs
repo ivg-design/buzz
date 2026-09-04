@@ -1,3 +1,4 @@
+use super::super::project_git_exec::build_test_git_auth_config;
 use super::super::project_git_file_content::validate_repo_file_path;
 use super::*;
 
@@ -27,7 +28,7 @@ fn parse_ls_tree_keeps_paths_after_eager_preview_limit() {
         "c".repeat(40)
     );
 
-    let files = parse_ls_tree(repo_dir.path(), &output, &std::collections::HashMap::new());
+    let files = parse_ls_tree(&output, &std::collections::HashMap::new());
 
     assert_eq!(files.len(), MAX_EAGER_FILE_PREVIEWS + 2);
     let readme = files
@@ -60,10 +61,7 @@ fn repo_file_paths_reject_traversal_and_absolute_paths() {
 }
 
 #[test]
-fn parse_ls_tree_counts_only_blobs_toward_eager_preview_limit() {
-    let repo_dir = tempfile::tempdir().expect("create temporary repository");
-    std::fs::write(repo_dir.path().join("application.rs"), "fn main() {}")
-        .expect("write preview file");
+fn parse_ls_tree_never_reads_blob_previews() {
     let non_blob_entries = (0..MAX_EAGER_FILE_PREVIEWS)
         .map(|index| {
             format!(
@@ -78,14 +76,10 @@ fn parse_ls_tree_counts_only_blobs_toward_eager_preview_limit() {
         "b".repeat(40)
     );
 
-    let files = parse_ls_tree(repo_dir.path(), &output, &std::collections::HashMap::new());
+    let files = parse_ls_tree(&output, &std::collections::HashMap::new());
 
-    assert_eq!(
-        files
-            .last()
-            .and_then(|file| file.preview_content.as_deref()),
-        Some("fn main() {}")
-    );
+    assert_eq!(files.last().and_then(|file| file.preview_content.as_deref()), None);
+    assert_eq!(files.last().and_then(|file| file.size), None);
 }
 
 #[test]
@@ -108,4 +102,245 @@ fn parse_worktree_files_counts_only_files_toward_eager_preview_limit() {
 
     assert_eq!(files.len(), MAX_EAGER_FILE_PREVIEWS);
     assert!(files.iter().all(|file| file.preview_content.is_some()));
+}
+
+#[test]
+fn sync_status_preserves_origin_and_surfaces_fetch_failures() {
+    let auth = build_test_git_auth_config().expect("build test git config");
+    let root = tempfile::tempdir().expect("create test directory");
+    let remote = root.path().join("remote.git");
+    let checkout = root.path().join("checkout");
+    let remote_path = remote.to_str().expect("remote path");
+    let checkout_path = checkout.to_str().expect("checkout path");
+
+    run_git(&["init", "--bare", "--", remote_path], None, &auth).expect("initialize remote");
+    run_git(&["init", "--", checkout_path], None, &auth).expect("initialize checkout");
+    std::fs::write(checkout.join("README.md"), "tracked\n").expect("write fixture");
+    run_git(&["add", "README.md"], Some(&checkout), &auth).expect("stage fixture");
+    run_git(
+        &[
+            "-c",
+            "user.name=Buzz Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "Initial commit",
+        ],
+        Some(&checkout),
+        &auth,
+    )
+    .expect("commit fixture");
+    run_git(&["branch", "-M", "main"], Some(&checkout), &auth).expect("rename branch");
+    run_git(
+        &["remote", "add", "origin", remote_path],
+        Some(&checkout),
+        &auth,
+    )
+    .expect("add remote");
+    run_git(&["push", "origin", "main"], Some(&checkout), &auth).expect("seed remote");
+
+    let upstream = root.path().join("upstream");
+    let upstream_path = upstream.to_str().expect("upstream checkout path");
+    run_git(
+        &[
+            "clone",
+            "--branch",
+            "main",
+            "--",
+            remote_path,
+            upstream_path,
+        ],
+        None,
+        &auth,
+    )
+    .expect("clone upstream fixture");
+    std::fs::write(upstream.join("CHANGELOG.md"), "remote update\n").expect("write remote update");
+    run_git(&["add", "CHANGELOG.md"], Some(&upstream), &auth).expect("stage remote update");
+    run_git(
+        &[
+            "-c",
+            "user.name=Buzz Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "Remote update",
+        ],
+        Some(&upstream),
+        &auth,
+    )
+    .expect("commit remote update");
+    run_git(&["push", "origin", "main"], Some(&upstream), &auth).expect("push remote update");
+    let upstream_head = run_git(&["rev-parse", "HEAD"], Some(&upstream), &auth)
+        .expect("read upstream head")
+        .trim()
+        .to_string();
+
+    let status = compare_local_remote_status(&checkout, remote_path, Some("main"), None, &auth)
+        .expect("refresh remote status");
+    assert_eq!(status.remote_head.as_deref(), Some(upstream_head.as_str()));
+    assert_eq!(status.behind_count, 1);
+    assert_eq!(
+        run_git(&["remote", "get-url", "origin"], Some(&checkout), &auth)
+            .expect("read origin")
+            .trim(),
+        remote_path,
+        "a status refresh must not rewrite origin",
+    );
+
+    std::fs::remove_dir_all(&remote).expect("remove remote fixture");
+    let error = compare_local_remote_status(&checkout, remote_path, Some("main"), None, &auth)
+        .err()
+        .expect("a failed fetch must fail the status refresh");
+    assert!(error.contains("query remote branches:"), "{error}");
+}
+
+#[test]
+fn sync_and_pull_preserve_full_history_beyond_one_hundred_commits() {
+    let auth = build_test_git_auth_config().expect("build test git config");
+    let root = tempfile::tempdir().expect("create test directory");
+    let remote = root.path().join("remote.git");
+    let checkout = root.path().join("checkout");
+    let upstream = root.path().join("upstream");
+    let remote_path = remote.to_str().expect("remote path");
+    let checkout_path = checkout.to_str().expect("checkout path");
+    let upstream_path = upstream.to_str().expect("upstream path");
+    run_git(&["init", "--bare", "--", remote_path], None, &auth).expect("init remote");
+    run_git(&["init", "--", checkout_path], None, &auth).expect("init checkout");
+    for index in 0..105 {
+        run_git(
+            &[
+                "-c",
+                "user.name=Buzz Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--allow-empty",
+                "-m",
+                &format!("commit {index}"),
+            ],
+            Some(&checkout),
+            &auth,
+        )
+        .expect("create history");
+    }
+    run_git(&["branch", "-M", "main"], Some(&checkout), &auth).expect("rename branch");
+    run_git(&["remote", "add", "origin", remote_path], Some(&checkout), &auth)
+        .expect("add remote");
+    run_git(&["push", "origin", "main"], Some(&checkout), &auth).expect("seed remote");
+    run_git(
+        &["clone", "--branch", "main", "--", remote_path, upstream_path],
+        None,
+        &auth,
+    )
+    .expect("clone upstream");
+    run_git(
+        &[
+            "-c",
+            "user.name=Buzz Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "remote update",
+        ],
+        Some(&upstream),
+        &auth,
+    )
+    .expect("commit upstream update");
+    run_git(&["push", "origin", "main"], Some(&upstream), &auth).expect("push update");
+
+    let status = compare_local_remote_status(&checkout, remote_path, Some("main"), None, &auth)
+        .expect("refresh status");
+    assert_eq!(status.behind_count, 1);
+    assert!(!checkout.join(".git/shallow").exists());
+    run_git(
+        &["pull", "--ff-only", "--no-tags", "--end-of-options", "origin", "main"],
+        Some(&checkout),
+        &auth,
+    )
+    .expect("pull full history");
+    assert!(!checkout.join(".git/shallow").exists());
+    assert_eq!(
+        run_git(&["rev-list", "--count", "HEAD"], Some(&checkout), &auth)
+            .expect("count history")
+            .trim(),
+        "106"
+    );
+}
+
+#[test]
+fn sync_status_rejects_repository_local_origin_rewrites() {
+    let auth = build_test_git_auth_config().expect("build test git config");
+    let root = tempfile::tempdir().expect("create test directory");
+    let remote = root.path().join("remote.git");
+    let redirected = root.path().join("redirected.git");
+    let checkout = root.path().join("checkout");
+    let remote_path = remote.to_str().expect("remote path");
+    let redirected_path = redirected.to_str().expect("redirected path");
+    let checkout_path = checkout.to_str().expect("checkout path");
+
+    run_git(&["init", "--bare", "--", remote_path], None, &auth).expect("initialize remote");
+    run_git(&["init", "--bare", "--", redirected_path], None, &auth)
+        .expect("initialize redirect target");
+    run_git(&["init", "--", checkout_path], None, &auth).expect("initialize checkout");
+    run_git(
+        &["remote", "add", "origin", remote_path],
+        Some(&checkout),
+        &auth,
+    )
+    .expect("add expected origin");
+    let rewrite_key = format!("url.{redirected_path}.insteadOf");
+    run_git(
+        &["config", "--local", rewrite_key.as_str(), remote_path],
+        Some(&checkout),
+        &auth,
+    )
+    .expect("install repository-local URL rewrite");
+    assert_eq!(
+        run_git(&["remote", "get-url", "origin"], Some(&checkout), &auth)
+            .expect("resolve effective origin")
+            .trim(),
+        redirected_path,
+    );
+
+    let error = compare_local_remote_status(&checkout, remote_path, Some("main"), None, &auth)
+        .err()
+        .expect("rewritten origin must be rejected before network access");
+    assert!(error.contains("disallowed network setting url."), "{error}");
+}
+
+#[test]
+fn sync_status_rejects_repository_local_custom_remote_helpers() {
+    let auth = build_test_git_auth_config().expect("build test git config");
+    let root = tempfile::tempdir().expect("create test directory");
+    let remote = root.path().join("remote.git");
+    let checkout = root.path().join("checkout");
+    let remote_path = remote.to_str().expect("remote path");
+    let checkout_path = checkout.to_str().expect("checkout path");
+
+    run_git(&["init", "--bare", "--", remote_path], None, &auth).expect("initialize remote");
+    run_git(&["init", "--", checkout_path], None, &auth).expect("initialize checkout");
+    run_git(
+        &["remote", "add", "origin", remote_path],
+        Some(&checkout),
+        &auth,
+    )
+    .expect("add expected origin");
+    run_git(
+        &["config", "--local", "remote.origin.vcs", "ext"],
+        Some(&checkout),
+        &auth,
+    )
+    .expect("install repository-local custom helper");
+
+    let error = compare_local_remote_status(&checkout, remote_path, Some("main"), None, &auth)
+        .err()
+        .expect("custom origin helpers must be rejected before network access");
+    assert!(
+        error.contains("disallowed network setting remote.origin.vcs"),
+        "{error}"
+    );
 }

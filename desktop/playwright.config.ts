@@ -130,6 +130,7 @@ export default defineConfig({
         "**/send-channel-binding.spec.ts",
         "**/project-cold-start.spec.ts",
         "**/project-commit-detail.spec.ts",
+        "**/project-external-repository.spec.ts",
         "**/project-empty-state-alignment.spec.ts",
         "**/project-inbox.spec.ts",
         "**/projects-v3-screenshots.spec.ts",

@@ -1,12 +1,7 @@
 import { ChevronDown, FolderGit2 } from "lucide-react";
 
-import {
-  useProjectRepoSnapshotQuery,
-  useRepoStateQuery,
-  type Project,
-  type Repository,
-} from "@/features/projects/hooks";
-import { resolveProjectDefaultBranch } from "@/features/projects/lib/projectBranches";
+import type { Project, Repository } from "@/features/projects/hooks";
+import { useProjectRepositorySnapshots } from "@/features/projects/useProjectRepositorySnapshots";
 import { Button } from "@/shared/ui/button";
 import {
   DropdownMenu,
@@ -27,6 +22,7 @@ export function ProjectHomeCodebasePanel({
   project,
   projects,
   repository,
+  reposDir,
 }: {
   identityPubkey?: string;
   onFilesContextChange?: (context: {
@@ -40,27 +36,25 @@ export function ProjectHomeCodebasePanel({
   project: Project;
   projects: Project[];
   repository: Repository | null;
+  reposDir?: string | null;
 }) {
-  const repoStateQuery = useRepoStateQuery(repository);
-  const defaultBranch = repository
-    ? resolveProjectDefaultBranch(repository.defaultBranch, repoStateQuery.data)
-    : null;
-  const snapshotQuery = useProjectRepoSnapshotQuery(
-    repository,
-    defaultBranch,
-    null,
-    null,
+  const [snapshotResult] = useProjectRepositorySnapshots(
+    repository ? [repository] : [],
     Boolean(repository),
+    reposDir,
   );
+  const source = snapshotResult?.source ?? "local";
   const fileContentSource = useRepositoryFileContentSource({
-    activeBranch: defaultBranch,
+    activeBranch:
+      snapshotResult?.effectiveBranch ?? repository?.defaultBranch ?? null,
     activeTag: null,
     pullRequest: null,
     repository,
+    reposDir: reposDir ?? undefined,
     selectedTag: null,
-    source: "remote",
+    source,
   });
-  const snapshot = snapshotQuery.data ?? null;
+  const snapshot = snapshotResult?.snapshot ?? null;
   const files = snapshot?.files ?? [];
 
   if (!repository) {
@@ -118,11 +112,11 @@ export function ProjectHomeCodebasePanel({
       ) : null}
       <div className="min-h-0 flex-1 overflow-y-auto px-4 pb-4">
         <RepositoryFilesPanel
-          error={snapshotQuery.error}
+          error={snapshotResult?.error}
           fallbackAuthorPubkey={repository.owner}
           fileContentSource={fileContentSource}
           files={files}
-          isLoading={snapshotQuery.isPending}
+          isLoading={snapshotResult?.isLoading ?? false}
           onContextChange={onFilesContextChange}
           onOpenCommit={onOpenCommit}
           snapshot={snapshot}

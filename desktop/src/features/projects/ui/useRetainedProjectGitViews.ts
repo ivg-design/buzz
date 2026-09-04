@@ -5,6 +5,9 @@ import {
   type ProjectRepoDiff,
   type ProjectRepoSnapshot,
   type Repository,
+  projectLocalRepoDiffQueryKey,
+  projectRepoDiffQueryKey,
+  projectRepoSnapshotQueryKey,
   useProjectLocalRepoDiffQuery,
   useProjectLocalRepoSnapshotQuery,
   useProjectRepoDiffQuery,
@@ -18,6 +21,7 @@ import {
 } from "@/features/projects/lib/projectReviewDisplay";
 import { normalizeRepositoryUrl } from "@/features/projects/lib/projectsViewHelpers";
 import { useProjectCommitDiffQuery } from "@/features/projects/useProjectCommitDiff";
+import { useRelayOrigin } from "@/shared/lib/useRelayOrigin";
 import { snapshotHasContent } from "./projectDetailHelpers";
 
 /** Keep the active review identity stable while the pull-request list refetches. */
@@ -135,7 +139,7 @@ export function useProjectDetailGitViews({
   activeBranch,
   activeRepoPullRequest,
   activeTag,
-  isBuzzHost,
+  canReadRemote,
   repository,
   reposDir,
   repoSource,
@@ -146,7 +150,7 @@ export function useProjectDetailGitViews({
   activeBranch: string | null | undefined;
   activeRepoPullRequest: ProjectPullRequest | null | undefined;
   activeTag: { commit: string; name: string } | null;
-  isBuzzHost: boolean;
+  canReadRemote: boolean;
   repository: Repository | null | undefined;
   reposDir?: string | null;
   repoSource: "local" | "remote";
@@ -154,15 +158,25 @@ export function useProjectDetailGitViews({
   selectedCommitHash: string | null;
   selectedTag: string | null;
 }) {
+  const relayOrigin = useRelayOrigin();
+  const snapshotPullRequest = selectedTag ? null : selectedBranchPullRequest;
   const repoSnapshotQuery = useProjectRepoSnapshotQuery(
     repository,
     activeBranch,
-    selectedTag ? null : selectedBranchPullRequest,
+    snapshotPullRequest,
     activeTag,
-    isBuzzHost,
+    canReadRemote,
   );
   const displayedRepoSnapshot = useRetainedRepoSnapshot(
-    `${repository?.id}:${activeBranch}:${selectedTag ? activeTag?.name : selectedBranchPullRequest?.id}:${selectedTag ? activeTag?.commit : selectedBranchPullRequest?.commit}`,
+    JSON.stringify(
+      projectRepoSnapshotQueryKey(
+        repository,
+        relayOrigin,
+        activeBranch,
+        snapshotPullRequest,
+        activeTag,
+      ),
+    ),
     repoSnapshotQuery.data,
     repoSnapshotQuery.isFetching,
   );
@@ -196,7 +210,22 @@ export function useProjectDetailGitViews({
     activeBranch,
   );
   const displayedRepoDiff = useRetainedRepoDiff(
-    `${repository?.id ?? "none"}:${repoSource}:${reviewDiffBranch}:${activeRepoPullRequest?.id}:${activeRepoPullRequest?.commit}`,
+    JSON.stringify(
+      repoSource === "local"
+        ? projectLocalRepoDiffQueryKey(
+            repository,
+            relayOrigin,
+            reposDir,
+            reviewDiffBranch,
+            activeRepoPullRequest,
+          )
+        : projectRepoDiffQueryKey(
+            repository,
+            relayOrigin,
+            reviewDiffBranch,
+            activeRepoPullRequest,
+          ),
+    ),
     repoSource === "local" ? localRepoDiffQuery.data : repoDiffQuery.data,
     repoSource === "local"
       ? localRepoDiffQuery.isFetching

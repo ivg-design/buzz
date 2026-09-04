@@ -12,14 +12,12 @@ import * as React from "react";
 
 import { presentContextCount } from "@/features/projects/lib/projectHomeSummary";
 import type { ProjectHomeWorkspaceSheetTab } from "@/features/projects/lib/projectHomeWorkspaceSheet";
-import { resolveProjectDefaultBranch } from "@/features/projects/lib/projectBranches";
 import { listProjectBoundChannels } from "@/features/projects/lib/projectRelatedChannels";
 import {
   useProjectActivitySummariesQuery,
-  useProjectRepoSnapshotQuery,
-  useRepoStateQuery,
   type Project,
 } from "@/features/projects/hooks";
+import { useProjectRepositorySnapshots } from "@/features/projects/useProjectRepositorySnapshots";
 import { ProjectChannelIcon } from "@/features/projects/ui/ProjectChannelIcon";
 import type { Channel } from "@/shared/api/types";
 import { cn } from "@/shared/lib/cn";
@@ -190,6 +188,7 @@ export function ProjectHomeContextPanel({
   onRepositoryChange,
   project,
   projects,
+  reposDir,
 }: {
   activeWorkspaceTab?: ProjectHomeWorkspaceSheetTab | null;
   channel: Channel | null;
@@ -202,6 +201,7 @@ export function ProjectHomeContextPanel({
   onRepositoryChange: (repositoryId: string) => void;
   project: Project;
   projects: Project[];
+  reposDir?: string | null;
 }) {
   const firstRepository = project.repositories[0] ?? null;
   const addRepositoryTitle = firstRepository
@@ -220,19 +220,10 @@ export function ProjectHomeContextPanel({
   ]).size;
   const activityQuery = useProjectActivitySummariesQuery([project]);
   const activity = activityQuery.data?.[project.id];
-  const repoStateQuery = useRepoStateQuery(firstRepository);
-  const defaultBranch = firstRepository
-    ? resolveProjectDefaultBranch(
-        firstRepository.defaultBranch,
-        repoStateQuery.data,
-      )
-    : null;
-  const snapshotQuery = useProjectRepoSnapshotQuery(
-    firstRepository,
-    defaultBranch,
-    null,
-    null,
+  const [repositorySnapshot] = useProjectRepositorySnapshots(
+    firstRepository ? [firstRepository] : [],
     Boolean(firstRepository),
+    reposDir,
   );
   const channelsById = new Map(
     channels.map((candidate) => [candidate.id, candidate]),
@@ -296,7 +287,9 @@ export function ProjectHomeContextPanel({
           Commits
         </ContextNavButton>
         <ContextNavButton
-          count={presentContextCount(snapshotQuery.data?.files.length)}
+          count={presentContextCount(
+            repositorySnapshot?.snapshot?.files.length,
+          )}
           disabled={!firstRepository && !onAddRepository}
           icon={<FileCode2 />}
           onClick={() => openWorkspace("files")}

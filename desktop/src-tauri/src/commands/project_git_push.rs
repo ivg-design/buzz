@@ -14,7 +14,7 @@ pub(crate) fn push_project_local_repository_blocking(
         branch_name.as_deref(),
         base_branch.as_deref(),
         auth,
-    );
+    )?;
     if !status.can_push {
         return Err(status
             .push_block_reason
@@ -102,7 +102,8 @@ mod tests {
         )
         .expect("add remote");
 
-        let status = compare_local_remote_status(&checkout, remote_path, Some("main"), None, &auth);
+        let status = compare_local_remote_status(&checkout, remote_path, Some("main"), None, &auth)
+            .expect("compare local and remote status");
         assert_eq!(status.local_branches, ["master", "space"]);
 
         let result = push_project_local_repository_blocking(

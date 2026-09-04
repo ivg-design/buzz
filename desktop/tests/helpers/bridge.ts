@@ -148,6 +148,8 @@ type MockInstallRuntimeResult = {
 type MockBridgeOptions = {
   /** Tauri window label exposed to the app. Defaults to the main window. */
   windowLabel?: string;
+  /** Repository root persisted on the seeded community. */
+  reposDir?: string;
   ttsSettings?: {
     version: number;
     agentTextToSpeech: boolean;
@@ -157,6 +159,10 @@ type MockBridgeOptions = {
   pocketVoiceImportResult?: "success" | "cancel" | "invalid";
   /** Advertised HEAD for the first mock project without adding that branch. */
   projectHeadBranch?: string;
+  /** Make remote project snapshots fail with this git-facing message. */
+  projectRepoSnapshotError?: string;
+  /** Delay remote repository snapshots so loading UI can be observed. */
+  projectRepoSnapshotDelayMs?: number;
   /** Relay NIP-11 identity used to sign authoritative repository state. */
   relaySelf?: string | null;
   /** Native-like huddle state seeded from authoritative role-bearing membership. */
@@ -791,9 +797,10 @@ async function seedDefaultCommunity(
   page: Page,
   fallbackPubkey: string,
   relayWsUrl?: string,
+  reposDir?: string,
 ) {
   await page.addInitScript(
-    ({ fallback, identityOverrideKey, relayUrl }) => {
+    ({ fallback, identityOverrideKey, relayUrl, repositoryRoot }) => {
       // If seedActiveIdentity() ran before this script (the normal ordering),
       // use its pubkey so the community matches the active identity and
       // migrateMachineOnboardingCompletion's strict voucher accepts it.
@@ -826,6 +833,7 @@ async function seedDefaultCommunity(
         relayUrl,
         pubkey: overridePubkey ?? fallback,
         addedAt: new Date().toISOString(),
+        ...(repositoryRoot ? { reposDir: repositoryRoot } : {}),
       };
       window.localStorage.setItem(
         "buzz-communities",
@@ -837,6 +845,7 @@ async function seedDefaultCommunity(
       fallback: fallbackPubkey,
       identityOverrideKey: "buzz:e2e-identity-override.v1",
       relayUrl: relayWsUrl ?? DEFAULT_RELAY_WS_URL,
+      repositoryRoot: reposDir,
     },
   );
 }
@@ -866,7 +875,12 @@ export async function installBridge(page: Page, options: BridgeOptions) {
   // the bridge identity's pubkey or DEFAULT_MOCK_PUBKEY for mock mode.
   if (!options.skipCommunitySeed) {
     const activePubkey = identity?.pubkey ?? DEFAULT_MOCK_PUBKEY;
-    await seedDefaultCommunity(page, activePubkey, options.relayWsUrl);
+    await seedDefaultCommunity(
+      page,
+      activePubkey,
+      options.relayWsUrl,
+      options.mock?.reposDir,
+    );
   }
   if (!options.skipOnboardingSeed) {
     await seedOnboardingCompletionForKnownIdentities(page, options.relayWsUrl);

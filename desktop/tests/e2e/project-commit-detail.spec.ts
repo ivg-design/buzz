@@ -526,6 +526,198 @@ test("unsupported relays cannot create a channel-first project", async ({
   expect(acceptedKinds).toEqual([]);
 });
 
+test("project home reads an external repository from its local checkout", async ({
+  page,
+}) => {
+  await enableProjectsFeature(page);
+  const owner = TEST_IDENTITIES.alice.pubkey;
+  const repoAddress = `30617:${owner}:nemo`;
+  await page.addInitScript(
+    ({ repositoryAddress, repositoryOwner }) => {
+      const now = Math.floor(Date.now() / 1_000);
+      window.__BUZZ_E2E_EXTRA_PROJECT_EVENTS__ = [
+        {
+          id: "aa".repeat(32),
+          kind: 30617,
+          pubkey: repositoryOwner,
+          created_at: now,
+          content: "Local-first external repository fixture.",
+          tags: [
+            ["d", "nemo"],
+            ["name", "Nemo"],
+            ["clone", "https://github.com/mysteropodes/nemo.git"],
+            ["web", "https://github.com/mysteropodes/nemo"],
+            ["default-branch", "main"],
+          ],
+        },
+        {
+          id: "bb".repeat(32),
+          kind: 30621,
+          pubkey: repositoryOwner,
+          created_at: now,
+          content: "",
+          tags: [
+            ["d", "nemo"],
+            ["name", "Nemo"],
+            ["a", repositoryAddress],
+            ["buzz-channel", "cf63feec-21bb-5bf0-a2f8-0e4c3de8ec73"],
+          ],
+        },
+      ];
+      const commit = {
+        hash: "1234567890abcdef1234567890abcdef12345678",
+        short_hash: "1234567",
+        author_name: "Nemo Local",
+        author_email: "nemo@example.com",
+        timestamp: now - 60,
+        subject: "Read Nemo from its local checkout",
+      };
+      window.__BUZZ_E2E_PROJECT_LOCAL_REPO_SNAPSHOT__ = {
+        path: "/tmp/nemo-team-repos/nemo",
+        snapshot: {
+          latest_commit: commit,
+          commits: [commit],
+          contributors: [
+            {
+              name: "Nemo Local",
+              email: "nemo@example.com",
+              commit_count: 1,
+              last_commit_at: now - 60,
+            },
+          ],
+          files: [
+            {
+              path: "README.md",
+              kind: "text",
+              size: 21,
+              preview_content: null,
+              last_changed_at: now - 60,
+              latest_commit: commit,
+            },
+          ],
+        },
+      };
+      window.__BUZZ_E2E_PROJECT_LOCAL_REPO_DIFF__ = {
+        additions: 1,
+        deletions: 0,
+        commit_body: "Local-only commit body",
+        files: [
+          {
+            path: "README.md",
+            additions: 1,
+            deletions: 0,
+            patch: "@@ -0,0 +1 @@\n+# Nemo local checkout",
+            truncated: false,
+          },
+        ],
+      };
+      window.__BUZZ_E2E_PROJECT_REPO_FILE_CONTENTS__ = {
+        "README.md": "# Nemo local checkout",
+      };
+    },
+    { repositoryAddress: repoAddress, repositoryOwner: owner },
+  );
+  await installMockBridge(page, { reposDir: "/tmp/nemo-team-repos" });
+  await page.goto("/", { waitUntil: "domcontentloaded" });
+  await page.getByTestId("open-projects-view").click();
+  await page.getByTestId("projects-section-projects").click();
+  await page
+    .locator(
+      '[data-testid="project-card-nemo"], [data-testid="project-row-nemo"]',
+    )
+    .first()
+    .click();
+
+  await expect(page.getByTestId("project-home-context-files")).toContainText(
+    /Files\d+/,
+  );
+  await page.getByTestId("project-home-context-files").click();
+  const filesSheet = page.getByTestId("project-home-workspace-sheet");
+  await filesSheet.getByText("README.md", { exact: true }).click();
+  await expect(filesSheet.getByText("# Nemo local checkout")).toBeVisible();
+  await page
+    .getByTestId("focus-thread-drawer")
+    .getByTestId("auxiliary-panel-close")
+    .click();
+
+  await page.getByTestId("project-home-context-commits").click();
+  const commitsSheet = page.getByTestId("project-home-workspace-sheet");
+  await commitsSheet
+    .getByRole("article")
+    .filter({ has: page.getByText("Nemo", { exact: true }) })
+    .getByRole("button", {
+      name: "Read Nemo from its local checkout",
+      exact: true,
+    })
+    .click();
+  await expect(commitsSheet.getByText("Local-only commit body")).toBeVisible();
+  await page
+    .getByTestId("focus-thread-drawer")
+    .getByTestId("auxiliary-panel-close")
+    .click();
+
+  await page.getByTestId("project-home-context-people").click();
+  await expect(
+    page.getByTestId("project-home-workspace-sheet").getByText("Nemo Local"),
+  ).toBeVisible();
+  await page
+    .getByTestId("focus-thread-drawer")
+    .getByTestId("auxiliary-panel-close")
+    .click();
+
+  await page.getByTestId("project-home-context-repo-nemo").click();
+  await page.getByRole("button", { name: "github.com", exact: true }).click();
+  await page.getByRole("menuitemradio", { name: /^Local/ }).click();
+  await expect(page.getByRole("button", { name: /^Local/ })).toBeVisible();
+  const localSnapshotsBeforeFetch = await page.evaluate(
+    () =>
+      (window.__BUZZ_E2E_COMMAND_PAYLOADS__ ?? []).filter(
+        ({ command }) => command === "get_project_local_repo_snapshot",
+      ).length,
+  );
+  await page.getByRole("button", { name: "Fetch", exact: true }).click();
+  await expect(page.getByText("Remote state refreshed.")).toBeVisible();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (window.__BUZZ_E2E_COMMAND_PAYLOADS__ ?? []).filter(
+            ({ command }) => command === "get_project_local_repo_snapshot",
+          ).length,
+      ),
+    )
+    .toBeGreaterThan(localSnapshotsBeforeFetch);
+
+  const commands = await page.evaluate(
+    () => window.__BUZZ_E2E_COMMAND_PAYLOADS__ ?? [],
+  );
+  expect(commands).toContainEqual({
+    command: "get_project_local_repo_snapshot",
+    payload: expect.objectContaining({
+      cloneUrl: "https://github.com/mysteropodes/nemo.git",
+      projectDtag: "nemo",
+      reposDir: "/tmp/nemo-team-repos",
+    }),
+  });
+  expect(
+    commands.some(
+      ({ command, payload }) =>
+        command === "get_project_repo_snapshot" &&
+        (payload as { cloneUrl?: string } | null)?.cloneUrl ===
+          "https://github.com/mysteropodes/nemo.git",
+    ),
+  ).toBe(true);
+  expect(commands).toContainEqual(
+    expect.objectContaining({ command: "get_project_local_repo_file_content" }),
+  );
+  expect(commands).toContainEqual(
+    expect.objectContaining({ command: "get_project_local_repo_diff" }),
+  );
+  expect(commands).toContainEqual(
+    expect.objectContaining({ command: "get_project_repo_sync_status" }),
+  );
+});
+
 test("project creation can retry after its repository publication fails", async ({
   page,
 }) => {

@@ -6,12 +6,16 @@ import {
 } from "@/shared/api/projectGit";
 import type { ProjectRepoDiff } from "@/shared/api/types";
 import type { Repository as Project } from "./hooks";
+import { projectRepositoryQueryIdentity } from "./lib/projectRepositoryQueryIdentity";
+import { useProjectRepoHost } from "./useProjectRepoHost";
+import { useRelayOrigin } from "@/shared/lib/useRelayOrigin";
 
 async function fetchProjectCommitDiff(
   project: Project,
   commitHash: string,
   repoSource: "remote" | "local",
   reposDir: string | null | undefined,
+  allowRemote: boolean,
 ): Promise<ProjectRepoDiff> {
   if (repoSource === "local") {
     // Passing only the target commit (no base branch/commit) makes the
@@ -25,6 +29,10 @@ async function fetchProjectCommitDiff(
     if (local) return local;
   }
 
+  if (!allowRemote) {
+    throw new Error("No local checkout found for this external repository.");
+  }
+
   const cloneUrl = project.cloneUrls[0];
   if (!cloneUrl) {
     throw new Error("This project has no clone URL to load the commit from.");
@@ -34,6 +42,29 @@ async function fetchProjectCommitDiff(
     defaultBranch: project.defaultBranch,
     targetCommit: commitHash,
   });
+}
+
+/** Complete cache key for a commit-against-parent diff query. */
+export function projectCommitDiffQueryKey(
+  project: Project | null | undefined,
+  commitHash: string | null,
+  repoSource: "remote" | "local",
+  reposDir: string | null | undefined,
+  relayOrigin: string | null,
+) {
+  return [
+    "project",
+    project?.id ?? "none",
+    "commit-diff",
+    projectRepositoryQueryIdentity({
+      branch: project?.defaultBranch,
+      relayOrigin,
+      repository: project,
+      reposDir,
+      source: repoSource,
+      targetCommit: commitHash,
+    }),
+  ] as const;
 }
 
 /**
@@ -47,20 +78,31 @@ export function useProjectCommitDiffQuery(
   repoSource: "remote" | "local",
   reposDir?: string | null,
 ) {
+  const host = useProjectRepoHost(project);
+  const relayOrigin = useRelayOrigin();
+  const canReadRemote =
+    host.kind === "buzz" ||
+    (host.kind === "external" && host.host === "github.com");
   return useQuery({
     enabled: Boolean(project && commitHash),
-    queryKey: [
-      "project",
-      project?.id ?? "none",
-      "commit-diff",
+    queryKey: projectCommitDiffQueryKey(
+      project,
+      commitHash,
       repoSource,
-      commitHash ?? "none",
-    ],
+      reposDir,
+      relayOrigin,
+    ),
     queryFn: () => {
       if (!project || !commitHash) {
         return Promise.reject(new Error("No commit selected."));
       }
-      return fetchProjectCommitDiff(project, commitHash, repoSource, reposDir);
+      return fetchProjectCommitDiff(
+        project,
+        commitHash,
+        repoSource,
+        reposDir,
+        canReadRemote,
+      );
     },
     // A commit's diff is immutable, so never refetch it while cached.
     staleTime: Number.POSITIVE_INFINITY,

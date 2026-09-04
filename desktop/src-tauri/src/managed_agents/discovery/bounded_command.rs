@@ -11,6 +11,7 @@ use std::process::{ChildStderr, ChildStdout, Command, ExitStatus, Output, Stdio}
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 /// Poll interval while waiting for the child to exit.
@@ -34,6 +35,26 @@ const DRAIN_IDLE_POLL: Duration = Duration::from_millis(5);
 /// per-stream, so a probe cannot double it by splitting output across stdout
 /// and stderr.
 const CAPTURE_LIMIT: u64 = 1 << 20; // 1 MiB
+
+/// Resource ceilings for one child process. `storage_root` is sampled while
+/// the child runs so callers handling untrusted downloads can stop the whole
+/// process tree before a temporary workspace grows without bound.
+pub(crate) struct BoundedCommandLimits<'a> {
+    pub timeout: Duration,
+    pub capture_limit: u64,
+    pub storage_root: Option<(&'a Path, u64)>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum BoundedCommandError {
+    Spawn,
+    Setup,
+    Timeout,
+    OutputLimit(u64),
+    StorageLimit(u64),
+    Wait,
+    Read,
+}
 
 /// Grace period between the initial `SIGTERM` and the escalating `SIGKILL` for a
 /// timed-out process group. Long enough for a well-behaved child to flush and
@@ -269,6 +290,7 @@ fn spawn_drain<R: Read + Send + 'static>(
     total: Arc<AtomicU64>,
     overflow: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
+    capture_limit: u64,
 ) -> JoinHandle<std::io::Result<Vec<u8>>> {
     // `stop` gates only the nonblocking Unix drain; the Windows path blocks to
     // the job-close EOF and never consults it.
@@ -285,9 +307,9 @@ fn spawn_drain<R: Read + Send + 'static>(
                     // `prev` is unique per call, so the two streams keep
                     // disjoint ranges and their retained bytes sum to <= cap.
                     let prev = total.fetch_add(n as u64, Ordering::Relaxed);
-                    if prev.saturating_add(n as u64) > CAPTURE_LIMIT {
+                    if prev.saturating_add(n as u64) > capture_limit {
                         overflow.store(true, Ordering::Relaxed);
-                        let keep = CAPTURE_LIMIT.saturating_sub(prev).min(n as u64) as usize;
+                        let keep = capture_limit.saturating_sub(prev).min(n as u64) as usize;
                         buf.extend_from_slice(&chunk[..keep]);
                         // Overflow: the result is already fail-closed, so nothing
                         // still in the pipe is worth preserving. Return NOW rather
@@ -360,13 +382,33 @@ fn spawn_drain<R: Read + Send + 'static>(
 ///   process group on Unix (the group-escapee case bounded by the drain rule
 ///   above) — the adjudicated asymmetry. The timeout path additionally sends a
 ///   graceful `SIGTERM` and a grace period before the kill.
-pub(crate) fn output_with_timeout(mut command: Command, timeout: Duration) -> Option<Output> {
+pub(crate) fn output_with_timeout(command: Command, timeout: Duration) -> Option<Output> {
+    output_with_limits(
+        command,
+        BoundedCommandLimits {
+            timeout,
+            capture_limit: CAPTURE_LIMIT,
+            storage_root: None,
+        },
+    )
+    .ok()
+}
+
+/// Run a child with explicit output, storage, and wall-clock ceilings.
+///
+/// The process-tree ownership and pipe-drain guarantees are identical to
+/// [`output_with_timeout`], while the structured error lets security-sensitive
+/// callers distinguish a quota breach from an ordinary command failure.
+pub(crate) fn output_with_limits(
+    mut command: Command,
+    limits: BoundedCommandLimits<'_>,
+) -> Result<Output, BoundedCommandError> {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = BoundedChild::spawn(command)?;
+    let mut child = BoundedChild::spawn(command).ok_or(BoundedCommandError::Spawn)?;
 
     let stdout_pipe = child.take_stdout();
     let stderr_pipe = child.take_stderr();
@@ -388,7 +430,7 @@ pub(crate) fn output_with_timeout(mut command: Command, timeout: Duration) -> Op
         if !(stdout_ok && stderr_ok) {
             child.kill_tree();
             child.reap();
-            return None;
+            return Err(BoundedCommandError::Setup);
         }
     }
 
@@ -399,18 +441,34 @@ pub(crate) fn output_with_timeout(mut command: Command, timeout: Duration) -> Op
     let total = Arc::new(AtomicU64::new(0));
     let overflow = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
-    let stdout_drain =
-        stdout_pipe.map(|s| spawn_drain(s, total.clone(), overflow.clone(), stop.clone()));
-    let stderr_drain =
-        stderr_pipe.map(|s| spawn_drain(s, total.clone(), overflow.clone(), stop.clone()));
+    let stdout_drain = stdout_pipe.map(|s| {
+        spawn_drain(
+            s,
+            total.clone(),
+            overflow.clone(),
+            stop.clone(),
+            limits.capture_limit,
+        )
+    });
+    let stderr_drain = stderr_pipe.map(|s| {
+        spawn_drain(
+            s,
+            total.clone(),
+            overflow.clone(),
+            stop.clone(),
+            limits.capture_limit,
+        )
+    });
 
-    let deadline = Instant::now() + timeout;
+    let deadline = Instant::now() + limits.timeout;
+    let mut failure = None;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
             Ok(None) => {
                 if Instant::now() >= deadline {
                     child.terminate_timed_out();
+                    failure = Some(BoundedCommandError::Timeout);
                     break None;
                 }
                 // Fail closed on a capture breach *while the child runs*: the
@@ -418,12 +476,21 @@ pub(crate) fn output_with_timeout(mut command: Command, timeout: Duration) -> Op
                 // drains so the join cannot hang.
                 if overflow.load(Ordering::Relaxed) {
                     child.kill_tree();
+                    failure = Some(BoundedCommandError::OutputLimit(limits.capture_limit));
                     break None;
+                }
+                if let Some((root, limit)) = limits.storage_root {
+                    if directory_size_exceeds(root, limit).unwrap_or(true) {
+                        child.kill_tree();
+                        failure = Some(BoundedCommandError::StorageLimit(limit));
+                        break None;
+                    }
                 }
                 std::thread::sleep(POLL_INTERVAL);
             }
             Err(_) => {
                 child.kill_tree();
+                failure = Some(BoundedCommandError::Wait);
                 break None;
             }
         }
@@ -439,21 +506,69 @@ pub(crate) fn output_with_timeout(mut command: Command, timeout: Duration) -> Op
     child.reap();
     stop.store(true, Ordering::Relaxed);
 
-    let stdout = join_drain(stdout_drain);
-    let stderr = join_drain(stderr_drain);
+    let stdout = join_drain(stdout_drain).ok_or(BoundedCommandError::Read)?;
+    let stderr = join_drain(stderr_drain).ok_or(BoundedCommandError::Read)?;
 
     // Fail closed if the child exited within the deadline but overran the cap in
     // a final burst, or if either drain hit a read error (join_drain -> None).
-    let (status, stdout, stderr) = (status?, stdout?, stderr?);
+    if let Some(failure) = failure {
+        return Err(failure);
+    }
+    let status = status.ok_or(BoundedCommandError::Wait)?;
     if overflow.load(Ordering::Relaxed) {
-        return None;
+        return Err(BoundedCommandError::OutputLimit(limits.capture_limit));
+    }
+    if let Some((root, limit)) = limits.storage_root {
+        if directory_size_exceeds(root, limit).unwrap_or(true) {
+            return Err(BoundedCommandError::StorageLimit(limit));
+        }
     }
 
-    Some(Output {
+    Ok(Output {
         status,
         stdout,
         stderr,
     })
+}
+
+fn directory_size_exceeds(root: &Path, limit: u64) -> std::io::Result<bool> {
+    if !root.exists() {
+        return Ok(false);
+    }
+    let mut total = 0_u64;
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_file() {
+            total = total.saturating_add(metadata.len());
+            if total > limit {
+                return Ok(true);
+            }
+            continue;
+        }
+        if metadata.is_dir() {
+            let entries = match std::fs::read_dir(&path) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            for entry in entries {
+                match entry {
+                    Ok(entry) => pending.push(entry.path()),
+                    Err(error) if error.kind() == ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// Join a drain thread, returning its captured bytes. `None` (fail closed) if
@@ -634,7 +749,13 @@ mod tests {
         // since a continuously-ready reader never hits the `WouldBlock` arm that
         // consults it. The overflow return is the only thing that can bound it.
         let stop = Arc::new(AtomicBool::new(true));
-        let drain = spawn_drain(AlwaysReady, total.clone(), overflow.clone(), stop);
+        let drain = spawn_drain(
+            AlwaysReady,
+            total.clone(),
+            overflow.clone(),
+            stop,
+            CAPTURE_LIMIT,
+        );
 
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {

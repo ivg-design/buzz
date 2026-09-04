@@ -260,6 +260,7 @@ let createRoute;
 let createRouter;
 let RouterProvider;
 let channelsQueryKey;
+let projectRepoSnapshotQueryKey;
 before(async () => {
   ({ default: React, act } = await import("react"));
   ({ createRoot } = await import("react-dom/client"));
@@ -281,6 +282,7 @@ before(async () => {
     RouterProvider,
   } = await import("@tanstack/react-router"));
   ({ channelsQueryKey } = await import("@/features/channels/hooks.ts"));
+  ({ projectRepoSnapshotQueryKey } = await import("../hooks.ts"));
 });
 
 async function renderSelection(initialProps) {
@@ -312,6 +314,92 @@ async function renderSelection(initialProps) {
     },
   };
 }
+
+async function renderRetainedSnapshot(initialProps) {
+  let props = initialProps;
+  const result = { current: null };
+  function Probe() {
+    result.current = hookModule.useRetainedRepoSnapshot(
+      props.cacheKey,
+      props.data,
+      props.isFetching,
+    );
+    return null;
+  }
+  const container = document.createElement("div");
+  document.body.appendChild(container);
+  const root = createRoot(container);
+  await act(async () => {
+    root.render(React.createElement(Probe));
+  });
+  return {
+    result,
+    async rerender(nextProps) {
+      props = nextProps;
+      await act(async () => {
+        root.render(React.createElement(Probe));
+      });
+    },
+    async unmount() {
+      await act(async () => {
+        root.unmount();
+      });
+      container.remove();
+    },
+  };
+}
+
+test("retained snapshots never cross a repository query identity", async () => {
+  const snapshot = {
+    commits: [],
+    contributors: [],
+    files: [{ kind: "blob", path: "old.txt", previewContent: "old" }],
+    latestCommit: null,
+  };
+  const oldRepository = {
+    ...repository,
+    cloneUrls: ["https://github.com/example/old.git"],
+  };
+  const newRepository = {
+    ...repository,
+    cloneUrls: ["https://github.com/example/new.git"],
+  };
+  const oldKey = JSON.stringify(
+    projectRepoSnapshotQueryKey(oldRepository, "https://relay.example", "main"),
+  );
+  const newKey = JSON.stringify(
+    projectRepoSnapshotQueryKey(newRepository, "https://relay.example", "main"),
+  );
+  const view = await renderRetainedSnapshot({
+    cacheKey: oldKey,
+    data: snapshot,
+    isFetching: false,
+  });
+
+  assert.equal(view.result.current, snapshot);
+  await view.rerender({
+    cacheKey: oldKey,
+    data: undefined,
+    isFetching: true,
+  });
+  assert.equal(
+    view.result.current,
+    snapshot,
+    "same-identity refetch flickered",
+  );
+
+  await view.rerender({
+    cacheKey: newKey,
+    data: undefined,
+    isFetching: true,
+  });
+  assert.equal(
+    view.result.current,
+    undefined,
+    "old repository data crossed into the replacement identity",
+  );
+  await view.unmount();
+});
 
 async function renderWorkspaceReviews(initialProps) {
   let setPanelProps = noop;

@@ -108,6 +108,11 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
   }, [projectId, repositoryId]);
   const repository = selectProjectRepository(project, routeRepositoryId);
   const repoRemote = useProjectRepoPresentation(repository);
+  const canReadRemote =
+    repoRemote.host.kind === "buzz" ||
+    (repoRemote.host.kind === "external" &&
+      repoRemote.host.host === "github.com");
+  const canManageRemoteBranches = repoRemote.host.kind === "buzz";
   const { applyPatch: applyRepositorySearch } = useHistorySearchState(
     PROJECT_REPOSITORY_SEARCH_KEYS,
   );
@@ -219,7 +224,7 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
     activeBranch,
     activeRepoPullRequest,
     activeTag,
-    isBuzzHost: repoRemote.host.kind === "buzz",
+    canReadRemote,
     repository,
     reposDir: activeCommunity?.reposDir,
     repoSource,
@@ -325,7 +330,9 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
   });
   const handleFetchRepo = React.useCallback(async () => {
     const results = await Promise.all([
-      repoSnapshotQuery.refetch(),
+      repoSource === "remote" && canReadRemote
+        ? repoSnapshotQuery.refetch()
+        : localRepoSnapshotQuery.refetch(),
       repoStateQuery.refetch(),
       repoSyncStatusQuery.refetch(),
     ]);
@@ -344,7 +351,10 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
     }
     toast.success("Remote state refreshed.");
   }, [
+    canReadRemote,
+    localRepoSnapshotQuery,
     memberChannelIds,
+    repoSource,
     repoSnapshotQuery,
     repoStateQuery,
     repoSyncStatusQuery,
@@ -361,10 +371,14 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
     tagOptions: repoStateQuery.data?.tags ?? [],
     onBranchChange: handleBranchChange,
     onTagChange: handleTagChange,
-    onCreateBranch: () => branchActions.setCreateOpen(true),
+    onCreateBranch: canManageRemoteBranches
+      ? () => branchActions.setCreateOpen(true)
+      : undefined,
     createBranchDisabled: branchActions.createPending || !activeBranchCommit,
     createBranchTitle: createBranchReason ?? "Create a remote branch",
-    onDeleteBranch: () => branchActions.setDeleteOpen(true),
+    onDeleteBranch: canManageRemoteBranches
+      ? () => branchActions.setDeleteOpen(true)
+      : undefined,
     deleteBranchDisabled:
       branchActions.deletePending || Boolean(deleteBranchReason),
     deleteBranchTitle: deleteBranchReason ?? "Delete this remote branch",
@@ -398,7 +412,10 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
           }
         : undefined,
     clonePending: cloneRepoMutation.isPending,
-    canPush: !selectedTag && (repoSyncStatusQuery.data?.canPush ?? false),
+    canPush:
+      !selectedTag &&
+      repoRemote.host.kind === "buzz" &&
+      (repoSyncStatusQuery.data?.canPush ?? false),
     onPush: selectedTag
       ? undefined
       : () => {
@@ -429,6 +446,7 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
     },
     fetchPending:
       repoSnapshotQuery.isFetching ||
+      localRepoSnapshotQuery.isFetching ||
       repoStateQuery.isFetching ||
       repoSyncStatusQuery.isFetching,
     fetchTitle:
@@ -801,12 +819,14 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
       resetKey={`${repository.id}:${activeTab}`}
     >
       <ProfilePanelProvider onOpenProfilePanel={handleOpenProfilePanel}>
-        <ProjectBranchActionDialogs
-          actions={branchActions}
-          activeBranch={activeBranch}
-          activeBranchCommit={activeBranchCommit}
-          existingBranches={branchOptionsWithLocal}
-        />
+        {canManageRemoteBranches ? (
+          <ProjectBranchActionDialogs
+            actions={branchActions}
+            activeBranch={activeBranch}
+            activeBranchCommit={activeBranchCommit}
+            existingBranches={branchOptionsWithLocal}
+          />
+        ) : null}
         <div className="flex min-h-0 min-w-0 flex-1 flex-row overflow-hidden">
           <ProjectConversationPanelController
             canResetWidth={threadPanelWidth.canReset}

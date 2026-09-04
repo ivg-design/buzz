@@ -1,16 +1,12 @@
 import * as React from "react";
 
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
-import { useCommunities } from "@/features/communities/useCommunities";
 import {
   useProjectPullRequestsQuery,
-  useProjectRepoSnapshotQuery,
   useProjectsWorkItemsQuery,
-  useRepoStateQuery,
   type Project,
 } from "@/features/projects/hooks";
 import { gitContributorPubkeysFromCommits } from "@/features/projects/lib/projectContributorMatching";
-import { resolveProjectDefaultBranch } from "@/features/projects/lib/projectBranches";
 import type { ProjectHomeWorkspaceSheetTab } from "@/features/projects/lib/projectHomeWorkspaceSheet";
 import { useProjectCommitDiffQuery } from "@/features/projects/useProjectCommitDiff";
 import { useProjectRepositorySnapshots } from "@/features/projects/useProjectRepositorySnapshots";
@@ -54,6 +50,7 @@ export function ProjectHomeWorkspaceSheet({
   project,
   projects,
   repository,
+  reposDir,
   tab,
 }: {
   identityPubkey?: string;
@@ -67,10 +64,10 @@ export function ProjectHomeWorkspaceSheet({
   project: Project;
   projects: Project[];
   repository: Project["repositories"][number];
+  reposDir?: string | null;
   tab: ProjectHomeWorkspaceSheetTab;
 }) {
   const { goProject } = useAppNavigation();
-  const { activeCommunity } = useCommunities();
   const [selectedIssueId, setSelectedIssueId] = React.useState<string | null>(
     null,
   );
@@ -114,35 +111,30 @@ export function ProjectHomeWorkspaceSheet({
     pullRequests,
     repository,
   });
-  const repoStateQuery = useRepoStateQuery(repository);
-  const defaultBranch = resolveProjectDefaultBranch(
-    repository.defaultBranch,
-    repoStateQuery.data,
-  );
-  const snapshotQuery = useProjectRepoSnapshotQuery(
-    repository,
-    defaultBranch,
-    null,
-    null,
-    true,
-  );
-  const snapshot = snapshotQuery.data ?? null;
+  const snapshotRepositories =
+    tab === "contributors" ? [repository] : project.repositories;
   const repositorySnapshots = useProjectRepositorySnapshots(
-    project.repositories,
-    tab === "commits",
+    snapshotRepositories,
+    tab === "commits" || tab === "contributors",
+    reposDir,
   );
+  const currentRepositoryResult =
+    repositorySnapshots.find(
+      ({ repository: candidate }) => candidate.id === repository.id,
+    ) ?? null;
+  const snapshot = currentRepositoryResult?.snapshot ?? null;
   const selectedCommitResult =
     repositorySnapshots.find(
       ({ repository: candidate }) =>
         candidate.id === selectedCommitRepositoryId,
-    ) ?? null;
+    ) ?? currentRepositoryResult;
   const selectedCommitRepository =
     selectedCommitResult?.repository ?? repository;
   const commitDiffQuery = useProjectCommitDiffQuery(
     selectedCommitRepository,
     selectedCommitHash,
-    "remote",
-    activeCommunity?.reposDir,
+    selectedCommitResult?.source ?? "remote",
+    reposDir,
   );
   const contributorPubkeysByGitIdentity = React.useMemo(
     () =>
@@ -368,6 +360,7 @@ export function ProjectHomeWorkspaceSheet({
           project={project}
           projects={projects}
           repository={repository}
+          reposDir={reposDir}
         />
       );
       break;
@@ -408,7 +401,7 @@ export function ProjectHomeWorkspaceSheet({
           onOpenChange={setCreatePullRequestOpen}
           open
           projects={projects}
-          reposDir={activeCommunity?.reposDir}
+          reposDir={reposDir}
         />
       ) : null}
       <CreateProjectIssueDialog

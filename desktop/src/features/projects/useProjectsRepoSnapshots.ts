@@ -7,11 +7,13 @@ import {
 } from "@/shared/api/projectGit";
 import type { ProjectRepoSnapshot } from "@/shared/api/types";
 import type { Project } from "./hooks";
+import { projectRepositoryQueryIdentity } from "./lib/projectRepositoryQueryIdentity";
 import { selectProjectRepository } from "./projectModels";
 import {
   type ProjectRepoUnavailableReason,
   projectRepoUnavailableReason,
 } from "./lib/projectRepoAvailability";
+import { useRelayOrigin } from "@/shared/lib/useRelayOrigin";
 
 // Remote snapshots are backed by a blobless `git clone` per repository, so the
 // overview scan is deliberately throttled and cached for a long time.
@@ -91,6 +93,30 @@ async function fetchProjectsRepoSnapshots(
   return { snapshots, unavailable };
 }
 
+/** Complete cache key for the local-first repository overview aggregate. */
+export function projectsRepoSnapshotsQueryKey(
+  projects: Project[],
+  reposDir: string | null | undefined,
+  relayOrigin: string | null,
+) {
+  const repositoryIdentities = projects
+    .map((project) => {
+      const repository = selectProjectRepository(project, null);
+      return [
+        project.id,
+        projectRepositoryQueryIdentity({
+          branch: repository?.defaultBranch,
+          relayOrigin,
+          repository,
+          reposDir,
+          source: "local-first",
+        }),
+      ] as const;
+    })
+    .sort(([left], [right]) => left.localeCompare(right));
+  return ["projects", "repo-snapshots", repositoryIdentities] as const;
+}
+
 /**
  * Fetches repo snapshots for a set of projects (throttled, failure-tolerant)
  * for community-wide aggregates like the overview language breakdown.
@@ -101,14 +127,15 @@ export function useProjectsRepoSnapshotsQuery(
   projects: Project[],
   reposDir?: string | null,
 ) {
-  const projectIds = React.useMemo(
-    () => projects.map((project) => project.id).sort(),
-    [projects],
+  const relayOrigin = useRelayOrigin();
+  const queryKey = React.useMemo(
+    () => projectsRepoSnapshotsQueryKey(projects, reposDir, relayOrigin),
+    [projects, relayOrigin, reposDir],
   );
 
   return useQuery({
     enabled: projects.length > 0,
-    queryKey: ["projects", "repo-snapshots", reposDir ?? "default", projectIds],
+    queryKey,
     queryFn: () => fetchProjectsRepoSnapshots(projects, reposDir),
     staleTime: 15 * 60_000,
     retry: 0,

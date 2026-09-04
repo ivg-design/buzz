@@ -73,6 +73,8 @@ import {
   PROJECT_QUERY_STRUCTURAL_SHARING,
 } from "./projectSnapshot";
 import { projectMatchesRouteId } from "./projectRoutes";
+import { projectRepositoryQueryIdentity } from "./lib/projectRepositoryQueryIdentity";
+import { useRelayOrigin } from "@/shared/lib/useRelayOrigin";
 
 export { fetchProjects } from "./projectFetch";
 export { projectsQueryKey };
@@ -672,6 +674,112 @@ export function useRepoStateQuery(project: Repository | null | undefined) {
   });
 }
 
+/** Complete cache key for a remote repository snapshot query. */
+export function projectRepoSnapshotQueryKey(
+  project: Repository | null | undefined,
+  relayOrigin: string | null,
+  branchName?: string | null,
+  pullRequest?: ProjectPullRequest | null,
+  tag?: { name: string; commit: string } | null,
+) {
+  const selectedBranch = branchName ?? project?.defaultBranch ?? null;
+  const targetRef = tag
+    ? `refs/tags/${tag.name}`
+    : pullRequest
+      ? `refs/nostr/${pullRequest.id}`
+      : null;
+  return [
+    "project",
+    project?.id ?? "none",
+    "repo-snapshot",
+    projectRepositoryQueryIdentity({
+      branch: selectedBranch,
+      cloneUrl: pullRequest?.cloneUrls[0],
+      relayOrigin,
+      repository: project,
+      source: "remote",
+      targetCommit: tag?.commit ?? pullRequest?.commit,
+      targetRef,
+    }),
+  ] as const;
+}
+
+/** Complete cache key for a remote repository diff query. */
+export function projectRepoDiffQueryKey(
+  project: Repository | null | undefined,
+  relayOrigin: string | null,
+  branchName?: string | null,
+  pullRequest?: ProjectPullRequest | null,
+) {
+  const selectedBranch = branchName ?? project?.defaultBranch ?? null;
+  return [
+    "project",
+    project?.id ?? "none",
+    "repo-diff",
+    projectRepositoryQueryIdentity({
+      branch: selectedBranch,
+      cloneUrl: pullRequest?.cloneUrls[0],
+      relayOrigin,
+      repository: project,
+      source: "remote",
+      targetCommit: pullRequest?.commit,
+      targetRef: pullRequest ? `refs/nostr/${pullRequest.id}` : null,
+    }),
+  ] as const;
+}
+
+/** Complete cache key for a local-checkout repository diff query. */
+export function projectLocalRepoDiffQueryKey(
+  project: Repository | null | undefined,
+  relayOrigin: string | null,
+  reposDir?: string | null,
+  branchName?: string | null,
+  pullRequest?: ProjectPullRequest | null,
+) {
+  const selectedBranch = branchName ?? project?.defaultBranch ?? null;
+  const baseCommit =
+    pullRequest?.initialCommit &&
+    pullRequest.initialCommit !== pullRequest.commit
+      ? pullRequest.initialCommit
+      : null;
+  return [
+    "project",
+    project?.id ?? "none",
+    "local-repo-diff",
+    projectRepositoryQueryIdentity({
+      baseCommit,
+      branch: selectedBranch,
+      relayOrigin,
+      repository: project,
+      reposDir,
+      source: "local",
+      targetCommit: pullRequest?.commit,
+    }),
+  ] as const;
+}
+
+/** Complete cache key for a local-checkout repository snapshot query. */
+export function projectLocalRepoSnapshotQueryKey(
+  project: Repository | null | undefined,
+  relayOrigin: string | null,
+  reposDir?: string | null,
+  branchName?: string | null,
+) {
+  const selectedBranch = branchName ?? project?.defaultBranch ?? null;
+  return [
+    "project",
+    project?.id ?? "none",
+    "local-repo-snapshot",
+    projectRepositoryQueryIdentity({
+      branch: selectedBranch,
+      relayOrigin,
+      repository: project,
+      reposDir,
+      source: "local",
+    }),
+  ] as const;
+}
+
 export function useProjectRepoSnapshotQuery(
   project: Repository | null | undefined,
   branchName?: string | null,
@@ -680,19 +788,17 @@ export function useProjectRepoSnapshotQuery(
   enabled = true,
 ) {
   const selectedBranch = branchName ?? project?.defaultBranch ?? null;
+  const relayOrigin = useRelayOrigin();
 
   return useQuery({
     enabled: Boolean(enabled && project?.cloneUrls[0]),
-    queryKey: [
-      "project",
-      project?.id ?? "none",
-      "repo-snapshot",
-      selectedBranch ?? "default",
-      pullRequest?.id ?? "none",
-      pullRequest?.commit ?? "none",
-      tag?.name ?? "no-tag",
-      tag?.commit ?? "no-tag-commit",
-    ],
+    queryKey: projectRepoSnapshotQueryKey(
+      project,
+      relayOrigin,
+      selectedBranch,
+      pullRequest,
+      tag,
+    ),
     queryFn: () => {
       if (!project) throw new Error("No project selected.");
       return fetchProjectRepoSnapshot(
@@ -714,17 +820,16 @@ export function useProjectRepoDiffQuery(
   enabled = true,
 ) {
   const selectedBranch = branchName ?? project?.defaultBranch ?? null;
+  const relayOrigin = useRelayOrigin();
 
   return useQuery({
     enabled: Boolean(enabled && project?.cloneUrls[0] && pullRequest),
-    queryKey: [
-      "project",
-      project?.id ?? "none",
-      "repo-diff",
-      selectedBranch ?? "default",
-      pullRequest?.id ?? "none",
-      pullRequest?.commit ?? "none",
-    ],
+    queryKey: projectRepoDiffQueryKey(
+      project,
+      relayOrigin,
+      selectedBranch,
+      pullRequest,
+    ),
     queryFn: () => {
       if (!project) throw new Error("No project selected.");
       return fetchProjectRepoDiff(project, selectedBranch, pullRequest);
@@ -742,18 +847,17 @@ export function useProjectLocalRepoDiffQuery(
   enabled = true,
 ) {
   const selectedBranch = branchName ?? project?.defaultBranch ?? null;
+  const relayOrigin = useRelayOrigin();
 
   return useQuery({
     enabled: Boolean(enabled && project),
-    queryKey: [
-      "project",
-      project?.id ?? "none",
-      "local-repo-diff",
-      reposDir ?? "default",
-      selectedBranch ?? "default",
-      pullRequest?.initialCommit ?? "none",
-      pullRequest?.commit ?? "none",
-    ],
+    queryKey: projectLocalRepoDiffQueryKey(
+      project,
+      relayOrigin,
+      reposDir,
+      selectedBranch,
+      pullRequest,
+    ),
     queryFn: () => {
       if (!project) throw new Error("No project selected.");
       return fetchProjectLocalRepoDiff(
@@ -774,16 +878,16 @@ export function useProjectLocalRepoSnapshotQuery(
   branchName?: string | null,
 ) {
   const selectedBranch = branchName ?? project?.defaultBranch ?? null;
+  const relayOrigin = useRelayOrigin();
 
   return useQuery({
     enabled: Boolean(project),
-    queryKey: [
-      "project",
-      project?.id ?? "none",
-      "local-repo-snapshot",
-      reposDir ?? "default",
-      selectedBranch ?? "default",
-    ],
+    queryKey: projectLocalRepoSnapshotQueryKey(
+      project,
+      relayOrigin,
+      reposDir,
+      selectedBranch,
+    ),
     queryFn: () => {
       if (!project) throw new Error("No project selected.");
       return fetchProjectLocalRepoSnapshot(project, reposDir, selectedBranch);

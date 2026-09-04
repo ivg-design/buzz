@@ -33,12 +33,7 @@ fn sidecar_search_order_matches_the_build_profile() {
 
     for (debug_build, expected) in cases {
         assert_eq!(
-            command_search_dirs_for(
-                workspace,
-                Some(current),
-                Some(bundled),
-                debug_build,
-            ),
+            command_search_dirs_for(workspace, Some(current), Some(bundled), debug_build,),
             expected,
             "unexpected sidecar search order for debug_build={debug_build}"
         );

@@ -11,6 +11,9 @@ use crate::{AgentsCmd, RespondToArg};
 
 pub async fn dispatch(command: AgentsCmd, client: &BuzzClient) -> Result<(), CliError> {
     match command {
+        AgentsCmd::Capabilities { project_address } => {
+            crate::commands::jobs::capabilities(client, project_address).await
+        }
         AgentsCmd::DraftCreate {
             channel,
             display_name,

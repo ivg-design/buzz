@@ -6,6 +6,7 @@ pub mod events;
 pub mod gifs;
 pub mod git;
 pub mod invites;
+pub mod jobs;
 pub mod media;
 pub mod mesh_demo;
 pub mod nip05;

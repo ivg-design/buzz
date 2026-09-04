@@ -9,6 +9,8 @@
 pub mod agent_turn_metric;
 /// Channel and membership enums shared across crates.
 pub mod channel;
+/// Authenticated server-resolved tenant context contract.
+pub mod community_context;
 /// NIP-AE Agent Engrams — slug grammar, conversation key, d-tag derivation,
 /// body parse/serialize, envelope build/validate, head selection.
 pub mod engram;
@@ -22,6 +24,10 @@ pub mod filter;
 pub mod git_perms;
 /// Shared invite-link contract constants.
 pub mod invite;
+/// Signed, channel-scoped agent job event schema and validation.
+pub mod job;
+/// Short-lived relay authorization preflight for durable job receivers.
+pub mod job_authorization;
 /// Buzz kind number registry — custom event type constants.
 pub mod kind;
 /// Network utilities — SSRF-safe IP classification.
@@ -43,6 +49,7 @@ pub mod tenant;
 /// Schnorr signature and event ID verification.
 pub mod verification;
 
+pub use community_context::{CommunityContext, COMMUNITY_CONTEXT_SCHEMA_VERSION};
 pub use error::VerificationError;
 pub use event::StoredEvent;
 pub use nostr::{Event, EventId, Filter, Keys, Kind, PublicKey};

@@ -7,11 +7,11 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use buzz_core::kind::{
-    event_kind_u32, is_parameterized_replaceable, KIND_AGENT_PROFILE, KIND_DM_VISIBILITY,
-    KIND_GIT_REPO_ANNOUNCEMENT, KIND_IA_ARCHIVED, KIND_IA_ARCHIVED_LIST, KIND_IA_UNARCHIVED,
-    KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION, KIND_NIP29_GROUP_ADMINS,
-    KIND_NIP29_GROUP_MEMBERS, KIND_NIP29_GROUP_METADATA, KIND_NIP43_MEMBERSHIP_LIST, KIND_REACTION,
-    KIND_THREAD_SUMMARY,
+    event_kind_u32, is_job_kind, is_parameterized_replaceable, KIND_AGENT_PROFILE,
+    KIND_DM_VISIBILITY, KIND_GIT_REPO_ANNOUNCEMENT, KIND_IA_ARCHIVED, KIND_IA_ARCHIVED_LIST,
+    KIND_IA_UNARCHIVED, KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION,
+    KIND_NIP29_GROUP_ADMINS, KIND_NIP29_GROUP_MEMBERS, KIND_NIP29_GROUP_METADATA,
+    KIND_NIP43_MEMBERSHIP_LIST, KIND_REACTION, KIND_THREAD_SUMMARY,
 };
 use buzz_core::StoredEvent;
 use buzz_db::channel::{MemberRecord, MemberRole};
@@ -1788,6 +1788,11 @@ async fn handle_delete_event_side_effect(
         .await
         .map_err(|e| anyhow::anyhow!("get_event_by_id failed: {e}"))?
     {
+        if is_job_kind(event_kind_u32(&target_event.event)) {
+            return Err(anyhow::anyhow!(
+                "job protocol events are immutable and cannot be deleted"
+            ));
+        }
         match target_event.channel_id {
             Some(target_ch) if target_ch != channel_id => {
                 return Err(anyhow::anyhow!(
@@ -2342,6 +2347,11 @@ async fn handle_standard_deletion_event(
             Some(target) => target,
             None => continue,
         };
+        if is_job_kind(event_kind_u32(&target_event.event)) {
+            return Err(anyhow::anyhow!(
+                "job protocol events are immutable and cannot be deleted"
+            ));
+        }
         if u32::from(target_event.event.kind.as_u16()) == super::push_lease::KIND_PUSH_LEASE {
             tracing::debug!(
                 target_id = %hex::encode(&target_id),

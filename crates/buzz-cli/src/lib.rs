@@ -180,6 +180,9 @@ enum Cmd {
     /// Send, read, search, and manage messages
     #[command(subcommand)]
     Messages(MessagesCmd),
+    /// Submit and inspect signed, project-scoped agent jobs
+    #[command(subcommand)]
+    Jobs(JobsCmd),
     /// Create, configure, and manage channels
     #[command(subcommand)]
     Channels(ChannelsCmd),
@@ -265,6 +268,12 @@ impl RespondToArg {
 
 #[derive(Subcommand)]
 pub enum AgentsCmd {
+    /// Discover capabilities advertised by project agents
+    Capabilities {
+        /// Exact NIP-33 project address (`30621:<pubkey>:<d>`)
+        #[arg(long)]
+        project_address: String,
+    },
     /// Open a prefilled create-agent form in the owner's Buzz Desktop
     DraftCreate {
         /// Current channel UUID; the new agent is added here after save
@@ -368,6 +377,109 @@ Examples:\n  \
 buzz agents archived"
     )]
     Archived,
+}
+
+#[derive(Subcommand)]
+pub enum JobsCmd {
+    /// Submit a kind 43001 request from a strict JSON document
+    Submit {
+        /// JSON file, or '-' for stdin
+        #[arg(long)]
+        input: String,
+    },
+    /// List durable job projections visible after reconnect
+    List {
+        /// Filter by exact NIP-33 project address
+        #[arg(long)]
+        project_address: Option<String>,
+        /// Filter by addressee pubkey, or 'self'
+        #[arg(long)]
+        recipient: Option<String>,
+        /// Filter by projected lifecycle state
+        #[arg(long)]
+        state: Option<String>,
+        /// Opaque cursor returned by an earlier list
+        #[arg(long)]
+        cursor: Option<String>,
+    },
+    /// Get one durable operation projection
+    Get {
+        /// Canonical operation UUID
+        #[arg(long)]
+        operation_id: String,
+    },
+    /// Publish a processed or accepted kind 43002 receipt
+    Accept {
+        /// Canonical operation UUID (must match the JSON body)
+        #[arg(long)]
+        operation_id: String,
+        /// JSON file, or '-' for stdin
+        #[arg(long)]
+        input: String,
+    },
+    /// Publish a progress or blocked kind 43003 event
+    Progress {
+        /// Canonical operation UUID (must match the JSON body)
+        #[arg(long)]
+        operation_id: String,
+        /// JSON file, or '-' for stdin
+        #[arg(long)]
+        input: String,
+    },
+    /// Publish a successful kind 43004 terminal result
+    Complete {
+        /// Canonical operation UUID (must match the JSON body)
+        #[arg(long)]
+        operation_id: String,
+        /// JSON file, or '-' for stdin
+        #[arg(long)]
+        input: String,
+    },
+    /// Publish a kind 43006 terminal error
+    Fail {
+        /// Canonical operation UUID (must match the JSON body)
+        #[arg(long)]
+        operation_id: String,
+        /// JSON file, or '-' for stdin
+        #[arg(long)]
+        input: String,
+    },
+    /// Publish a requester-authored kind 43005 cancellation
+    Cancel {
+        /// Canonical operation UUID (must match the JSON body)
+        #[arg(long)]
+        operation_id: String,
+        /// JSON file, or '-' for stdin
+        #[arg(long)]
+        input: String,
+    },
+    /// Publish a worker-authored terminal acknowledgement of cancellation
+    AcknowledgeCancel {
+        /// Canonical operation UUID (must match the JSON body)
+        #[arg(long)]
+        operation_id: String,
+        /// JSON file, or '-' for stdin
+        #[arg(long)]
+        input: String,
+    },
+    /// Publish a worker-authored kind 43005 claim release
+    Release {
+        /// Canonical operation UUID (must match the JSON body)
+        #[arg(long)]
+        operation_id: String,
+        /// JSON file, or '-' for stdin
+        #[arg(long)]
+        input: String,
+    },
+    /// Publish a terminal handoff request; the coordinator must supersede it
+    Handoff {
+        /// Canonical operation UUID (must match the JSON body)
+        #[arg(long)]
+        operation_id: String,
+        /// JSON file, or '-' for stdin
+        #[arg(long)]
+        input: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2104,6 +2216,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
     match cli.command {
         Cmd::Agents(sub) => commands::agents::dispatch(sub, &client).await,
         Cmd::Messages(sub) => commands::messages::dispatch(sub, &client, &cli.format).await,
+        Cmd::Jobs(sub) => commands::jobs::dispatch(sub, &client).await,
         Cmd::Channels(sub) => commands::channels::dispatch(sub, &client, &cli.format).await,
         Cmd::Canvas(sub) => commands::channels::dispatch_canvas(sub, &client).await,
         Cmd::Reactions(sub) => commands::reactions::dispatch(sub, &client).await,
@@ -2260,6 +2373,7 @@ mod tests {
             "feed",
             "gifs",
             "issues",
+            "jobs",
             "media",
             "mem",
             "messages",
@@ -2321,6 +2435,7 @@ mod tests {
             vec![
                 "archive",
                 "archived",
+                "capabilities",
                 "draft-create",
                 "draft-update",
                 "unarchive"
@@ -2442,6 +2557,22 @@ mod tests {
             vec!["assign", "create", "get", "list", "status", "unassign"]
         );
         assert_eq!(names(&cmd, "media"), vec!["get"]);
+        assert_eq!(
+            names(&cmd, "jobs"),
+            vec![
+                "accept",
+                "acknowledge-cancel",
+                "cancel",
+                "complete",
+                "fail",
+                "get",
+                "handoff",
+                "list",
+                "progress",
+                "release",
+                "submit"
+            ]
+        );
         assert_eq!(names(&cmd, "upload"), vec!["file"]);
         assert_eq!(names(&cmd, "pack"), vec!["inspect", "validate"]);
         assert_eq!(
@@ -2462,13 +2593,14 @@ mod tests {
     #[test]
     fn subcommand_counts_are_stable() {
         let expected: Vec<(&str, usize)> = vec![
-            ("agents", 5),
+            ("agents", 6),
             ("canvas", 2),
             ("channels", 16),
             ("dms", 4),
             ("emoji", 5),
             ("feed", 1),
             ("issues", 6),
+            ("jobs", 11),
             ("media", 1),
             ("messages", 8),
             ("pack", 2),

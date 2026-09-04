@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use buzz_auth::Scope;
 use buzz_core::kind::{
-    event_kind_u32, is_identity_archive_request_kind, is_parameterized_replaceable,
+    event_kind_u32, is_identity_archive_request_kind, is_job_kind, is_parameterized_replaceable,
     is_relay_admin_kind, KIND_AGENT_ENGRAM, KIND_AGENT_PROFILE, KIND_AGENT_TURN_METRIC,
     KIND_APPROVAL_DENY, KIND_APPROVAL_GRANT, KIND_AUTH, KIND_BOOKMARK_LIST, KIND_BOOKMARK_SET,
     KIND_CANVAS, KIND_CONTACT_LIST, KIND_DELETION, KIND_DM_ADD_MEMBER, KIND_DM_HIDE, KIND_DM_OPEN,
@@ -21,20 +21,21 @@ use buzz_core::kind::{
     KIND_GIT_STATUS_CLOSED, KIND_GIT_STATUS_DRAFT, KIND_GIT_STATUS_MERGED, KIND_GIT_STATUS_OPEN,
     KIND_HUDDLE_ENDED, KIND_HUDDLE_GUIDELINES, KIND_HUDDLE_PARTICIPANT_JOINED,
     KIND_HUDDLE_PARTICIPANT_LEFT, KIND_HUDDLE_STARTED, KIND_IA_ARCHIVE_REQUEST,
-    KIND_IA_UNARCHIVE_REQUEST, KIND_LONG_FORM, KIND_MANAGED_AGENT, KIND_MEMBER_ADDED_NOTIFICATION,
-    KIND_MEMBER_REMOVED_NOTIFICATION, KIND_MODERATION_BAN, KIND_MODERATION_RESOLVE_REPORT,
-    KIND_MODERATION_TIMEOUT, KIND_MODERATION_UNBAN, KIND_MODERATION_UNTIMEOUT, KIND_MUTE_LIST,
-    KIND_NIP29_CREATE_GROUP, KIND_NIP29_DELETE_EVENT, KIND_NIP29_DELETE_GROUP,
-    KIND_NIP29_EDIT_METADATA, KIND_NIP29_JOIN_REQUEST, KIND_NIP29_LEAVE_REQUEST,
-    KIND_NIP29_PUT_USER, KIND_NIP29_REMOVE_USER, KIND_NIP43_LEAVE_REQUEST,
-    KIND_NIP65_RELAY_LIST_METADATA, KIND_PERSONA, KIND_PIN_LIST, KIND_PRESENCE_UPDATE,
-    KIND_PRIVATE_MANAGED_AGENT, KIND_PRODUCT_FEEDBACK, KIND_PROFILE, KIND_PROJECT, KIND_REACTION,
-    KIND_READ_STATE, KIND_REPORT, KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_BOOKMARKED,
-    KIND_STREAM_MESSAGE_DIFF, KIND_STREAM_MESSAGE_EDIT, KIND_STREAM_MESSAGE_PINNED,
-    KIND_STREAM_MESSAGE_SCHEDULED, KIND_STREAM_MESSAGE_V2, KIND_STREAM_REMINDER, KIND_TEAM,
-    KIND_TEAM_CATALOG, KIND_TEXT_NOTE, KIND_USER_STATUS, KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER,
-    RELAY_ADMIN_ADD_MEMBER, RELAY_ADMIN_CHANGE_ROLE, RELAY_ADMIN_REMOVE_MEMBER,
-    RELAY_ADMIN_SET_WORKSPACE_PROFILE,
+    KIND_IA_UNARCHIVE_REQUEST, KIND_JOB_ACCEPTED, KIND_JOB_CANCEL, KIND_JOB_ERROR,
+    KIND_JOB_PROGRESS, KIND_JOB_REQUEST, KIND_JOB_RESULT, KIND_LONG_FORM, KIND_MANAGED_AGENT,
+    KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION, KIND_MODERATION_BAN,
+    KIND_MODERATION_RESOLVE_REPORT, KIND_MODERATION_TIMEOUT, KIND_MODERATION_UNBAN,
+    KIND_MODERATION_UNTIMEOUT, KIND_MUTE_LIST, KIND_NIP29_CREATE_GROUP, KIND_NIP29_DELETE_EVENT,
+    KIND_NIP29_DELETE_GROUP, KIND_NIP29_EDIT_METADATA, KIND_NIP29_JOIN_REQUEST,
+    KIND_NIP29_LEAVE_REQUEST, KIND_NIP29_PUT_USER, KIND_NIP29_REMOVE_USER,
+    KIND_NIP43_LEAVE_REQUEST, KIND_NIP65_RELAY_LIST_METADATA, KIND_PERSONA, KIND_PIN_LIST,
+    KIND_PRESENCE_UPDATE, KIND_PRIVATE_MANAGED_AGENT, KIND_PRODUCT_FEEDBACK, KIND_PROFILE,
+    KIND_PROJECT, KIND_REACTION, KIND_READ_STATE, KIND_REPORT, KIND_STREAM_MESSAGE,
+    KIND_STREAM_MESSAGE_BOOKMARKED, KIND_STREAM_MESSAGE_DIFF, KIND_STREAM_MESSAGE_EDIT,
+    KIND_STREAM_MESSAGE_PINNED, KIND_STREAM_MESSAGE_SCHEDULED, KIND_STREAM_MESSAGE_V2,
+    KIND_STREAM_REMINDER, KIND_TEAM, KIND_TEAM_CATALOG, KIND_TEXT_NOTE, KIND_USER_STATUS,
+    KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER, RELAY_ADMIN_ADD_MEMBER, RELAY_ADMIN_CHANGE_ROLE,
+    RELAY_ADMIN_REMOVE_MEMBER, RELAY_ADMIN_SET_WORKSPACE_PROFILE,
 };
 use buzz_core::tenant::TenantContext;
 use buzz_core::verification::verify_event;
@@ -431,6 +432,20 @@ fn map_push_accept_error(error: super::push_lease::AcceptError) -> IngestError {
     }
 }
 
+fn map_job_auth_error(error: super::job::JobAuthError) -> IngestError {
+    match error {
+        super::job::JobAuthError::Invalid(reason) => {
+            IngestError::Rejected(format!("invalid: {reason}"))
+        }
+        super::job::JobAuthError::Restricted(reason) => {
+            IngestError::AuthFailed(format!("restricted: {reason}"))
+        }
+        super::job::JobAuthError::Internal(reason) => {
+            IngestError::Internal(format!("error: {reason}"))
+        }
+    }
+}
+
 /// Determine the required scope for a given event kind.
 ///
 /// Returns `Err` for unknown kinds — the relay rejects them.
@@ -438,6 +453,7 @@ fn required_scope_for_kind(kind: u32, event: &Event) -> Result<Scope, &'static s
     match kind {
         KIND_PROFILE => Ok(Scope::UsersWrite),
         KIND_TEXT_NOTE | KIND_LONG_FORM => Ok(Scope::MessagesWrite),
+        k if is_job_kind(k) => Ok(Scope::JobsWrite),
         KIND_CONTACT_LIST | KIND_READ_STATE | KIND_USER_STATUS | KIND_AGENT_ENGRAM
         | KIND_EVENT_REMINDER | KIND_PERSONA | KIND_TEAM | KIND_MANAGED_AGENT
         | KIND_PRIVATE_MANAGED_AGENT | KIND_TEAM_CATALOG | super::push_lease::KIND_PUSH_LEASE => {
@@ -732,7 +748,23 @@ pub(crate) fn requires_h_channel_scope(kind: u32) -> bool {
             | KIND_HUDDLE_PARTICIPANT_LEFT
             | KIND_HUDDLE_ENDED
             | KIND_HUDDLE_GUIDELINES
+            // Agent jobs are shared project coordination, never global/DM events.
+            | KIND_JOB_REQUEST
+            | KIND_JOB_ACCEPTED
+            | KIND_JOB_PROGRESS
+            | KIND_JOB_RESULT
+            | KIND_JOB_CANCEL
+            | KIND_JOB_ERROR
     )
+}
+
+/// Channel-scoped kinds whose `e` tags use NIP-10 message threading.
+///
+/// Job events carry their own strict root/predecessor graph, so feeding their
+/// e-tags through the message-thread ancestry resolver would reject the valid
+/// processed -> accepted -> progress lifecycle.
+fn requires_nip10_thread_meta(kind: u32) -> bool {
+    requires_h_channel_scope(kind) && !is_job_kind(kind)
 }
 
 /// Check channel membership: member OR open-visibility channel.
@@ -2234,7 +2266,11 @@ async fn ingest_event_inner(
     const MAX_TIMESTAMP_DRIFT_SECS: i64 = 900; // ±15 minutes
     let now = chrono::Utc::now().timestamp();
     let event_ts = event.created_at.as_secs() as i64;
-    if (event_ts - now).abs() > MAX_TIMESTAMP_DRIFT_SECS {
+    // Job retries are checked for an exact durable event under their operation
+    // lock before the job validator applies this same drift bound to new
+    // events. This lets a caller recover a lost relay OK after expiry without
+    // reopening stale publication for a never-stored event.
+    if !is_job_kind(kind_u32) && (event_ts - now).abs() > MAX_TIMESTAMP_DRIFT_SECS {
         return Err(IngestError::Rejected(
             "invalid: event timestamp too far from server time".into(),
         ));
@@ -2564,6 +2600,16 @@ async fn ingest_event_inner(
             auth_result.map_err(IngestError::Rejected)?;
         }
     }
+
+    let mut job_operation = if is_job_kind(kind_u32) {
+        Some(
+            super::job::validate_job_event(tenant, state, &event)
+                .await
+                .map_err(map_job_auth_error)?,
+        )
+    } else {
+        None
+    };
 
     // Handled directly — these mutate relay_members and do NOT get stored.
     // The handler enforces the durable community ban itself: the write-path
@@ -2998,7 +3044,7 @@ async fn ingest_event_inner(
             .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
     }
 
-    let thread_meta = if requires_h_channel_scope(kind_u32) {
+    let thread_meta = if requires_nip10_thread_meta(kind_u32) {
         if let Some(ch_id) = channel_id {
             resolve_nip10_thread_meta(tenant.community(), &event, ch_id, state)
                 .await
@@ -3167,6 +3213,16 @@ async fn ingest_event_inner(
             .replace_parameterized_event(tenant.community(), &event, &d_tag, channel_id)
             .await
             .map_err(|e| IngestError::Internal(format!("error: {e}")))?
+    } else if let Some(operation) = job_operation.as_mut() {
+        let Some(job_channel_id) = channel_id else {
+            return Err(IngestError::Internal(
+                "error: validated job event lost its channel scope".into(),
+            ));
+        };
+        operation
+            .insert_event(tenant, &event, job_channel_id)
+            .await
+            .map_err(map_job_auth_error)?
     } else {
         let thread_params = thread_meta.as_ref().map(|m| m.as_params());
         match state
@@ -3204,11 +3260,18 @@ async fn ingest_event_inner(
     };
 
     if !was_inserted {
+        if let Some(job_operation) = job_operation.take() {
+            job_operation.commit().await.map_err(map_job_auth_error)?;
+        }
         return Ok(IngestResult {
             event_id: event_id_hex,
             accepted: true,
             message: "duplicate:".into(),
         });
+    }
+
+    if let Some(job_operation) = job_operation.take() {
+        job_operation.commit().await.map_err(map_job_auth_error)?;
     }
 
     if crate::handlers::side_effects::is_side_effect_kind(kind_u32) {

@@ -527,6 +527,12 @@ pub const KIND_JOB_CANCEL: u32 = 43005;
 /// An agent job failed with an error.
 pub const KIND_JOB_ERROR: u32 = 43006;
 
+/// Whether `kind` belongs to the signed agent-job protocol.
+#[must_use]
+pub const fn is_job_kind(kind: u32) -> bool {
+    matches!(kind, KIND_JOB_REQUEST..=KIND_JOB_ERROR)
+}
+
 /// Relay-signed notification: the target pubkey was added to a channel.
 /// Stored globally (channel_id = None) with p-tag = target, h-tag = channel UUID.
 pub const KIND_MEMBER_ADDED_NOTIFICATION: u32 = 44100;

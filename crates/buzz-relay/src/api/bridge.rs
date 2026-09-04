@@ -14,7 +14,7 @@ use base64::Engine;
 use serde_json::Value;
 
 use buzz_auth::{LimitType, Nip98ReplayGuard, DEFAULT_REPLAY_TTL_SECS};
-use buzz_core::TenantContext;
+use buzz_core::{CommunityContext, TenantContext, COMMUNITY_CONTEXT_SCHEMA_VERSION};
 
 use crate::handlers::ingest::{IngestAuth, IngestError};
 use crate::state::AppState;
@@ -248,6 +248,55 @@ pub(crate) fn nip42_expected_relay_url(config_relay_url: &str, tenant: &TenantCo
         "ws"
     };
     format!("{scheme}://{}", tenant.host())
+}
+
+/// Return the authenticated, server-resolved tenant identity for durable clients.
+///
+/// The community UUID is derived from the request Host before authentication;
+/// neither job content nor a caller header can select it.
+pub async fn community_context(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let raw_host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let tenant = crate::tenant::bind_community(&state.db, raw_host)
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::NOT_FOUND,
+                "relay: no community is configured for this host",
+            )
+        })?;
+    let url = nip98_expected_url(&state.config.relay_url, &tenant, "/api/context");
+    let VerifiedBridgeAuth {
+        pubkey,
+        event_id_bytes,
+        signed_created_at,
+    } = verify_bridge_auth(&headers, "GET", &url, None, state.config.require_auth_token)?;
+    enforce_http_admission(&state, &tenant, &pubkey).await?;
+    check_nip98_replay(&state, &tenant, event_id_bytes).await?;
+    let pubkey_bytes = pubkey.to_bytes().to_vec();
+    let auth_tag = super::relay_members::extract_auth_tag_header(&headers);
+    super::relay_members::enforce_relay_membership(
+        &state,
+        tenant.community(),
+        &pubkey_bytes,
+        auth_tag,
+        signed_created_at,
+    )
+    .await?;
+    let context = CommunityContext {
+        schema_version: COMMUNITY_CONTEXT_SCHEMA_VERSION.into(),
+        community_id: tenant.community().as_uuid().to_string(),
+        host: tenant.host().to_owned(),
+        pubkey: pubkey.to_hex(),
+    };
+    Ok(Json(serde_json::to_value(context).map_err(|error| {
+        internal_error(&format!("serializing community context: {error}"))
+    })?))
 }
 
 /// Extract a channel UUID from a single filter's `#h` tag.

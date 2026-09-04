@@ -727,12 +727,27 @@ pub async fn execute_delete_with_marker(
         return Ok(false);
     }
 
+    let target_kind = sqlx::query_scalar::<_, i32>(
+        "SELECT kind FROM events WHERE community_id = $1 AND id = $2 FOR SHARE",
+    )
+    .bind(community_id.as_uuid())
+    .bind(target_event_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if target_kind.is_some_and(|kind| (43_001..=43_006).contains(&kind)) {
+        tx.rollback().await?;
+        return Err(crate::DbError::InvalidData(
+            "job protocol events are immutable and cannot be deleted".into(),
+        ));
+    }
+
     // Soft-delete the event and update thread metadata (idempotent: already-deleted is a no-op).
     sqlx::query(
         r#"
         UPDATE events
         SET deleted_at = now()
         WHERE community_id = $1 AND id = $2 AND deleted_at IS NULL
+          AND kind NOT BETWEEN 43001 AND 43006
         "#,
     )
     .bind(community_id.as_uuid())

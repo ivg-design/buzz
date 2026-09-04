@@ -1,5 +1,7 @@
 const DEFAULT_DATABASE_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz"; // sadscan:disable np.postgres.1 -- local test-only credentials
 
+pub(crate) mod job;
+
 /// Resolve the database URL shared by PostgreSQL-backed relay tests.
 pub(crate) fn database_url() -> String {
     std::env::var("BUZZ_TEST_DATABASE_URL")

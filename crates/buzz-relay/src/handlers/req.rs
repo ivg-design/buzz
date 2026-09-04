@@ -7,9 +7,9 @@ use tracing::{debug, warn};
 
 use buzz_core::filter::filters_match;
 use buzz_core::kind::{
-    is_unshared_gated_event, AUTHOR_ONLY_KINDS, KIND_AGENT_ENGRAM, KIND_AGENT_TURN_METRIC,
-    KIND_DM_VISIBILITY, KIND_HUDDLE_LIVENESS, P_GATED_KINDS, RESULT_GATED_KINDS,
-    SHARED_GATED_KINDS,
+    is_job_kind, is_unshared_gated_event, AUTHOR_ONLY_KINDS, KIND_AGENT_ENGRAM,
+    KIND_AGENT_TURN_METRIC, KIND_DM_VISIBILITY, KIND_HUDDLE_LIVENESS, P_GATED_KINDS,
+    RESULT_GATED_KINDS, SHARED_GATED_KINDS,
 };
 use buzz_core::tenant::TenantContext;
 use buzz_db::EventQuery;
@@ -56,11 +56,16 @@ pub async fn handle_req(
     conn: Arc<ConnectionState>,
     state: Arc<AppState>,
 ) {
+    let required_read_scopes = required_read_scopes(&filters);
     let (conn_id, pubkey_bytes, token_channel_ids) = {
         let auth = conn.auth_state.read().await;
         match &*auth {
             AuthState::Authenticated(ctx) => {
-                if !ctx.scopes.is_empty() && !ctx.scopes.contains(&Scope::MessagesRead) {
+                if !ctx.scopes.is_empty()
+                    && ((required_read_scopes.messages
+                        && !ctx.scopes.contains(&Scope::MessagesRead))
+                        || (required_read_scopes.jobs && !ctx.scopes.contains(&Scope::JobsRead)))
+                {
                     conn.send(RelayMessage::notice("restricted: insufficient scope"));
                     conn.send(RelayMessage::closed(
                         &sub_id,
@@ -492,6 +497,42 @@ pub async fn handle_req(
         count = total_sent,
         "EOSE sent after historical delivery"
     );
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RequiredReadScopes {
+    messages: bool,
+    jobs: bool,
+}
+
+fn required_read_scopes(filters: &[Filter]) -> RequiredReadScopes {
+    let mut required = RequiredReadScopes {
+        messages: false,
+        jobs: false,
+    };
+    if filters.is_empty() {
+        return RequiredReadScopes {
+            messages: true,
+            jobs: true,
+        };
+    }
+    for filter in filters {
+        match &filter.kinds {
+            None => {
+                required.messages = true;
+                required.jobs = true;
+            }
+            Some(kinds) => {
+                required.jobs |= kinds
+                    .iter()
+                    .any(|kind| is_job_kind(u32::from(kind.as_u16())));
+                required.messages |= kinds
+                    .iter()
+                    .any(|kind| !is_job_kind(u32::from(kind.as_u16())));
+            }
+        }
+    }
+    required
 }
 
 /// FTS candidate hits fetched per page. Pages are always full regardless of

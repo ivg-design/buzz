@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
+use buzz_core::CommunityContext;
 use nostr::{EventBuilder, JsonUtil, Keys, Kind, Tag};
 use sha2::{Digest, Sha256};
 
@@ -569,6 +570,19 @@ impl BuzzClient {
         &self.relay_url
     }
 
+    /// Load the authenticated community namespace from the relay's Host-bound context endpoint.
+    pub async fn community_context(&self) -> Result<CommunityContext, CliError> {
+        let raw = self.get_authed("/api/context").await?;
+        let context: CommunityContext = serde_json::from_str(&raw)
+            .map_err(|error| CliError::Other(format!("invalid relay context response: {error}")))?;
+        let expected_host = relay_server_tag(&self.relay_url)
+            .ok_or_else(|| CliError::Other("configured relay URL has no canonical host".into()))?;
+        context
+            .validate_binding(&expected_host, &self.keys.public_key())
+            .map_err(CliError::Other)?;
+        Ok(context)
+    }
+
     /// Return the owner pubkey carried by the NIP-OA auth tag, if any.
     ///
     /// The auth tag is `["auth", owner_pubkey, conditions, sig]`; the
@@ -609,6 +623,27 @@ impl BuzzClient {
             )));
         }
 
+        Ok(event)
+    }
+
+    /// Sign a durable job event without embedding the NIP-OA credential tag.
+    ///
+    /// Agent admission still uses the verified `x-auth-tag` HTTP header (or an
+    /// authenticated NIP-42 session). Keeping that credential out of kinds
+    /// 43001-43006 prevents durable job history from leaking owner linkage.
+    pub(crate) fn sign_job_event(&self, builder: EventBuilder) -> Result<nostr::Event, CliError> {
+        let event = builder
+            .sign_with_keys(&self.keys)
+            .map_err(|error| CliError::Other(format!("signing failed: {error}")))?;
+        if event
+            .tags
+            .iter()
+            .any(|tag| tag.as_slice().first().map(String::as_str) == Some("auth"))
+        {
+            return Err(CliError::Other(
+                "job events must not embed a durable auth tag".into(),
+            ));
+        }
         Ok(event)
     }
 

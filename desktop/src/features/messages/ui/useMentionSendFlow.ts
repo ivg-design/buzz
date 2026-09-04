@@ -668,6 +668,13 @@ export function useMentionSendFlow({
       }
       try {
         if (isSendCancelled()) return;
+        // Every extraction below reads the mention map, and a pasted identity
+        // can still be verifying — the relay round trip for a non-member is
+        // exactly the case this feature exists for. Sending first would
+        // publish a readable `@Label` with no `p` tag. Bounded inside, so a
+        // lookup that never answers delays the send rather than blocking it.
+        await mentions.settlePendingMentionBindings();
+        if (isSendCancelled()) return;
         const dmThreadAgentMentionErrorMessage = dmThreadAgentMentionError({
           trimmed,
           isThreadReply: capturedThreadContext != null,
@@ -785,6 +792,10 @@ export function useMentionSendFlow({
         }
         sendPromoted = true;
         await completeSend(pendingDraft, pubkeys);
+      } catch (error) {
+        toast.error(
+          getErrorMessage(error, "Could not prepare mentions. Please retry."),
+        );
       } finally {
         if (!sendPromoted) {
           if (preparedLinkPreviews) {
@@ -809,6 +820,7 @@ export function useMentionSendFlow({
       mentions.isManagedAgentPubkey,
       mentions.memberPubkeys,
       mentions.getDraftMentionRefs,
+      mentions.settlePendingMentionBindings,
       onPrepareSendChannel,
       activePreparedLinkPreviews,
     ],

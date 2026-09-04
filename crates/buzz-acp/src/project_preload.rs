@@ -290,7 +290,9 @@ fn git_output_with_program(
     max_stdout_bytes: u64,
     deadline: Duration,
 ) -> Result<Output, String> {
-    let null_device = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    // These values are interpreted by Git. Git for Windows maps `/dev/null`
+    // through its MSYS layer but rejects `NUL` as a config-file path.
+    let null_device = "/dev/null";
     let mut command = Command::new(program);
     command
         .arg("--no-optional-locks")

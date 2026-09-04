@@ -1415,7 +1415,7 @@ fn apply_isolated_environment(command: &mut Command) {
         .env("GIT_ASKPASS", "")
         .env("SSH_ASKPASS", "")
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "NUL")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_PROTOCOL_FROM_USER", "0")
         .env("GIT_ATTR_NOSYSTEM", "1")
         .env("GIT_NO_LAZY_FETCH", "1")
@@ -1780,7 +1780,9 @@ fn null_device() -> &'static str {
 
 #[cfg(windows)]
 fn null_device() -> &'static str {
-    "NUL"
+    // Git for Windows maps POSIX `/dev/null` correctly, while the Win32
+    // device name `NUL` is rejected when used as a Git config path.
+    "/dev/null"
 }
 
 #[cfg(target_os = "macos")]
@@ -2098,7 +2100,7 @@ mod windows_tests {
             .args(args)
             .current_dir(cwd)
             .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "NUL")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_TERMINAL_PROMPT", "0")
             .output()
             .expect("run test Git");

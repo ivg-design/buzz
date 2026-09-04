@@ -1119,7 +1119,14 @@ fn null_device() -> &'static str {
     "/dev/null"
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn null_device() -> &'static str {
+    // Git for Windows interprets its config paths through the MSYS layer;
+    // the Win32 device name `NUL` is rejected as an invalid config file.
+    "/dev/null"
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn null_device() -> &'static str {
     "NUL"
 }

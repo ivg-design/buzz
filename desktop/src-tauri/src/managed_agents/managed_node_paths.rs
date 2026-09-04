@@ -257,6 +257,11 @@ pub(crate) fn buzz_managed_command_path(command: &str, basename: &str) -> Option
     if command == "codex-acp" && !bundled_codex_acp_is_verified(&candidate) {
         return None;
     }
+    if matches!(command, "claude-agent-acp" | "claude-code-acp")
+        && !super::bundled_claude_adapter::bundled_claude_acp_is_verified(&candidate)
+    {
+        return None;
+    }
     Some(candidate)
 }
 

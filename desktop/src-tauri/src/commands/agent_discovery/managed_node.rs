@@ -664,7 +664,44 @@ pub(super) fn managed_codex_acp_install_command() -> Result<Option<String>, Box<
     Ok(Some(bundled_codex_acp_npm_command(&prefix, &tarball)))
 }
 
+/// Build the app-private install command for Buzz's checksum-pinned Claude
+/// adapter with the immutable JobPolicyV1 extension.
+pub(super) fn managed_claude_acp_install_command(
+) -> Result<Option<String>, Box<InstallStepResult>> {
+    let tarball = crate::managed_agents::materialize_bundled_claude_acp().map_err(|error| {
+        Box::new(InstallStepResult {
+            step: "adapter".to_string(),
+            command: "bundled @agentclientprotocol/claude-agent-acp@0.73.0".to_string(),
+            success: false,
+            stdout: String::new(),
+            stderr: error,
+            exit_code: None,
+            hint: Some(managed_npm_prefix_hint()),
+        })
+    })?;
+    let prefix = crate::managed_agents::buzz_managed_claude_npm_prefix().ok_or_else(|| {
+        Box::new(InstallStepResult {
+            step: "adapter".to_string(),
+            command: "bundled @agentclientprotocol/claude-agent-acp@0.73.0".to_string(),
+            success: false,
+            stdout: String::new(),
+            stderr: "failed to resolve Buzz private Claude npm prefix".to_string(),
+            exit_code: None,
+            hint: Some(managed_npm_prefix_hint()),
+        })
+    })?;
+    Ok(Some(bundled_claude_acp_npm_command(&prefix, &tarball)))
+}
+
 fn bundled_codex_acp_npm_command(prefix: &std::path::Path, tarball: &std::path::Path) -> String {
+    format!(
+        "npm install --global --ignore-scripts --prefix {} {}",
+        shell_quote(prefix),
+        shell_quote(tarball)
+    )
+}
+
+fn bundled_claude_acp_npm_command(prefix: &std::path::Path, tarball: &std::path::Path) -> String {
     format!(
         "npm install --global --ignore-scripts --prefix {} {}",
         shell_quote(prefix),

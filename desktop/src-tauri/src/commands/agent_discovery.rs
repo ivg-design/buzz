@@ -28,7 +28,18 @@ pub(crate) fn plan_adapter_install<'c>(
     _adapter_probe_path: Option<&str>,
 ) -> Option<Vec<&'c str>> {
     match adapter_path {
-        // Non-Codex adapters retain their existing any-resolved-binary policy.
+        Some(path)
+            if runtime_id == "claude"
+                && crate::managed_agents::bundled_claude_acp_is_verified(path) =>
+        {
+            None
+        }
+        // Claude must use the reviewed JobPolicyV1 build. Any ambient or
+        // altered adapter is replaced from the bundled tarball.
+        Some(_) if runtime_id == "claude" => {
+            Some(vec!["npm install -g @agentclientprotocol/claude-agent-acp"])
+        }
+        // Other non-Codex adapters retain their existing any-resolved-binary policy.
         Some(_) if runtime_id != "codex" => None,
         // Codex is stricter: only the reviewed payload beneath Buzz's private
         // npm prefix satisfies the contract. A same-version public/global
@@ -330,6 +341,13 @@ fn install_acp_runtime_blocking(
                     .starts_with("npm install -g @agentclientprotocol/codex-acp")
             {
                 managed_codex_acp_install_command()
+            } else if use_managed_npm
+                && runtime_id == "claude"
+                && cmd
+                    .trim_start()
+                    .starts_with("npm install -g @agentclientprotocol/claude-agent-acp")
+            {
+                managed_claude_acp_install_command()
             } else if use_managed_npm {
                 managed_npm_command(cmd)
             } else {
@@ -995,8 +1013,9 @@ use install_report::InstallReporter;
 // ── managed Node/npm runtime ──────────────────────────────────────────────────
 mod managed_node;
 use managed_node::{
-    ensure_managed_node_runtime_blocking, managed_codex_acp_install_command,
-    managed_node_runtime_supported, managed_npm_command, npm_eacces_hint, resolve_adapter_path,
+    ensure_managed_node_runtime_blocking, managed_claude_acp_install_command,
+    managed_codex_acp_install_command, managed_node_runtime_supported, managed_npm_command,
+    npm_eacces_hint, resolve_adapter_path,
 };
 
 #[tauri::command]

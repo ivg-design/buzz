@@ -4,9 +4,10 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::managed_agents::{
-    bundled_codex_acp_is_verified, buzz_managed_command_path, buzz_managed_node_bin_dir,
-    buzz_managed_npm_bin_dir, AcpAvailabilityStatus, AcpRuntimeCatalogEntry, AuthStatus,
-    CommandAvailabilityInfo, HarnessSource,
+    bundled_claude_acp_is_verified, bundled_codex_acp_is_verified, buzz_managed_command_path,
+    buzz_managed_node_bin_dir, buzz_managed_npm_bin_dir, resolve_bundled_claude_acp_command,
+    AcpAvailabilityStatus, AcpRuntimeCatalogEntry, AuthStatus, CommandAvailabilityInfo,
+    HarnessSource,
 };
 mod auth_status_cache;
 pub(crate) mod bounded_command;
@@ -626,6 +627,23 @@ fn is_codex_acp_command(command: &str) -> bool {
         .is_some_and(|name| matches!(name, "codex-acp" | "codex-acp.exe" | "codex-acp.cmd"))
 }
 
+fn is_claude_acp_command(command: &str) -> bool {
+    Path::new(command)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            matches!(
+                name,
+                "claude-agent-acp"
+                    | "claude-agent-acp.exe"
+                    | "claude-agent-acp.cmd"
+                    | "claude-code-acp"
+                    | "claude-code-acp.exe"
+                    | "claude-code-acp.cmd"
+            )
+        })
+}
+
 /// Resolve Codex only from Buzz's app-private adapter directory and require
 /// the installed compiled payload to match the reviewed bundle. This is the
 /// common seam used by discovery, runtime launch, readiness, and auth.
@@ -639,9 +657,22 @@ fn resolve_verified_codex_acp_command(command: &str) -> Option<PathBuf> {
     bundled_codex_acp_is_verified(&candidate).then_some(candidate)
 }
 
+fn resolve_verified_claude_acp_command(command: &str) -> Option<PathBuf> {
+    let candidate = if command_looks_like_path(command) {
+        let path = PathBuf::from(command);
+        is_executable_file(&path).then_some(path)
+    } else {
+        resolve_bundled_claude_acp_command()
+    }?;
+    bundled_claude_acp_is_verified(&candidate).then_some(candidate)
+}
+
 fn resolve_command_uncached(command: &str) -> Option<PathBuf> {
     if is_codex_acp_command(command) {
         return resolve_verified_codex_acp_command(command);
+    }
+    if is_claude_acp_command(command) {
+        return resolve_verified_claude_acp_command(command);
     }
     if let Some(path) = resolve_workspace_command(command) {
         return Some(path);

@@ -1,0 +1,647 @@
+From 78baedaf9b9d57e30ec81afa91826a4cdb535756 Mon Sep 17 00:00:00 2001
+From: IVG-Design <ilyav@gusinski.us>
+Date: Fri, 4 Sep 2026 11:56:28 -0400
+Subject: [PATCH] feat: add immutable Buzz job policy
+
+Signed-off-by: IVG-Design <ilyav@gusinski.us>
+---
+ package-lock.json => npm-shrinkwrap.json |   0
+ package.json                             |   1 +
+ src/acp-agent.ts                         | 277 ++++++++++++++++++++---
+ src/tests/job-policy.test.ts             | 241 ++++++++++++++++++++
+ 4 files changed, 485 insertions(+), 34 deletions(-)
+ rename package-lock.json => npm-shrinkwrap.json (100%)
+ create mode 100644 src/tests/job-policy.test.ts
+
+diff --git a/package-lock.json b/npm-shrinkwrap.json
+similarity index 100%
+rename from package-lock.json
+rename to npm-shrinkwrap.json
+diff --git a/package.json b/package.json
+index 0993733..86b057f 100644
+--- a/package.json
++++ b/package.json
+@@ -21,6 +21,7 @@
+   "files": [
+     "dist/",
+     "!dist/tests/",
++    "npm-shrinkwrap.json",
+     "README.md",
+     "LICENSE",
+     "package.json"
+diff --git a/src/acp-agent.ts b/src/acp-agent.ts
+index e62840c..ff8e9d1 100644
+--- a/src/acp-agent.ts
++++ b/src/acp-agent.ts
+@@ -124,6 +124,7 @@ import { randomUUID } from "node:crypto";
+ import type { Stats } from "node:fs";
+ import { existsSync } from "node:fs";
+ import * as fs from "node:fs/promises";
++import { isIP } from "node:net";
+ import * as os from "node:os";
+ import * as path from "node:path";
+ import { promisify } from "node:util";
+@@ -1057,8 +1058,163 @@ export type NewSessionMeta = {
+     emitRawSDKMessages?: boolean | SDKMessageFilter[];
+   };
+   additionalRoots?: string[];
++  buzz?: {
++    jobPolicy?: unknown;
++  };
++};
++
++const BUZZ_JOB_POLICY_CAPABILITY = {
++  version: 1,
++  methods: ["session/new"],
++  nativeTools: "disabled",
++  mcp: "explicitOnly",
++  permissionRequests: "deny",
++} as const;
++
++const BUZZ_JOB_POLICY_KEYS = [
++  "ambientMcp",
++  "digest",
++  "nativeTools",
++  "permissionRequests",
++  "version",
++] as const;
++
++const BUZZ_JOB_NATIVE_TOOLS = [
++  "Bash",
++  "Read",
++  "Edit",
++  "Write",
++  "Glob",
++  "Grep",
++  "WebFetch",
++  "WebSearch",
++  "Task",
++  "Agent",
++  "Skill",
++  "NotebookEdit",
++  "TodoWrite",
++  "AskUserQuestion",
++  "EnterPlanMode",
++  "ExitPlanMode",
++  "KillShell",
++  "TaskOutput",
++] as const;
++
++type BuzzJobPolicyV1 = {
++  version: 1;
++  digest: string;
++  nativeTools: "disabled";
++  ambientMcp: "disabled";
++  permissionRequests: "deny";
+ };
+
++function isRecord(value: unknown): value is Record<string, unknown> {
++  return typeof value === "object" && value !== null && !Array.isArray(value);
++}
++
++function hasExactKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
++  const actual = Object.keys(value).sort();
++  return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
++}
++
++function isLoopbackHostname(hostname: string): boolean {
++  const unbracketed =
++    hostname.startsWith("[") && hostname.endsWith("]") ? hostname.slice(1, -1) : hostname;
++  if (isIP(unbracketed) === 4) return unbracketed.split(".")[0] === "127";
++  return isIP(unbracketed) === 6 && unbracketed === "::1";
++}
++
++function validateTrustedJobMcp(mcpServers: NewSessionRequest["mcpServers"]): void {
++  const [server] = mcpServers;
++  const candidate = server as unknown as Record<string, unknown> | undefined;
++  if (
++    mcpServers.length !== 1 ||
++    !isRecord(candidate) ||
++    !hasExactKeys(candidate, ["headers", "name", "type", "url"]) ||
++    candidate.type !== "http" ||
++    candidate.name !== "buzz-trusted-session" ||
++    typeof candidate.url !== "string" ||
++    !Array.isArray(candidate.headers) ||
++    candidate.headers.length !== 1
++  ) {
++    throw RequestError.invalidParams(
++      { mcpServers: "redacted" },
++      "JobPolicyV1 requires exactly one buzz-trusted-session loopback HTTP MCP",
++    );
++  }
++
++  let url: URL;
++  try {
++    url = new URL(candidate.url as string);
++  } catch {
++    throw RequestError.invalidParams({ mcpServers: "redacted" }, "JobPolicyV1 MCP URL is invalid");
++  }
++  if (
++    url.protocol !== "http:" ||
++    !isLoopbackHostname(url.hostname) ||
++    url.port === "" ||
++    url.pathname !== "/mcp" ||
++    url.username !== "" ||
++    url.password !== "" ||
++    url.search !== "" ||
++    url.hash !== ""
++  ) {
++    throw RequestError.invalidParams(
++      { mcpServers: "redacted" },
++      "JobPolicyV1 MCP must use an explicit loopback HTTP port and exact /mcp path",
++    );
++  }
++
++  const [header] = candidate.headers as unknown[];
++  if (
++    !isRecord(header) ||
++    !hasExactKeys(header, ["name", "value"]) ||
++    header.name !== "Authorization" ||
++    typeof header.value !== "string" ||
++    !/^Bearer [0-9a-f]{64}$/.test(header.value)
++  ) {
++    throw RequestError.invalidParams(
++      { mcpServers: "redacted" },
++      "JobPolicyV1 MCP requires one exact lowercase-SHA256 bearer header",
++    );
++  }
++}
++
++function parseBuzzJobPolicy(params: NewSessionRequest): BuzzJobPolicyV1 | undefined {
++  const meta = params._meta;
++  if (!isRecord(meta) || !isRecord(meta.buzz) || !("jobPolicy" in meta.buzz)) return undefined;
++  const policy = meta.buzz.jobPolicy;
++  if (
++    !isRecord(policy) ||
++    !hasExactKeys(policy, BUZZ_JOB_POLICY_KEYS) ||
++    policy.version !== 1 ||
++    typeof policy.digest !== "string" ||
++    !/^[0-9a-f]{64}$/.test(policy.digest) ||
++    policy.nativeTools !== "disabled" ||
++    policy.ambientMcp !== "disabled" ||
++    policy.permissionRequests !== "deny"
++  ) {
++    throw RequestError.invalidParams(
++      { jobPolicy: "redacted" },
++      "Invalid immutable Buzz JobPolicyV1 declaration",
++    );
++  }
++  validateTrustedJobMcp(params.mcpServers);
++  return policy as BuzzJobPolicyV1;
++}
++
++function canUseBuzzJobTool(): CanUseTool {
++  return async (toolName, toolInput) => {
++    if (toolName.startsWith("mcp__buzz-trusted-session__")) {
++      return { behavior: "allow", updatedInput: toolInput };
++    }
++    return {
++      behavior: "deny",
++      message: "JobPolicyV1 permits only the scoped buzz-trusted-session MCP",
++    };
++  };
++}
++
+ /**
+  * Extra metadata for 'gateway' authentication requests.
+  */
+@@ -1960,21 +2116,27 @@ export class ClaudeAcpAgent {
+           controlMethod: GOAL_CONTROL_METHOD,
+           actions: [...GOAL_ACTIONS],
+         } satisfies GoalCapability,
++        buzz: {
++          jobPolicy: BUZZ_JOB_POLICY_CAPABILITY,
++        },
+       },
+     };
+   }
+
+   async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
+     if (this.providerUpdate) await this.providerUpdate;
++    const jobPolicy = parseBuzzJobPolicy(params);
+     const response = await this.createSession(params, {
+       // Revisit these meta values once we support resume
+       resume: (params._meta as NewSessionMeta | undefined)?.claudeCode?.options?.resume,
+     });
+-    // Needs to happen after we return the session
+-    setTimeout(() => {
+-      this.sendAvailableCommandsUpdate(response.sessionId);
+-      startMcpAuthentication(this, response.sessionId, params.mcpServers);
+-    }, 0);
++    if (!jobPolicy) {
++      // Needs to happen after we return the session
++      setTimeout(() => {
++        this.sendAvailableCommandsUpdate(response.sessionId);
++        startMcpAuthentication(this, response.sessionId, params.mcpServers);
++      }, 0);
++    }
+     return response;
+   }
+
+@@ -6919,6 +7081,8 @@ export class ClaudeAcpAgent {
+       permissionMode?: PermissionMode;
+     } = {},
+   ): Promise<NewSessionResponse> {
++    const jobPolicy = parseBuzzJobPolicy(params);
++
+     // Validate `cwd` up front. The ACP spec requires an absolute path, and the
+     // directory must actually exist on the machine running the agent. Without
+     // this check a session is created against a missing directory and the
+@@ -6996,15 +7160,18 @@ export class ClaudeAcpAgent {
+       settingsManager.getSettings().permissions?.defaultMode,
+       this.logger,
+     );
+-    const initialPermissionMode = creationOpts.permissionMode ?? permissionMode;
++    const initialPermissionMode = jobPolicy
++      ? "dontAsk"
++      : (creationOpts.permissionMode ?? permissionMode);
+
+     // Extract options from _meta if provided
+     const sessionMeta = params._meta as NewSessionMeta | undefined;
+-    const userProvidedOptions = sessionMeta?.claudeCode?.options;
++    const userProvidedOptions = jobPolicy ? undefined : sessionMeta?.claudeCode?.options;
+     const forwardSubagentText =
+-      clientSupportsSubagents(this.clientCapabilities) ||
+-      supportsSubagentTranscript(this.clientCapabilities) ||
+-      userProvidedOptions?.forwardSubagentText === true;
++      !jobPolicy &&
++      (clientSupportsSubagents(this.clientCapabilities) ||
++        supportsSubagentTranscript(this.clientCapabilities) ||
++        userProvidedOptions?.forwardSubagentText === true);
+
+     // Configure thinking behavior from environment variable
+     const thinking = resolveThinkingConfig(process.env.MAX_THINKING_TOKENS, this.logger);
+@@ -7044,28 +7211,28 @@ export class ClaudeAcpAgent {
+     // set for lexical path validation, and the SDK receives it below.
+     const acpAdditionalDirectories =
+       params.additionalDirectories ?? sessionMeta?.additionalRoots ?? [];
+-    const additionalDirectories = [
+-      ...(userProvidedOptions?.additionalDirectories ?? []),
+-      ...acpAdditionalDirectories,
+-    ];
+-
+-    const fileChangeAuditSupport = supportsAgentFileChangeReport(this.clientCapabilities)
+-      ? createFileChangeAuditSupport({
+-          cwd: params.cwd,
+-          additionalDirectories,
+-          getActiveState: () => this.sessions[sessionId]?.activeTurn?.fileChangeAudit,
+-          publish: async (result) => {
+-            await this.client.sessionUpdate({
+-              sessionId,
+-              update: {
+-                sessionUpdate: "session_info_update",
+-                _meta: agentFileChangeReportMeta(result),
+-              },
+-            });
+-          },
+-          logError: (message) => this.logger.error(message),
+-        })
+-      : undefined;
++    const additionalDirectories = jobPolicy
++      ? []
++      : [...(userProvidedOptions?.additionalDirectories ?? []), ...acpAdditionalDirectories];
++
++    const fileChangeAuditSupport =
++      !jobPolicy && supportsAgentFileChangeReport(this.clientCapabilities)
++        ? createFileChangeAuditSupport({
++            cwd: params.cwd,
++            additionalDirectories,
++            getActiveState: () => this.sessions[sessionId]?.activeTurn?.fileChangeAudit,
++            publish: async (result) => {
++              await this.client.sessionUpdate({
++                sessionId,
++                update: {
++                  sessionUpdate: "session_info_update",
++                  _meta: agentFileChangeReportMeta(result),
++                },
++              });
++            },
++            logError: (message) => this.logger.error(message),
++          })
++        : undefined;
+
+     // The exact env the query will be created with. Built (and the provider
+     // cache key derived from it, below) in one place so the key always
+@@ -7266,6 +7433,33 @@ export class ClaudeAcpAgent {
+       abortController,
+     };
+
++    if (jobPolicy) {
++      // This branch is deliberately constructed as a hard override after all
++      // ordinary-session merging. A signed job cannot inherit client options,
++      // local settings, native tools, hooks, plugins, skills, subagents, or
++      // ambient MCP servers.
++      options.settingSources = [];
++      options.strictMcpConfig = true;
++      options.mcpServers = mcpServers;
++      options.allowDangerouslySkipPermissions = false;
++      options.permissionMode = "dontAsk";
++      options.canUseTool = canUseBuzzJobTool();
++      options.disallowedTools = [...BUZZ_JOB_NATIVE_TOOLS];
++      options.tools = [];
++      options.hooks = {};
++      options.agents = {};
++      options.plugins = [];
++      options.skills = [];
++      options.additionalDirectories = [];
++      options.forwardSubagentText = false;
++      options.extraArgs = { "replay-user-messages": "" };
++      delete options.settings;
++      delete options.agent;
++      delete options.onElicitation;
++      delete options.onUserDialog;
++      delete options.supportedDialogKinds;
++    }
++
+     // Prefer the official ACP `additionalDirectories` field. Fall back to the
+     // legacy `_meta.additionalRoots` extension for clients that haven't been
+     // updated yet. Either source is merged with directories supplied via
+@@ -7379,7 +7573,7 @@ export class ClaudeAcpAgent {
+       currentModelId: models.currentModelId,
+     });
+
+-    const agents = await discoverCustomAgents(q);
++    const agents = jobPolicy ? [] : await discoverCustomAgents(q);
+     // Only adopt the requested agent as the selected value if it's one we
+     // actually surface in the picker. A built-in (filtered out above) or
+     // otherwise-unknown name would leave the config option's `currentValue`
+@@ -7489,7 +7683,9 @@ export class ClaudeAcpAgent {
+       fastModeEnabled,
+       fastModeDisabledReason,
+       abortController,
+-      emitRawSDKMessages: sessionMeta?.claudeCode?.emitRawSDKMessages ?? false,
++      emitRawSDKMessages: jobPolicy
++        ? false
++        : (sessionMeta?.claudeCode?.emitRawSDKMessages ?? false),
+       forwardSubagentText,
+       contextWindowSize: seededWindow.size,
+       contextWindowAuthoritative: seededWindow.authoritative,
+@@ -7514,6 +7710,19 @@ export class ClaudeAcpAgent {
+       sessionId,
+       modes,
+       configOptions,
++      ...(jobPolicy
++        ? {
++            _meta: {
++              buzz: {
++                jobPolicy: {
++                  version: 1,
++                  applied: true,
++                  digest: jobPolicy.digest,
++                },
++              },
++            },
++          }
++        : {}),
+     };
+   }
+
+diff --git a/src/tests/job-policy.test.ts b/src/tests/job-policy.test.ts
+new file mode 100644
+index 0000000..9a7f7da
+--- /dev/null
++++ b/src/tests/job-policy.test.ts
+@@ -0,0 +1,241 @@
++import { beforeEach, describe, expect, it, vi } from "vitest";
++import type {
++  ClientCapabilities,
++  NewSessionRequest,
++  SessionNotification,
++} from "@agentclientprotocol/sdk";
++import type { CanUseTool, Options } from "@anthropic-ai/claude-agent-sdk";
++import type { AcpClient, ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
++
++let capturedOptions: Options | undefined;
++let queryCalls = 0;
++
++vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
++  const actual = await vi.importActual<typeof import("@anthropic-ai/claude-agent-sdk")>(
++    "@anthropic-ai/claude-agent-sdk",
++  );
++  const { makeMockQuery } = await import("./helpers.js");
++  return {
++    ...actual,
++    query: (args: { prompt: unknown; options: Options }) => {
++      queryCalls += 1;
++      capturedOptions = args.options;
++      return makeMockQuery({
++        initializationResult: async () => ({
++          models: [
++            {
++              value: "claude-sonnet-4-6",
++              displayName: "Claude Sonnet",
++              description: "Fast",
++              supportsAutoMode: true,
++            },
++          ],
++        }),
++      });
++    },
++  };
++});
++
++const DIGEST = "a".repeat(64);
++const TOKEN = "b".repeat(64);
++
++function validJobRequest(): NewSessionRequest {
++  return {
++    cwd: process.cwd(),
++    mcpServers: [
++      {
++        type: "http",
++        name: "buzz-trusted-session",
++        url: "http://127.0.0.1:32123/mcp",
++        headers: [{ name: "Authorization", value: `Bearer ${TOKEN}` }],
++      },
++    ],
++    _meta: {
++      buzz: {
++        jobPolicy: {
++          version: 1,
++          digest: DIGEST,
++          nativeTools: "disabled",
++          ambientMcp: "disabled",
++          permissionRequests: "deny",
++        },
++      },
++    },
++  };
++}
++
++describe("Buzz JobPolicyV1", () => {
++  let agent: ClaudeAcpAgentType;
++  let requestPermission: ReturnType<typeof vi.fn>;
++
++  beforeEach(async () => {
++    capturedOptions = undefined;
++    queryCalls = 0;
++    requestPermission = vi.fn(async () => ({ outcome: { outcome: "cancelled" } }));
++    vi.resetModules();
++    const { ClaudeAcpAgent } = await import("../acp-agent.js");
++    const client = {
++      sessionUpdate: async (_notification: SessionNotification) => {},
++      requestPermission,
++      readTextFile: async () => ({ content: "" }),
++      writeTextFile: async () => ({}),
++    } as unknown as AcpClient;
++    agent = new ClaudeAcpAgent(client);
++  });
++
++  it("advertises the exact immutable job capability", async () => {
++    const response = await agent.initialize({
++      protocolVersion: 1,
++      clientCapabilities: {} as ClientCapabilities,
++    });
++
++    expect(response._meta?.buzz).toEqual({
++      jobPolicy: {
++        version: 1,
++        methods: ["session/new"],
++        nativeTools: "disabled",
++        mcp: "explicitOnly",
++        permissionRequests: "deny",
++      },
++    });
++  });
++
++  it("rejects malformed policies and non-exact trusted MCP declarations before query creation", async () => {
++    const cases: NewSessionRequest[] = [];
++
++    const uppercaseDigest = validJobRequest();
++    (uppercaseDigest._meta!.buzz as { jobPolicy: { digest: string } }).jobPolicy.digest =
++      "A".repeat(64);
++    cases.push(uppercaseDigest);
++
++    const extraPolicyField = validJobRequest();
++    (extraPolicyField._meta!.buzz as { jobPolicy: Record<string, unknown> }).jobPolicy.extra = true;
++    cases.push(extraPolicyField);
++
++    const queryUrl = validJobRequest();
++    (queryUrl.mcpServers[0] as { url: string }).url += "?escape=1";
++    cases.push(queryUrl);
++
++    const remoteUrl = validJobRequest();
++    (remoteUrl.mcpServers[0] as { url: string }).url = "http://example.test:32123/mcp";
++    cases.push(remoteUrl);
++
++    const extraHeader = validJobRequest();
++    (extraHeader.mcpServers[0] as { headers: Array<{ name: string; value: string }> }).headers.push(
++      {
++        name: "X-Extra",
++        value: "not-allowed",
++      },
++    );
++    cases.push(extraHeader);
++
++    const extraServer = validJobRequest();
++    extraServer.mcpServers.push({
++      name: "ambient",
++      command: "/bin/false",
++      args: [],
++      env: [],
++    });
++    cases.push(extraServer);
++
++    for (const request of cases) {
++      await expect(agent.newSession(request)).rejects.toThrow(/JobPolicyV1/);
++    }
++    expect(queryCalls).toBe(0);
++  });
++
++  it("hard-overrides every ambient execution surface and returns the exact acknowledgement", async () => {
++    const request = validJobRequest();
++    request.additionalDirectories = ["/Users/Shared"];
++    request._meta = {
++      ...request._meta,
++      additionalRoots: ["/Volumes"],
++      claudeCode: {
++        emitRawSDKMessages: true,
++        options: {
++          tools: ["Bash", "Read"],
++          settingSources: ["user", "project", "local"],
++          strictMcpConfig: false,
++          permissionMode: "bypassPermissions",
++          allowDangerouslySkipPermissions: true,
++          additionalDirectories: ["/tmp/escape"],
++          agents: { escape: { description: "escape", prompt: "escape" } },
++          agent: "escape",
++          plugins: [{ type: "local", path: "/tmp/plugin" }],
++          skills: "all",
++          hooks: { PreToolUse: [] },
++          mcpServers: {
++            ambient: { type: "stdio", command: "/bin/false", args: [] },
++          },
++          settings: { permissions: { allow: ["Bash"] } },
++          extraArgs: { "plugin-dir": "/tmp/plugin" },
++        },
++      },
++    };
++
++    const response = await agent.newSession(request);
++
++    expect(response._meta).toEqual({
++      buzz: { jobPolicy: { version: 1, applied: true, digest: DIGEST } },
++    });
++    expect(capturedOptions).toMatchObject({
++      tools: [],
++      settingSources: [],
++      strictMcpConfig: true,
++      permissionMode: "dontAsk",
++      allowDangerouslySkipPermissions: false,
++      additionalDirectories: [],
++      forwardSubagentText: false,
++      agents: {},
++      plugins: [],
++      skills: [],
++      hooks: {},
++      extraArgs: { "replay-user-messages": "" },
++    });
++    expect(capturedOptions?.settings).toBeUndefined();
++    expect(capturedOptions?.agent).toBeUndefined();
++    expect(capturedOptions?.mcpServers).toEqual({
++      "buzz-trusted-session": {
++        type: "http",
++        url: "http://127.0.0.1:32123/mcp",
++        headers: { Authorization: `Bearer ${TOKEN}` },
++      },
++    });
++    expect(capturedOptions?.disallowedTools).toEqual(
++      expect.arrayContaining([
++        "Bash",
++        "Read",
++        "Edit",
++        "Write",
++        "Glob",
++        "Grep",
++        "WebFetch",
++        "WebSearch",
++        "Task",
++        "Agent",
++        "Skill",
++        "AskUserQuestion",
++      ]),
++    );
++  });
++
++  it("allows only the scoped trusted MCP without consulting ACP permissions", async () => {
++    await agent.newSession(validJobRequest());
++    const canUseTool = capturedOptions?.canUseTool as CanUseTool;
++    const callbackOptions = {
++      signal: new AbortController().signal,
++      toolUseID: "tool-1",
++    } as Parameters<CanUseTool>[2];
++
++    await expect(
++      canUseTool("mcp__buzz-trusted-session__git_status", { path: "." }, callbackOptions),
++    ).resolves.toEqual({ behavior: "allow", updatedInput: { path: "." } });
++    await expect(canUseTool("Bash", { command: "id" }, callbackOptions)).resolves.toMatchObject({
++      behavior: "deny",
++    });
++    await expect(canUseTool("mcp__ambient__escape", {}, callbackOptions)).resolves.toMatchObject({
++      behavior: "deny",
++    });
++    expect(requestPermission).not.toHaveBeenCalled();
++  });
++});
+--
+2.50.1 (Apple Git-155)

@@ -397,6 +397,8 @@ pub(crate) fn configure_runtime_cli(
     if runtime.id != "claude" {
         return Ok(());
     }
+    command.env_remove("NODE_OPTIONS");
+    command.env_remove("NODE_PATH");
     if let Some(cli_path) = runtime.underlying_cli.and_then(resolve_command) {
         // On Windows, `.cmd` and `.bat` files are batch shims — they cannot be
         // passed directly to `CreateProcess` and cause EINVAL when the Claude
@@ -545,6 +547,7 @@ pub fn spawn_agent_child(
     let effective_mcp_command = known_acp_runtime(effective_command)
         .and_then(|r| r.mcp_command)
         .unwrap_or("");
+    let runtime_meta = known_acp_runtime(effective_command);
     let resolved_mcp_command: Option<std::path::PathBuf> = if effective_mcp_command.is_empty() {
         None
     } else {
@@ -559,9 +562,29 @@ pub fn spawn_agent_child(
         }
     };
     // Resolve agent command to a full path (DMG launches have minimal PATH).
-    let resolved_agent_command = resolve_command(effective_command)
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| effective_command.clone());
+    // Claude is launched through Buzz's verified Node runtime and the exact
+    // reviewed adapter entrypoint. The harness independently verifies the full
+    // compiled dist tree before granting JobPolicyV1 authority.
+    let resolved_adapter = resolve_command(effective_command);
+    let (resolved_agent_command, launch_agent_args) =
+        if runtime_meta.is_some_and(|runtime| runtime.id == "claude") {
+            let adapter = resolved_adapter.as_deref().ok_or_else(|| {
+                "checksum-pinned bundled Claude ACP adapter is unavailable".to_string()
+            })?;
+            let (node, entrypoint) =
+                super::bundled_claude_adapter::verified_claude_acp_launch(adapter)?;
+            let mut launch_args = Vec::with_capacity(agent_args.len() + 1);
+            launch_args.push(entrypoint.display().to_string());
+            launch_args.extend(agent_args.iter().cloned());
+            (node.display().to_string(), launch_args)
+        } else {
+            (
+                resolved_adapter
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| effective_command.clone()),
+                agent_args.clone(),
+            )
+        };
 
     // The caller supplies the explicit canonical pair relay. This is the only
     // relay this child may connect to, regardless of the record/workspace default.
@@ -604,7 +627,7 @@ pub fn spawn_agent_child(
     // loop by `apply_replay_floor_env` so saved user env cannot shadow it.
     command.env_remove(REPLAY_FLOOR_ENV_VAR);
     command.env("BUZZ_ACP_AGENT_COMMAND", &resolved_agent_command);
-    command.env("BUZZ_ACP_AGENT_ARGS", agent_args.join(","));
+    command.env("BUZZ_ACP_AGENT_ARGS", launch_agent_args.join(","));
     match &resolved_mcp_command {
         Some(mcp_cmd) => {
             command.env("BUZZ_ACP_MCP_COMMAND", mcp_cmd);
@@ -615,7 +638,6 @@ pub fn spawn_agent_child(
     }
     // Enable MCP hook tools (_Stop, _PostCompact) for agents that need them.
     // Uses "*" because build_mcp_servers() hard-codes the server name to "buzz-mcp".
-    let runtime_meta = known_acp_runtime(effective_command);
     if runtime_meta.is_some_and(|r| r.mcp_hooks) {
         command.env("MCP_HOOK_SERVERS", "*");
     }

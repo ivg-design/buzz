@@ -840,6 +840,8 @@ impl AcpClient {
     ) -> Result<Self, AcpError> {
         use std::process::Stdio;
 
+        let checksum_qualified_claude =
+            crate::qualified_adapter::is_checksum_qualified_claude_adapter(command, args);
         let mut cmd = tokio::process::Command::new(command);
         cmd.args(args)
             .stdin(Stdio::piped())
@@ -856,6 +858,13 @@ impl AcpClient {
             if is_harness_only_env(&name) {
                 cmd.env_remove(name);
             }
+        }
+        if checksum_qualified_claude {
+            // These variables can inject code or alter module resolution before
+            // the reviewed adapter starts. A qualified Job executor must use
+            // only the dependency closure whose bytes were hashed above.
+            cmd.env_remove("NODE_OPTIONS");
+            cmd.env_remove("NODE_PATH");
         }
 
         // Per-persona env vars (e.g., GOOSE_PROVIDER, BUZZ_AGENT_PROVIDER).
@@ -919,14 +928,17 @@ impl AcpClient {
         // console-subsystem child process spawned from a GUI/non-console parent.
         configure_no_window(&mut cmd);
 
-        let standard_adapter =
+        let standard_adapter = if checksum_qualified_claude {
+            Some(StandardAdapterKind::Claude)
+        } else {
             match crate::config::normalize_agent_command_identity(command).as_str() {
                 "claude-agent-acp" | "claude-code-acp" | "claude-code" | "claudecode" => {
                     Some(StandardAdapterKind::Claude)
                 }
                 "codex" | "codex-acp" => Some(StandardAdapterKind::Codex),
                 _ => None,
-            };
+            }
+        };
         let mut child = cmd.spawn()?;
 
         let stdin = child
@@ -955,7 +967,7 @@ impl AcpClient {
             http_mcp_supported: false,
             developer_instructions_append_supported: false,
             job_policy_supported: false,
-            job_policy_adapter_qualified: false,
+            job_policy_adapter_qualified: checksum_qualified_claude,
             session_permission_policies: HashMap::new(),
             active_prompt_session_id: None,
             steer_rx: None,

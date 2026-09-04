@@ -14,6 +14,7 @@ mod pool_lifecycle;
 mod project_preload;
 mod prompt_framing;
 mod prompt_project;
+mod qualified_adapter;
 mod queue;
 mod relay;
 mod reply_placement;

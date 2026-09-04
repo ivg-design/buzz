@@ -24,6 +24,8 @@ fn claude_spawn_uses_the_probed_cli_executable() {
     crate::managed_agents::clear_resolve_cache();
 
     let mut command = std::process::Command::new("buzz-acp");
+    command.env("NODE_OPTIONS", "--import=/tmp/inject.mjs");
+    command.env("NODE_PATH", "/tmp/ambient-modules");
     configure_runtime_cli(&mut command, known_acp_runtime("claude-agent-acp")).unwrap();
 
     if let Some(path) = original_path {
@@ -35,4 +37,10 @@ fn claude_spawn_uses_the_probed_cli_executable() {
     assert!(command
         .get_envs()
         .any(|(key, value)| { key == "CLAUDE_CODE_EXECUTABLE" && value == Some(cli.as_os_str()) }));
+    assert!(command
+        .get_envs()
+        .any(|(key, value)| key == "NODE_OPTIONS" && value.is_none()));
+    assert!(command
+        .get_envs()
+        .any(|(key, value)| key == "NODE_PATH" && value.is_none()));
 }

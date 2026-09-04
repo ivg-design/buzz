@@ -11,6 +11,7 @@ pub(crate) use agent_env::{
 mod agent_description;
 pub(crate) use agent_description::{effective_agent_description, record_effective_description};
 mod backend;
+mod bundled_claude_adapter;
 mod bundled_codex_manifest;
 pub(crate) mod bundled_codex_cli;
 pub(crate) mod bestie_assignment;
@@ -76,6 +77,7 @@ pub(crate) fn lock_env_mutex() -> std::sync::MutexGuard<'static, ()> {
 }
 
 pub use backend::*;
+pub(crate) use bundled_claude_adapter::*;
 pub(crate) use definition_validation::{
     validate_agent_definition_text, validate_agent_description_text,
     validate_managed_agent_definition_text, validate_visible_text,

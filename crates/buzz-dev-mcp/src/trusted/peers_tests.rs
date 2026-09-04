@@ -37,7 +37,7 @@ fn policy(owner: &nostr::Keys, agent: &nostr::Keys, name: &str, created_at: u64)
 }
 
 #[test]
-fn cross_owner_roster_requires_all_verified_authority_layers() {
+fn cross_owner_discovery_does_not_require_home_roster_rows() {
     let relay = nostr::Keys::generate();
     let self_agent = nostr::Keys::generate();
     let owner_a = nostr::Keys::generate();
@@ -46,22 +46,6 @@ fn cross_owner_roster_requires_all_verified_authority_layers() {
     let agent_a = nostr::Keys::generate();
     let agent_b = nostr::Keys::generate();
     let revoked_agent = nostr::Keys::generate();
-    let cosmetic_member = nostr::Keys::generate();
-
-    let roster = signed_event(
-        &relay,
-        buzz_core::kind::KIND_NIP29_GROUP_MEMBERS,
-        "",
-        vec![
-            Tag::parse(["d", buzz_core::nemo::HOME_CHANNEL]).unwrap(),
-            Tag::parse(["p", &self_agent.public_key().to_hex(), "", "bot"]).unwrap(),
-            Tag::parse(["p", &agent_a.public_key().to_hex(), "", "bot"]).unwrap(),
-            Tag::parse(["p", &agent_b.public_key().to_hex(), "", "bot"]).unwrap(),
-            Tag::parse(["p", &revoked_agent.public_key().to_hex(), "", "bot"]).unwrap(),
-            Tag::parse(["p", &cosmetic_member.public_key().to_hex(), "", "member"]).unwrap(),
-        ],
-        10,
-    );
     let members = signed_event(
         &relay,
         buzz_core::kind::KIND_NIP43_MEMBERSHIP_LIST,
@@ -72,19 +56,18 @@ fn cross_owner_roster_requires_all_verified_authority_layers() {
         ],
         10,
     );
-    let authority = vec![roster, members];
-    let candidates = roster_candidates(
-        &authority,
-        &relay.public_key().to_hex(),
-        buzz_core::nemo::HOME_CHANNEL,
-        &self_agent.public_key().to_hex(),
-    )
-    .expect("roster candidates");
-    assert_eq!(candidates.len(), 3);
-    assert!(!candidates.contains(&self_agent.public_key().to_hex()));
-    assert!(!candidates.contains(&cosmetic_member.public_key().to_hex()));
-
+    let authority = vec![members];
     let direct = direct_members(&authority, &relay.public_key().to_hex()).expect("members");
+    let policies = vec![
+        policy(&owner_a, &agent_a, "Worker", 12),
+        policy(&owner_b, &agent_b, "Worker", 12),
+        policy(&revoked_owner, &revoked_agent, "Revoked", 12),
+        policy(&owner_a, &self_agent, "Self", 12),
+    ];
+    let candidates = policy_candidates(&policies, &direct, &self_agent.public_key().to_hex());
+    assert_eq!(candidates.len(), 2);
+    assert!(!candidates.contains(&self_agent.public_key().to_hex()));
+    assert!(!candidates.contains(&revoked_agent.public_key().to_hex()));
     let owners = verified_profile_owners(
         &[
             profile(&owner_a, &agent_a, 11),
@@ -96,14 +79,7 @@ fn cross_owner_roster_requires_all_verified_authority_layers() {
     );
     assert_eq!(owners.len(), 2, "revoked owner must not authorize a peer");
 
-    let peers = resolve_policies(
-        &[
-            policy(&owner_a, &agent_a, "Worker", 12),
-            policy(&owner_b, &agent_b, "Worker", 12),
-            policy(&revoked_owner, &revoked_agent, "Revoked", 12),
-        ],
-        &owners,
-    );
+    let peers = resolve_policies(&policies, &owners);
     assert_eq!(peers.len(), 2);
     assert!(peers.iter().all(|peer| peer.name == "Worker"));
     assert_ne!(
@@ -120,26 +96,6 @@ fn forged_or_mismatched_directory_evidence_cannot_create_a_peer() {
     let agent = nostr::Keys::generate();
     let other_agent = nostr::Keys::generate();
 
-    let valid_roster = signed_event(
-        &relay,
-        buzz_core::kind::KIND_NIP29_GROUP_MEMBERS,
-        "",
-        vec![
-            Tag::parse(["d", buzz_core::nemo::HOME_CHANNEL]).unwrap(),
-            Tag::parse(["p", &agent.public_key().to_hex(), "", "bot"]).unwrap(),
-        ],
-        10,
-    );
-    let forged_newer_roster = signed_event(
-        &attacker,
-        buzz_core::kind::KIND_NIP29_GROUP_MEMBERS,
-        "",
-        vec![
-            Tag::parse(["d", buzz_core::nemo::HOME_CHANNEL]).unwrap(),
-            Tag::parse(["p", &other_agent.public_key().to_hex(), "", "bot"]).unwrap(),
-        ],
-        20,
-    );
     let members = signed_event(
         &relay,
         buzz_core::kind::KIND_NIP43_MEMBERSHIP_LIST,
@@ -147,17 +103,13 @@ fn forged_or_mismatched_directory_evidence_cannot_create_a_peer() {
         vec![Tag::parse(["member", &owner.public_key().to_hex(), "member"]).unwrap()],
         10,
     );
-    let authority = vec![valid_roster, forged_newer_roster, members];
-    let candidates = roster_candidates(
-        &authority,
-        &relay.public_key().to_hex(),
-        buzz_core::nemo::HOME_CHANNEL,
-        "",
-    )
-    .unwrap();
+    let authority = vec![members];
+    let direct = direct_members(&authority, &relay.public_key().to_hex()).unwrap();
+    let valid_policy = policy(&owner, &agent, "Valid", 10);
+    let forged_policy = policy(&attacker, &other_agent, "Forged", 20);
+    let candidates = policy_candidates(&[valid_policy.clone(), forged_policy], &direct, "");
     assert_eq!(candidates, vec![agent.public_key().to_hex()]);
 
-    let direct = direct_members(&authority, &relay.public_key().to_hex()).unwrap();
     let owners = verified_profile_owners(&[profile(&owner, &agent, 11)], &candidates, &direct);
     let wrong_owner_policy = policy(&attacker, &agent, "Forged", 30);
     let wrong_agent_policy = policy(&owner, &other_agent, "Other", 30);
@@ -180,13 +132,21 @@ fn forged_or_mismatched_directory_evidence_cannot_create_a_peer() {
 }
 
 #[test]
-fn authority_queries_are_fixed_to_relay_and_nemo_home() {
+fn authority_and_policy_queries_are_fixed_to_current_members() {
     let relay = "a".repeat(64);
-    let filters = authority_filters(&relay, buzz_core::nemo::HOME_CHANNEL);
-    assert_eq!(filters.len(), 2);
+    let filters = authority_filters(&relay);
+    assert_eq!(filters.len(), 1);
     let encoded = serde_json::to_string(&filters).unwrap();
-    assert!(encoded.contains(buzz_core::nemo::HOME_CHANNEL));
     assert!(encoded.contains(&relay));
-    assert!(encoded.contains(&buzz_core::kind::KIND_NIP29_GROUP_MEMBERS.to_string()));
     assert!(encoded.contains(&buzz_core::kind::KIND_NIP43_MEMBERSHIP_LIST.to_string()));
+
+    let members = ["b".repeat(64), "c".repeat(64)]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let policies = policy_filters(&members);
+    let encoded = serde_json::to_string(&policies).unwrap();
+    assert!(encoded.contains(&buzz_core::kind::KIND_MANAGED_AGENT.to_string()));
+    assert!(encoded.contains(&"b".repeat(64)));
+    assert!(encoded.contains(&"c".repeat(64)));
+    assert!(encoded.contains(&(MAX_PEERS + 1).to_string()));
 }

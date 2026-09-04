@@ -9,7 +9,6 @@ use tokio_util::sync::CancellationToken;
 use super::TrustedRelay;
 
 const MAX_PEERS: usize = 128;
-const POLICY_FILTER_BATCH: usize = 10;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct VerifiedPeer {
@@ -17,11 +16,13 @@ pub struct VerifiedPeer {
     pub pubkey: String,
 }
 
-/// Discover managed agents that are currently authorized for the exact Nemo
-/// HOME channel. Every returned identity has four independent pieces of
-/// evidence: relay-authored channel membership, an agent-signed NIP-OA
-/// profile, an active direct-member owner and an owner-signed managed-agent
-/// definition. Model input cannot widen any of these query scopes.
+/// Discover managed agents whose owners are currently authorized for the exact
+/// Nemo community. Every returned identity has three independent pieces of
+/// evidence: an agent-signed NIP-OA profile, an active direct-member owner and
+/// an owner-signed managed-agent definition. The dedicated Nemo runtime binds
+/// every enrolled agent to HOME, so a stale or missing cosmetic channel-roster
+/// row must not hide an otherwise authorized peer. Model input cannot widen any
+/// of these query scopes.
 pub async fn discover(
     relay: &TrustedRelay,
     cancellation: &CancellationToken,
@@ -37,22 +38,22 @@ pub async fn discover(
     let relay_pubkey = relay.relay_signer_pubkey(cancellation).await?;
 
     let authority_events = relay
-        .query_signed_events(authority_filters(&relay_pubkey, &channel), cancellation)
+        .query_signed_events(authority_filters(&relay_pubkey), cancellation)
         .await?;
-    let candidates = roster_candidates(
-        &authority_events,
-        &relay_pubkey,
-        &channel,
-        &relay.signer_pubkey(),
-    )?;
+    let direct_members = direct_members(&authority_events, &relay_pubkey)?;
+    if direct_members.is_empty() {
+        return Ok(Vec::new());
+    }
+    let policy_events = relay
+        .query_signed_events(policy_filters(&direct_members), cancellation)
+        .await?;
+    let candidates = policy_candidates(&policy_events, &direct_members, &relay.signer_pubkey());
     if candidates.is_empty() {
         return Ok(Vec::new());
     }
     if candidates.len() > MAX_PEERS {
         return Err("verified Nemo peer roster exceeds the bounded tool limit".into());
     }
-    let direct_members = direct_members(&authority_events, &relay_pubkey)?;
-
     let profile_events = relay
         .query_signed_events(
             vec![serde_json::json!({
@@ -68,72 +69,46 @@ pub async fn discover(
         return Ok(Vec::new());
     }
 
-    let mut policy_events = Vec::new();
-    let filters = owners
-        .iter()
-        .map(|(agent, owner)| {
-            serde_json::json!({
-                "kinds": [buzz_core::kind::KIND_MANAGED_AGENT],
-                "authors": [owner],
-                "#d": [agent],
-                "limit": 1,
-            })
-        })
-        .collect::<Vec<_>>();
-    for batch in filters.chunks(POLICY_FILTER_BATCH) {
-        policy_events.extend(
-            relay
-                .query_signed_events(batch.to_vec(), cancellation)
-                .await?,
-        );
-    }
-
     Ok(resolve_policies(&policy_events, &owners))
 }
 
-fn authority_filters(relay_pubkey: &str, channel: &str) -> Vec<serde_json::Value> {
-    vec![
-        serde_json::json!({
-            "kinds": [buzz_core::kind::KIND_NIP29_GROUP_MEMBERS],
-            "authors": [relay_pubkey],
-            "#d": [channel],
-            "limit": 1,
-        }),
-        serde_json::json!({
-            "kinds": [buzz_core::kind::KIND_NIP43_MEMBERSHIP_LIST],
-            "authors": [relay_pubkey],
-            "limit": 1,
-        }),
-    ]
+fn authority_filters(relay_pubkey: &str) -> Vec<serde_json::Value> {
+    vec![serde_json::json!({
+        "kinds": [buzz_core::kind::KIND_NIP43_MEMBERSHIP_LIST],
+        "authors": [relay_pubkey],
+        "limit": 1,
+    })]
 }
 
-fn roster_candidates(
-    events: &[Event],
-    relay_pubkey: &str,
-    channel: &str,
-    self_pubkey: &str,
-) -> Result<Vec<String>, String> {
-    let roster = latest_matching(events, |event| {
-        event.kind.as_u16() as u32 == buzz_core::kind::KIND_NIP29_GROUP_MEMBERS
-            && event.pubkey.to_hex() == relay_pubkey
-            && single_tag_value(event, "d") == Some(channel)
-    })
-    .ok_or_else(|| "relay did not return the current Nemo HOME roster".to_owned())?;
-    ensure_valid_event(roster)?;
+fn policy_filters(direct_members: &BTreeSet<String>) -> Vec<serde_json::Value> {
+    vec![serde_json::json!({
+        "kinds": [buzz_core::kind::KIND_MANAGED_AGENT],
+        "authors": direct_members,
+        "limit": MAX_PEERS + 1,
+    })]
+}
 
+fn policy_candidates(
+    events: &[Event],
+    direct_members: &BTreeSet<String>,
+    self_pubkey: &str,
+) -> Vec<String> {
     let mut candidates = BTreeSet::new();
-    for tag in tags_named(roster, "p") {
-        if tag.get(3).map(String::as_str) != Some("bot") {
+    for event in events {
+        if event.kind.as_u16() as u32 != buzz_core::kind::KIND_MANAGED_AGENT
+            || event.verify().is_err()
+            || !direct_members.contains(&event.pubkey.to_hex())
+        {
             continue;
         }
-        let Some(pubkey) = tag.get(1).and_then(|value| canonical_pubkey(value)) else {
+        let Some(pubkey) = single_tag_value(event, "d").and_then(canonical_pubkey) else {
             continue;
         };
         if pubkey != self_pubkey {
             candidates.insert(pubkey);
         }
     }
-    Ok(candidates.into_iter().collect())
+    candidates.into_iter().collect()
 }
 
 fn direct_members(events: &[Event], relay_pubkey: &str) -> Result<BTreeSet<String>, String> {

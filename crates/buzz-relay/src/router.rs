@@ -27,6 +27,12 @@ use crate::nip11::{nip11_document, relay_info_handler};
 use crate::readiness::{self, ReadinessEvaluation, ReadinessReason};
 use crate::state::AppState;
 
+// Tauri uses a custom production origin on macOS and an HTTP origin on the
+// other desktop targets.  These are part of Buzz's first-party API surface:
+// when an operator restricts browser origins, the desktop must still be able
+// to call NIP-98 HTTP endpoints such as GET/POST /api/invites.
+const DESKTOP_CORS_ORIGINS: [&str; 2] = ["tauri://localhost", "http://tauri.localhost"];
+
 /// Build the axum [`Router`] with all relay routes, middleware, and CORS configuration.
 ///
 /// Pure Nostr protocol: WebSocket (NIP-01), HTTP bridge (NIP-98), media (Blossom),
@@ -529,12 +535,12 @@ fn build_cors_layer(cors_origins: &[String]) -> CorsLayer {
         return CorsLayer::permissive();
     }
 
-    let origins: Vec<axum::http::HeaderValue> = cors_origins
+    let configured_origins: Vec<axum::http::HeaderValue> = cors_origins
         .iter()
         .filter_map(|o| o.parse::<axum::http::HeaderValue>().ok())
         .collect();
 
-    if origins.is_empty() {
+    if configured_origins.is_empty() {
         tracing::error!(
             "BUZZ_CORS_ORIGINS set but no valid origins could be parsed — \
              refusing to fall back to permissive CORS. Fix the origins or unset \
@@ -542,6 +548,15 @@ fn build_cors_layer(cors_origins: &[String]) -> CorsLayer {
         );
         return CorsLayer::new();
     }
+
+    let origins = configured_origins
+        .into_iter()
+        .chain(
+            DESKTOP_CORS_ORIGINS
+                .into_iter()
+                .map(HeaderValue::from_static),
+        )
+        .collect::<Vec<_>>();
 
     CorsLayer::new()
         .allow_origin(AllowOrigin::list(origins))
@@ -568,6 +583,71 @@ mod tests {
     use tracing_subscriber::prelude::*;
 
     use super::*;
+
+    async fn cors_response(
+        configured_origins: &[String],
+        origin: &'static str,
+        preflight_method: Option<&'static str>,
+    ) -> axum::response::Response {
+        let router = Router::new()
+            .route(
+                "/api/invites",
+                get(|| async { StatusCode::OK }).post(|| async { StatusCode::OK }),
+            )
+            .layer(build_cors_layer(configured_origins));
+        let mut request = Request::builder()
+            .method(if preflight_method.is_some() {
+                "OPTIONS"
+            } else {
+                "GET"
+            })
+            .uri("/api/invites")
+            .header(header::ORIGIN, origin);
+        if let Some(method) = preflight_method {
+            request = request
+                .header(header::ACCESS_CONTROL_REQUEST_METHOD, method)
+                .header(
+                    header::ACCESS_CONTROL_REQUEST_HEADERS,
+                    "authorization,content-type",
+                );
+        }
+        router
+            .oneshot(request.body(Body::empty()).expect("CORS request"))
+            .await
+            .expect("CORS response")
+    }
+
+    #[tokio::test]
+    async fn restricted_cors_keeps_desktop_invite_get_and_post_available() {
+        let configured = vec!["https://buzz.example".to_string()];
+
+        for origin in DESKTOP_CORS_ORIGINS {
+            let get_response = cors_response(&configured, origin, None).await;
+            assert_eq!(
+                get_response
+                    .headers()
+                    .get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+                Some(&HeaderValue::from_static(origin))
+            );
+
+            let post_preflight = cors_response(&configured, origin, Some("POST")).await;
+            assert_eq!(
+                post_preflight
+                    .headers()
+                    .get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+                Some(&HeaderValue::from_static(origin))
+            );
+        }
+
+        let untrusted = cors_response(&configured, "https://untrusted.example", Some("POST")).await;
+        assert!(
+            untrusted
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .is_none(),
+            "adding the desktop origins must not make configured CORS permissive"
+        );
+    }
 
     struct ScriptedReadinessEvaluator {
         evaluations: Mutex<VecDeque<ReadinessEvaluation>>,

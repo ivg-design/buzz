@@ -38,24 +38,41 @@ const NEST_DIRS: &[&str] = &[
 ];
 
 /// Default AGENTS.md content written on first init.
-/// Fully static — no runtime interpolation, no secrets, no user paths.
-pub(crate) const AGENTS_MD: &str = include_str!("nest_agents.md");
+/// Fully static — no runtime interpolation, no secrets, no user paths. The
+/// canonical Nemo contract is shared with ACP project preloading so the local
+/// workspace file and the privileged prompt cannot drift independently.
+pub(crate) const AGENTS_MD: &str = concat!(
+    include_str!("nest_agents.md"),
+    "\n\n",
+    include_str!("../../../../docs/NEMO_WORKSPACE_INSTRUCTIONS.md"),
+    "\n\n<!-- BEGIN BUZZ MANAGED — regenerated automatically, do not edit below -->\n\
+## Active Agents\n\n\
+*(No agents deployed yet. Add agents in the Buzz desktop app.)*\n\n\
+<!-- END BUZZ MANAGED -->\n",
+);
 
-/// Default SKILL.md content for the buzz-cli skill.
-/// Written to ~/.buzz/.agents/skills/buzz-cli/SKILL.md on first init.
-const BUZZ_CLI_SKILL_MD: &str = include_str!("nest_skill.md");
+/// Default managed-agent skill. The legacy on-disk directory remains
+/// `buzz-cli` for upgrade compatibility, but the skill itself is Nemo A2A and
+/// exposes no CLI or credential workflow to managed agents.
+const NEMO_AGENT_SKILL_MD: &str = concat!(
+    include_str!("nest_skill.md"),
+    "\n\n",
+    include_str!("../../../../docs/NEMO_WORKSPACE_INSTRUCTIONS.md"),
+);
 
 /// Template content version for AGENTS.md static content (above managed markers).
 /// Bump this when changing `nest_agents.md` to trigger refresh on existing installs.
 /// Version 1 is implicitly "before this mechanism existed" (no version file).
-const NEST_AGENTS_VERSION: u32 = 5;
+const NEST_AGENTS_VERSION: u32 = 6;
 
 /// Template content version for SKILL.md.
 /// Bump this when changing `nest_skill.md` to trigger refresh on existing installs.
-const NEST_SKILL_VERSION: u32 = 5;
+const NEST_SKILL_VERSION: u32 = 6;
 
 const BEGIN_MARKER: &str = "<!-- BEGIN BUZZ MANAGED";
 const END_MARKER: &str = "<!-- END BUZZ MANAGED -->";
+const LEGACY_NEMO_POLICY_HEADING: &str = "## Mandatory Nemo workspace policy";
+const LEGACY_NEMO_POLICY_END: &str = "jobs keep their task-specific budgets.";
 
 /// Canonical skill directory path relative to the nest root.
 const CANONICAL_SKILL_DIR: &str = ".agents/skills/buzz-cli";
@@ -196,7 +213,7 @@ pub fn ensure_nest_at(root: &Path) -> Result<(), String> {
     {
         Ok(mut file) => {
             use std::io::Write;
-            file.write_all(BUZZ_CLI_SKILL_MD.as_bytes())
+            file.write_all(NEMO_AGENT_SKILL_MD.as_bytes())
                 .map_err(|e| format!("write {}: {e}", skill_md.display()))?;
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -376,6 +393,33 @@ fn read_version_file(path: &Path) -> u32 {
         .unwrap_or(0)
 }
 
+/// Remove the one known pre-v6 Nemo policy block that older local setup wrote
+/// after the managed roster. It had no end marker, so require its exact heading,
+/// terminal sentence, and placement after our managed section before touching
+/// anything. User notes before or after it are preserved.
+fn strip_legacy_nemo_policy(content: String) -> String {
+    let Some(managed_end) = find_marker_at_line_start(&content, END_MARKER) else {
+        return content;
+    };
+    let Some(policy_start) = find_marker_at_line_start(&content, LEGACY_NEMO_POLICY_HEADING) else {
+        return content;
+    };
+    if policy_start <= managed_end {
+        return content;
+    }
+    let Some(policy_end_offset) = content[policy_start..].find(LEGACY_NEMO_POLICY_END) else {
+        return content;
+    };
+    let policy_end = policy_start + policy_end_offset + LEGACY_NEMO_POLICY_END.len();
+    let prefix = content[..policy_start].trim_end_matches('\n');
+    let suffix = content[policy_end..].trim_start_matches('\n');
+    if suffix.is_empty() {
+        format!("{prefix}\n")
+    } else {
+        format!("{prefix}\n\n{suffix}")
+    }
+}
+
 /// Refresh AGENTS.md static content if the template version has changed.
 ///
 /// Preserves everything from the `<!-- BEGIN BUZZ MANAGED` marker onward
@@ -414,6 +458,7 @@ fn refresh_agents_md_if_stale(root: &Path) -> Result<(), String> {
             AGENTS_MD.to_string()
         }
     };
+    let new_content = strip_legacy_nemo_policy(new_content);
 
     // Atomic write via temp file.
     let parent = agents_md.parent().ok_or("AGENTS.md has no parent dir")?;
@@ -455,9 +500,9 @@ fn refresh_skill_md_if_stale(root: &Path) -> Result<(), String> {
     let skill_content = if old_is_real_dir {
         // Preserve user-edited content during migration.
         fs::read_to_string(old_skill_dir.join("SKILL.md"))
-            .unwrap_or_else(|_| BUZZ_CLI_SKILL_MD.to_string())
+            .unwrap_or_else(|_| NEMO_AGENT_SKILL_MD.to_string())
     } else {
-        BUZZ_CLI_SKILL_MD.to_string()
+        NEMO_AGENT_SKILL_MD.to_string()
     };
 
     // Ensure the canonical .agents skill directory exists.

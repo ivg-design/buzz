@@ -30,30 +30,26 @@ fn init_nest_dir_prod_sets_buzz() {
 }
 
 #[test]
-fn nest_skill_contains_safe_mention_workflow() {
-    assert!(BUZZ_CLI_SKILL_MD.contains("--mention <hex-or-npub>"));
-    assert!(BUZZ_CLI_SKILL_MD.contains("every presentation-only name that should notify"));
-    assert!(BUZZ_CLI_SKILL_MD
-        .contains("permits unresolved or ambiguous `@Name` text as presentation-only"));
-    assert!(BUZZ_CLI_SKILL_MD.contains("signed event's `mention_pubkeys`"));
-    assert!(BUZZ_CLI_SKILL_MD.contains("no follow-up verification command is needed"));
-    assert!(BUZZ_CLI_SKILL_MD.contains("Add membership separately only when authorized"));
-    assert!(BUZZ_CLI_SKILL_MD.contains("never changes membership automatically"));
+fn nest_skill_contains_the_shared_nemo_contract_without_cli_workflows() {
+    assert!(NEMO_AGENT_SKILL_MD.contains("name: nemo-a2a"));
+    assert!(NEMO_AGENT_SKILL_MD.contains("Protocol: `NEMO-A2A-1`"));
+    assert!(NEMO_AGENT_SKILL_MD.contains("A direct message needs no `@` prefix"));
+    assert!(NEMO_AGENT_SKILL_MD.contains("users do not maintain per-peer grants"));
+    assert!(!NEMO_AGENT_SKILL_MD.contains("BUZZ_PRIVATE_KEY"));
+    assert!(!NEMO_AGENT_SKILL_MD.contains("buzz agents"));
+    assert!(!NEMO_AGENT_SKILL_MD.contains("--mention"));
 }
 
 #[test]
-fn nest_agents_template_separates_commit_attribution_claims() {
-    assert_eq!(AGENTS_MD.matches("## Git Commit Attribution").count(), 1);
-    assert!(AGENTS_MD.contains(
-        "Git authorship, co-authorship, DCO sign-off, and cryptographic signing are separate claims"
-    ));
-    assert!(AGENTS_MD
-        .contains("Request, approval, review, or accountability alone is not co-authorship"));
-    assert!(AGENTS_MD.contains("A sign-off is not an approval marker"));
-    assert!(AGENTS_MD.contains("Never use another person's signing key"));
-    assert!(AGENTS_MD.contains("inspect every outgoing commit against the actual upstream or base"));
-    assert!(AGENTS_MD.contains("An agent-owned repository may use the agent as author"));
-    assert!(!AGENTS_MD.contains("every commit MUST include a `Signed-off-by`"));
+fn nest_agents_template_embeds_the_shared_nemo_contract() {
+    assert!(AGENTS_MD.starts_with("# Nemo workspace"));
+    assert_eq!(AGENTS_MD.matches("## Golden rules").count(), 1);
+    assert!(AGENTS_MD.contains("Protocol: `NEMO-A2A-1`"));
+    assert!(AGENTS_MD.contains("full read/write access to its repository"));
+    assert!(AGENTS_MD.contains("users do not maintain per-peer grants"));
+    assert!(!AGENTS_MD.contains("The bundled CLI is your primary tool interface"));
+    assert!(!AGENTS_MD.contains("Write findings down"));
+    assert!(!AGENTS_MD.contains("WORK_LOGS/"));
 }
 
 #[test]
@@ -144,7 +140,7 @@ fn ensure_nest_creates_skill_file() {
     let skill = root.join(".agents/skills/buzz-cli/SKILL.md");
     assert!(skill.exists(), "SKILL.md should exist at .agents path");
     let content = fs::read_to_string(&skill).unwrap();
-    assert_eq!(content, BUZZ_CLI_SKILL_MD);
+    assert_eq!(content, NEMO_AGENT_SKILL_MD);
 
     // On unix, harness-specific symlinks should resolve to the canonical dir.
     #[cfg(unix)]
@@ -474,7 +470,7 @@ fn refresh_agents_md_upgrades_attribution_and_preserves_owned_content() {
     ensure_nest_at(&root).unwrap();
 
     let content = fs::read_to_string(&agents_md).unwrap();
-    assert_eq!(content.matches("## Git Commit Attribution").count(), 1);
+    assert_eq!(content.matches("## Golden rules").count(), 1);
     assert!(!content.contains("**Human sign-off (required):**"));
     assert!(content.contains("| Kit | Builder | @Kit |"));
     assert!(content.contains("## Local Notes\n\nKeep me."));
@@ -512,7 +508,7 @@ fn refresh_agents_md_preserves_managed_section() {
     let content = fs::read_to_string(&agents_md).unwrap();
     // Static content should be refreshed (from template).
     assert!(
-        content.starts_with("# Buzz Nest"),
+        content.starts_with("# Nemo workspace"),
         "template header must be present"
     );
     // Managed section should be preserved.
@@ -522,6 +518,35 @@ fn refresh_agents_md_preserves_managed_section() {
     );
     assert!(content.contains(BEGIN_MARKER), "BEGIN marker must survive");
     assert!(content.contains(END_MARKER), "END marker must survive");
+}
+
+#[test]
+fn refresh_agents_md_removes_only_the_known_legacy_nemo_policy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join(".buzz");
+    ensure_nest_at(&root).unwrap();
+
+    let agents_md = root.join("AGENTS.md");
+    let current = fs::read_to_string(&agents_md).unwrap();
+    fs::write(
+        &agents_md,
+        format!(
+            "{current}\n## Mandatory Nemo workspace policy\n\n\
+             Legacy pinned instructions. If twelve operations elapse, stop.\n\
+             jobs keep their task-specific budgets.\n\n\
+             ## Local Notes\n\nKeep this user note.\n"
+        ),
+    )
+    .unwrap();
+    fs::write(root.join(".nest-agents-version"), "5\n").unwrap();
+
+    ensure_nest_at(&root).unwrap();
+
+    let content = fs::read_to_string(&agents_md).unwrap();
+    assert!(!content.contains(LEGACY_NEMO_POLICY_HEADING));
+    assert!(!content.contains("If twelve operations elapse"));
+    assert!(content.contains("## Local Notes\n\nKeep this user note."));
+    assert!(content.contains("Protocol: `NEMO-A2A-1`"));
 }
 
 #[test]
@@ -560,7 +585,7 @@ fn refresh_skill_overwrites_on_version_bump() {
 
     let content = fs::read_to_string(&skill_md).unwrap();
     assert_eq!(
-        content, BUZZ_CLI_SKILL_MD,
+        content, NEMO_AGENT_SKILL_MD,
         "SKILL.md must be refreshed on version bump"
     );
 }

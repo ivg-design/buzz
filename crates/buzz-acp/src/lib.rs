@@ -6043,7 +6043,7 @@ mod agent_draft_prompt_tests {
     }
 
     #[test]
-    fn shared_base_prompt_teaches_repo_context_and_learning_loop() {
+    fn shared_base_prompt_teaches_focused_repo_context() {
         let prompt = include_str!("base_prompt.md");
         assert!(prompt.contains("read its root `AGENTS.md`"));
         assert!(prompt.contains("path-local `AGENTS.md`"));
@@ -6051,23 +6051,20 @@ mod agent_draft_prompt_tests {
             prompt.contains("product, architecture, and vision documents as design constraints")
         );
         assert!(prompt.contains("CI and live workflow evidence answer different questions"));
-        assert!(prompt.contains("record the invariant in the same session"));
-        assert!(prompt.contains("update the team's shared guidance"));
+        assert!(prompt.contains("Run broader suites only for a concrete remaining risk"));
+        assert!(prompt.contains("not unrelated application tests or automatic independent reviews"));
+        assert!(!prompt.contains("WORK_LOGS/"));
+        assert!(!prompt.contains("write findings"));
     }
 
     #[test]
     fn shared_base_prompt_keeps_small_artifact_work_bounded() {
         let prompt = include_str!("base_prompt.md");
-        assert!(prompt.contains("Classify before expanding the workflow"));
-        assert!(prompt.contains("A wait call requires a\n  live operation or session identifier"));
-        assert!(prompt.contains("do not run unrelated application suites"));
-        assert!(
-            prompt.contains("A small uncontested documentation or artifact publication does not")
-        );
-        assert!(prompt.contains("`git var GIT_AUTHOR_IDENT`"));
-        assert!(
-            prompt.contains("do not stop merely because repository-local identity keys are unset")
-        );
+        assert!(prompt.contains("A wait call requires a live operation or session identifier"));
+        assert!(prompt.contains("Documentation and pre-reviewed artifact changes"));
+        assert!(prompt.contains("stop when the requested evidence exists"));
+        assert!(!prompt.contains("Get a second opinion"));
+        assert!(!prompt.contains("repository's relevant package suite"));
     }
 
     #[test]
@@ -6085,7 +6082,7 @@ mod agent_draft_prompt_tests {
         assert!(prompt.contains("Do not expand a short display name, infer a surname"));
         assert!(prompt.contains("Preserve it exactly; do not infer, expand, or look up a surname"));
         assert!(prompt.contains("`buzz_chat_send` accepts message content only"));
-        assert!(prompt.contains("do not claim it created a notification or recipient tag"));
+        assert!(prompt.contains("does not prove a notification or recipient tag"));
         assert!(prompt.contains("Use `buzz_a2a_dispatch` for a direct agent work request"));
         assert!(prompt.contains("typed chat tool never changes channel membership"));
     }

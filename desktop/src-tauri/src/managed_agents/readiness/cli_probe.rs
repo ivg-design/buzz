@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use crate::managed_agents::runtime::build_augmented_path;
+use crate::managed_agents::KnownAcpRuntime;
 
 /// Build the augmented PATH for CLI probes and other native child processes
 /// (auth commands, `buzz-acp models` discovery), including nvm's default
@@ -57,11 +58,17 @@ pub(crate) fn login_probe(
     binary_path: &Path,
     probe_args: &[&str],
     augmented_path: Option<&str>,
+    runtime: Option<&KnownAcpRuntime>,
 ) -> ProbeOutcome {
     let mut command = std::process::Command::new(binary_path);
     command.args(&probe_args[1..]);
     if let Some(path) = augmented_path {
         command.env("PATH", path);
+    }
+    if let Err(stderr_excerpt) =
+        crate::managed_agents::configure_runtime_cli(&mut command, runtime)
+    {
+        return ProbeOutcome::ConfigInvalid { stderr_excerpt };
     }
     crate::util::configure_no_window(&mut command);
 
@@ -154,6 +161,7 @@ mod tests {
                 &script_path,
                 &["fake-codex", "login", "status"],
                 Some(&augmented_path),
+                None,
             ),
             ProbeOutcome::LoggedIn,
             "the injected augmented PATH should allow /usr/bin/env to find the interpreter"
@@ -186,6 +194,7 @@ mod tests {
         let outcome = super::login_probe(
             &script_path,
             &["fake-codex-bad-config", "login", "status"],
+            None,
             None,
         );
         assert!(
@@ -225,12 +234,49 @@ mod tests {
             &script_path,
             &["fake-codex-logged-out", "login", "status"],
             None,
+            None,
         );
         assert_eq!(
             outcome,
             ProbeOutcome::LoggedOut,
             "non-config stderr should produce LoggedOut"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_readiness_probe_fails_before_running_without_verified_native_cli() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let marker = temp.path().join("probe-ran");
+        let adapter = temp.path().join("codex-acp");
+        std::fs::write(
+            &adapter,
+            format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display()),
+        )
+        .expect("write adapter");
+        std::fs::set_permissions(&adapter, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod adapter");
+        let runtime = crate::managed_agents::known_acp_runtime_exact("codex")
+            .expect("built-in Codex runtime");
+
+        let outcome = super::login_probe(
+            &adapter,
+            &["codex-acp", "cli", "login", "status"],
+            None,
+            Some(runtime),
+        );
+
+        assert!(
+            matches!(
+                outcome,
+                ProbeOutcome::ConfigInvalid { ref stderr_excerpt }
+                    if stderr_excerpt.contains("bundled Codex CLI")
+            ),
+            "unexpected outcome: {outcome:?}"
+        );
+        assert!(!marker.exists(), "the unbound adapter must never execute");
     }
 
     /// Verify that every string in CONFIG_PARSE_SIGNALS is lowercased so the

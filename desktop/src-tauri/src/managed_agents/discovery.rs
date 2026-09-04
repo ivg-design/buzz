@@ -764,7 +764,11 @@ pub(crate) fn is_npm_global_install(cmd: &str) -> bool {
 /// On timeout or spawn failure the child is killed and `Unknown` is returned;
 /// no orphaned threads or processes are left behind (see
 /// [`bounded_command::output_with_timeout`]).
-fn probe_auth_status(binary_path: &Path, probe_args: &[&str]) -> AuthStatus {
+fn probe_auth_status(
+    binary_path: &Path,
+    probe_args: &[&str],
+    runtime: &KnownAcpRuntime,
+) -> AuthStatus {
     use crate::managed_agents::readiness::cli_probe;
 
     let augmented_path = cli_probe::augmented_path();
@@ -773,6 +777,9 @@ fn probe_auth_status(binary_path: &Path, probe_args: &[&str]) -> AuthStatus {
     command.args(&probe_args[1..]);
     if let Some(ref path) = augmented_path {
         command.env("PATH", path);
+    }
+    if let Err(diagnostic) = super::configure_runtime_cli(&mut command, Some(runtime)) {
+        return AuthStatus::ConfigInvalid { diagnostic };
     }
     // Window suppression is owned by `output_with_timeout`'s spawn
     // (`BOUNDED_CREATION_FLAGS` carries `CREATE_NO_WINDOW`); a

@@ -67,10 +67,11 @@ pub(super) fn resolve_auth_statuses(partials: &mut [super::PartialEntry], force:
                 let binary_path = super::resolve_command(probe_args[0])?;
                 let probe_args_owned: Vec<String> =
                     probe_args.iter().map(|s| s.to_string()).collect();
+                let runtime = partial.runtime;
 
                 let handle = std::thread::spawn(move || {
                     let refs: Vec<&str> = probe_args_owned.iter().map(String::as_str).collect();
-                    super::probe_auth_status(&binary_path, &refs)
+                    super::probe_auth_status(&binary_path, &refs, runtime)
                 });
                 Some((idx, handle))
             })

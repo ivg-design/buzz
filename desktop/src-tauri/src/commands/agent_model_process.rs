@@ -84,3 +84,38 @@ pub(super) async fn run_agent_models_command(
 
     Ok(normalize_agent_models(&raw, persisted_model))
 }
+
+#[cfg(test)]
+mod tests {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_model_listing_fails_before_spawn_without_verified_native_cli() {
+        use std::{collections::BTreeMap, os::unix::fs::PermissionsExt};
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let marker = temp.path().join("models-ran");
+        let acp = temp.path().join("buzz-acp");
+        std::fs::write(
+            &acp,
+            format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display()),
+        )
+        .expect("write helper");
+        std::fs::set_permissions(&acp, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod helper");
+        let mut env = BTreeMap::new();
+        env.insert("CODEX_PATH".to_string(), "/tmp/ambient-codex".to_string());
+
+        let error = super::run_agent_models_command(
+            acp,
+            "codex-acp".to_string(),
+            Vec::new(),
+            None,
+            env,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.contains("bundled Codex CLI"), "{error}");
+        assert!(!marker.exists(), "the unbound models helper must never execute");
+    }
+}

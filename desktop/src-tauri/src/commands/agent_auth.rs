@@ -128,6 +128,7 @@ fn run_buzz_acp_auth_command<const N: usize>(
 
     let augmented_path = auth_command_path();
     run_buzz_acp_auth_command_with_paths(
+        runtime,
         &acp_path,
         adapter_command.0,
         &adapter_command.1,
@@ -174,6 +175,7 @@ fn append_inherited_path(augmented: Option<String>, inherited: Option<String>) -
 }
 
 fn run_buzz_acp_auth_command_with_paths<const N: usize>(
+    runtime: &crate::managed_agents::KnownAcpRuntime,
     acp_path: &Path,
     adapter_name: &str,
     adapter_path: &Path,
@@ -194,6 +196,7 @@ fn run_buzz_acp_auth_command_with_paths<const N: usize>(
     if let Some(path) = augmented_path {
         command.env("PATH", path);
     }
+    crate::managed_agents::configure_runtime_cli(&mut command, Some(runtime))?;
     crate::util::configure_no_window(&mut command);
 
     command
@@ -256,7 +259,12 @@ fn launch_terminal_auth(runtime_id: &str, method: &AcpAuthMethod) -> Result<(), 
         .ok_or_else(|| format!("{} ACP adapter is not installed", runtime.label))?;
     let fallback_command = adapter_command.1.display().to_string();
     let argv = adapter_terminal_argv(runtime.label, method, &fallback_command)?;
-    launch_visible_terminal(&argv)
+    let codex_path = if runtime.id == "codex" {
+        Some(crate::managed_agents::bundled_codex_cli::verified_cli_path()?)
+    } else {
+        None
+    };
+    launch_visible_terminal(&argv, codex_path.as_deref())
 }
 
 fn adapter_terminal_argv(
@@ -371,18 +379,15 @@ fn spawn_without_stdio(mut command: Command) -> Result<(), String> {
 }
 
 #[cfg(target_os = "macos")]
-fn launch_visible_terminal(argv: &[String]) -> Result<(), String> {
+fn launch_visible_terminal(argv: &[String], codex_path: Option<&Path>) -> Result<(), String> {
     let mut script = tempfile::Builder::new()
         .prefix("buzz-auth-")
         .suffix(".command")
         .tempfile()
         .map_err(|error| format!("failed to create terminal login script: {error}"))?;
-    writeln!(
-        script,
-        "#!/bin/sh\ntrap 'rm -f -- \"$0\"' EXIT\n{}",
-        shell_join(argv)
-    )
-    .map_err(|error| format!("failed to write terminal login script: {error}"))?;
+    script
+        .write_all(terminal_script(argv, codex_path)?.as_bytes())
+        .map_err(|error| format!("failed to write terminal login script: {error}"))?;
     fs::set_permissions(script.path(), fs::Permissions::from_mode(0o700))
         .map_err(|error| format!("failed to prepare terminal login script: {error}"))?;
     let script = script
@@ -390,8 +395,10 @@ fn launch_visible_terminal(argv: &[String]) -> Result<(), String> {
         .keep()
         .map_err(|error| format!("failed to preserve terminal login script: {error}"))?;
 
-    let status = Command::new("open")
-        .arg(&script)
+    let mut open = Command::new("open");
+    open.arg(&script);
+    apply_codex_terminal_env(&mut open, codex_path);
+    let status = open
         .status()
         .map_err(|error| format!("failed to open terminal: {error}"))?;
     if !status.success() {
@@ -405,7 +412,7 @@ fn launch_visible_terminal(argv: &[String]) -> Result<(), String> {
 }
 
 #[cfg(target_os = "linux")]
-fn launch_visible_terminal(argv: &[String]) -> Result<(), String> {
+fn launch_visible_terminal(argv: &[String], codex_path: Option<&Path>) -> Result<(), String> {
     let command = shell_join(argv);
     let candidates: [(&str, &[&str]); 4] = [
         ("x-terminal-emulator", &["-e", "sh", "-lc"]),
@@ -416,6 +423,7 @@ fn launch_visible_terminal(argv: &[String]) -> Result<(), String> {
     for (terminal, prefix) in candidates {
         let mut terminal_command = Command::new(terminal);
         terminal_command.args(prefix).arg(&command);
+        apply_codex_terminal_env(&mut terminal_command, codex_path);
         if spawn_without_stdio(terminal_command).is_ok() {
             return Ok(());
         }
@@ -424,7 +432,7 @@ fn launch_visible_terminal(argv: &[String]) -> Result<(), String> {
 }
 
 #[cfg(target_os = "windows")]
-fn launch_visible_terminal(argv: &[String]) -> Result<(), String> {
+fn launch_visible_terminal(argv: &[String], codex_path: Option<&Path>) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
 
     const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
@@ -435,6 +443,7 @@ fn launch_visible_terminal(argv: &[String]) -> Result<(), String> {
     command
         .args(windows_terminal_args(argv))
         .creation_flags(CREATE_NEW_CONSOLE);
+    apply_codex_terminal_env(&mut command, codex_path);
     spawn_without_stdio(command)
 }
 
@@ -446,8 +455,31 @@ fn windows_terminal_args(argv: &[String]) -> Vec<String> {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-fn launch_visible_terminal(_argv: &[String]) -> Result<(), String> {
+fn launch_visible_terminal(_argv: &[String], _codex_path: Option<&Path>) -> Result<(), String> {
     Err("opening a terminal is not supported on this platform".to_string())
+}
+
+fn apply_codex_terminal_env(command: &mut Command, codex_path: Option<&Path>) {
+    command.env_remove("CODEX_PATH");
+    if let Some(path) = codex_path {
+        command.env("CODEX_PATH", path);
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn terminal_script(argv: &[String], codex_path: Option<&Path>) -> Result<String, String> {
+    let mut script = "#!/bin/sh\ntrap 'rm -f -- \"$0\"' EXIT\nunset CODEX_PATH\n".to_string();
+    if let Some(path) = codex_path {
+        let path = path
+            .to_str()
+            .ok_or_else(|| "bundled Codex CLI path is not valid UTF-8".to_string())?;
+        script.push_str("export CODEX_PATH=");
+        script.push_str(&shell_escape(path));
+        script.push('\n');
+    }
+    script.push_str(&shell_join(argv));
+    script.push('\n');
+    Ok(script)
 }
 
 fn shell_join(argv: &[String]) -> String {
@@ -471,10 +503,11 @@ fn shell_escape(arg: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        adapter_terminal_argv, append_inherited_path, is_claude_subscription_login,
-        run_buzz_acp_auth_command_with_paths, shell_escape, shell_join, uses_terminal_auth,
-        windows_terminal_args, AcpAuthMethod,
+        adapter_terminal_argv, append_inherited_path, apply_codex_terminal_env,
+        is_claude_subscription_login, run_buzz_acp_auth_command_with_paths, shell_escape,
+        shell_join, terminal_script, uses_terminal_auth, windows_terminal_args, AcpAuthMethod,
     };
+    use std::{path::Path, process::Command};
 
     /// Windows regression: the augmented PATH there holds only Buzz-managed
     /// dirs and the exe parent (no login-shell PATH, no managed Node), so the
@@ -547,6 +580,8 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         let output = run_buzz_acp_auth_command_with_paths(
+            crate::managed_agents::known_acp_runtime_exact("claude")
+                .expect("built-in Claude runtime"),
             &acp_path,
             "claude-agent-acp",
             &adapter_path,
@@ -568,6 +603,40 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn codex_acp_auth_fails_before_helper_spawn_without_verified_native_cli() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let marker = temp.path().join("helper-ran");
+        let acp_path = temp.path().join("buzz-acp");
+        fs::write(
+            &acp_path,
+            format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display()),
+        )
+        .expect("write helper");
+        fs::set_permissions(&acp_path, fs::Permissions::from_mode(0o755))
+            .expect("chmod helper");
+        let adapter_path = temp.path().join("codex-acp");
+        let runtime = crate::managed_agents::known_acp_runtime_exact("codex")
+            .expect("built-in Codex runtime");
+
+        let error = run_buzz_acp_auth_command_with_paths(
+            runtime,
+            &acp_path,
+            "codex-acp",
+            &adapter_path,
+            ["auth-methods", "--json"],
+            None,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("bundled Codex CLI"), "{error}");
+        assert!(!marker.exists(), "the unbound auth helper must never execute");
+    }
+
     #[test]
     fn shell_join_escapes_spaces_and_quotes() {
         assert_eq!(
@@ -579,6 +648,31 @@ mod tests {
     #[test]
     fn shell_escape_leaves_simple_args_unquoted() {
         assert_eq!(shell_escape("--claudeai"), "--claudeai");
+    }
+
+    #[test]
+    fn visible_terminal_receives_exact_codex_path_with_spaces() {
+        let codex_path = Path::new("/Applications/Buzz App.app/Contents/Resources/codex");
+        let mut command = Command::new("terminal");
+        command.env("CODEX_PATH", "/tmp/ambient-codex");
+        apply_codex_terminal_env(&mut command, Some(codex_path));
+
+        let configured = command
+            .get_envs()
+            .find(|(key, _)| *key == "CODEX_PATH")
+            .and_then(|(_, value)| value);
+        assert_eq!(configured, Some(codex_path.as_os_str()));
+
+        let script = terminal_script(&["codex-acp".into(), "login".into()], Some(codex_path))
+            .expect("terminal script");
+        assert!(script.contains("unset CODEX_PATH\n"), "{script}");
+        assert!(
+            script.contains(
+                "export CODEX_PATH='/Applications/Buzz App.app/Contents/Resources/codex'\n"
+            ),
+            "{script}"
+        );
+        assert!(script.ends_with("codex-acp login\n"), "{script}");
     }
 
     #[test]

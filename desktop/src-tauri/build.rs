@@ -6,14 +6,20 @@ include!("src/commands/reconnect_hook_config.rs");
 include!("src/managed_agents/reserved_env_keys.rs");
 
 use base64::Engine as _;
-use sha2::{Digest as _, Sha256};
+
+#[path = "src/managed_agents/bundled_codex_manifest.rs"]
+mod bundled_codex_manifest;
 
 fn embed_bundled_codex_cli_manifest() {
     const REQUIRED_ENV: &str = "BUZZ_BUNDLED_CODEX_CLI_REQUIRED";
     println!("cargo:rerun-if-env-changed={REQUIRED_ENV}");
-    println!("cargo:rerun-if-changed=bundle-resources/codex-cli/PROVENANCE.json");
+    println!("cargo:rerun-if-changed=bundle-resources/codex-cli");
 
-    let required = std::env::var_os(REQUIRED_ENV).is_some();
+    let debug_build = std::env::var("DEBUG").as_deref() == Ok("true");
+    let required = bundled_codex_manifest::bundle_required(
+        debug_build,
+        std::env::var_os(REQUIRED_ENV).is_some(),
+    );
     let manifest_path = std::path::Path::new("bundle-resources/codex-cli/PROVENANCE.json");
     if !manifest_path.is_file() {
         if required {
@@ -23,29 +29,16 @@ fn embed_bundled_codex_cli_manifest() {
         }
         return;
     }
-    if !required {
-        return;
-    }
-
-    let bytes = std::fs::read(manifest_path)
-        .unwrap_or_else(|error| panic!("failed to read {}: {error}", manifest_path.display()));
-    let parsed: serde_json::Value = serde_json::from_slice(&bytes)
-        .unwrap_or_else(|error| panic!("failed to parse {}: {error}", manifest_path.display()));
-    let staged_target = parsed
-        .get("target")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_else(|| panic!("{} is missing target", manifest_path.display()));
     let cargo_target = std::env::var("TARGET")
         .unwrap_or_else(|error| panic!("Cargo TARGET must be set: {error}"));
-    if staged_target != cargo_target {
-        panic!(
-            "staged Codex CLI target {staged_target} does not match Cargo TARGET {cargo_target}"
-        );
-    }
-
-    let manifest_sha256 = hex::encode(Sha256::digest(&bytes));
+    let (_, manifest_sha256) = bundled_codex_manifest::verify_bundle(
+        std::path::Path::new("bundle-resources/codex-cli"),
+        None,
+        &cargo_target,
+    )
+    .unwrap_or_else(|error| panic!("staged bundled Codex CLI verification failed: {error}"));
     println!("cargo:rustc-env=BUZZ_DESKTOP_BUNDLED_CODEX_CLI_MANIFEST_SHA256={manifest_sha256}");
-    println!("cargo:rustc-env=BUZZ_DESKTOP_BUNDLED_CODEX_CLI_TARGET={staged_target}");
+    println!("cargo:rustc-env=BUZZ_DESKTOP_BUNDLED_CODEX_CLI_TARGET={cargo_target}");
 }
 
 fn main() {

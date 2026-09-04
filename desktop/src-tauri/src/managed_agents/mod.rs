@@ -11,6 +11,7 @@ pub(crate) use agent_env::{
 mod agent_description;
 pub(crate) use agent_description::{effective_agent_description, record_effective_description};
 mod backend;
+mod bundled_codex_manifest;
 pub(crate) mod bundled_codex_cli;
 pub(crate) mod bestie_assignment;
 pub(crate) mod claude_config;

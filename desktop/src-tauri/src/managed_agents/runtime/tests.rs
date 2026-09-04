@@ -585,9 +585,20 @@ fn name_matches_interpreter_rejects_node_prefix() {
 }
 
 #[test]
-fn codex_spawn_does_not_set_a_claude_executable() {
+fn codex_spawn_without_verified_bundle_fails_and_strips_ambient_cli_paths() {
     let mut command = std::process::Command::new("buzz-acp");
-    super::configure_runtime_cli(&mut command, super::known_acp_runtime("codex-acp")).unwrap();
+    command.env("CODEX_PATH", "/tmp/ambient-codex");
+    let error =
+        super::configure_runtime_cli(&mut command, super::known_acp_runtime("codex-acp"))
+            .unwrap_err();
+    assert!(error.contains("unavailable"), "{error}");
+    assert_eq!(
+        command
+            .get_envs()
+            .find(|(key, _)| *key == "CODEX_PATH")
+            .map(|(_, value)| value.map(std::ffi::OsString::from)),
+        Some(None)
+    );
     assert!(!command
         .get_envs()
         .any(|(key, _)| key == "CLAUDE_CODE_EXECUTABLE"));

@@ -384,6 +384,10 @@ pub(crate) fn configure_runtime_cli(
     command: &mut std::process::Command,
     runtime: Option<&KnownAcpRuntime>,
 ) -> Result<(), String> {
+    // No child process may inherit an ambient native Codex override. Codex
+    // receives the verified packaged path below; every other runtime keeps the
+    // key absent.
+    command.env_remove("CODEX_PATH");
     let Some(runtime) = runtime else {
         return Ok(());
     };

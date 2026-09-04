@@ -1,12 +1,12 @@
 //! Verified native Codex CLI shipped inside a release bundle.
 
-use serde::Deserialize;
-use sha2::{Digest as _, Sha256};
 use std::{
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     process::Command,
     sync::OnceLock,
 };
+
+use super::bundled_codex_manifest::verify_bundle;
 
 const EXPECTED_MANIFEST_SHA256: Option<&str> =
     option_env!("BUZZ_DESKTOP_BUNDLED_CODEX_CLI_MANIFEST_SHA256");
@@ -16,6 +16,8 @@ const EXPECTED_TARGET: Option<&str> =
 static RESOURCE_DIR: OnceLock<PathBuf> = OnceLock::new();
 static VERIFIED_CLI: OnceLock<CliState> = OnceLock::new();
 
+const CODEX_PATH_ENV: &str = "CODEX_PATH";
+
 #[derive(Debug)]
 enum CliState {
     NotConfigured,
@@ -23,95 +25,8 @@ enum CliState {
     Invalid(String),
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Provenance {
-    target: String,
-    codex_path: String,
-    payloads: Vec<Payload>,
-}
-
-#[derive(Debug, Deserialize)]
-struct Payload {
-    path: String,
-    sha256: String,
-}
-
 pub(crate) fn initialize_resource_dir(path: PathBuf) {
     let _ = RESOURCE_DIR.set(path);
-}
-
-fn sha256(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
-}
-
-fn safe_relative_path(value: &str) -> Result<PathBuf, String> {
-    let path = Path::new(value);
-    if path.as_os_str().is_empty()
-        || path.is_absolute()
-        || path.components().any(|component| {
-            matches!(
-                component,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        })
-    {
-        return Err(format!("unsafe bundled Codex CLI path {value:?}"));
-    }
-    Ok(path.to_path_buf())
-}
-
-fn verify_cli(
-    bundle_root: &Path,
-    expected_manifest_sha256: &str,
-    expected_target: &str,
-) -> Result<PathBuf, String> {
-    let manifest_path = bundle_root.join("PROVENANCE.json");
-    let manifest_bytes = std::fs::read(&manifest_path)
-        .map_err(|error| format!("failed to read {}: {error}", manifest_path.display()))?;
-    let actual_manifest_sha256 = sha256(&manifest_bytes);
-    if actual_manifest_sha256 != expected_manifest_sha256 {
-        return Err(format!(
-            "bundled Codex CLI provenance checksum mismatch: expected {expected_manifest_sha256}, got {actual_manifest_sha256}"
-        ));
-    }
-
-    let provenance: Provenance = serde_json::from_slice(&manifest_bytes)
-        .map_err(|error| format!("failed to parse {}: {error}", manifest_path.display()))?;
-    if provenance.target != expected_target {
-        return Err(format!(
-            "bundled Codex CLI target {} does not match application target {expected_target}",
-            provenance.target
-        ));
-    }
-
-    let codex_relative = safe_relative_path(&provenance.codex_path)?;
-    let mut codex_verified = false;
-    for payload in &provenance.payloads {
-        let relative = safe_relative_path(&payload.path)?;
-        if payload.sha256.len() != 64 || !payload.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
-        {
-            return Err(format!(
-                "invalid SHA-256 for bundled Codex CLI payload {:?}",
-                payload.path
-            ));
-        }
-        let path = bundle_root.join(&relative);
-        let bytes = std::fs::read(&path)
-            .map_err(|error| format!("failed to read bundled payload {}: {error}", path.display()))?;
-        let actual = sha256(&bytes);
-        if !actual.eq_ignore_ascii_case(&payload.sha256) {
-            return Err(format!(
-                "bundled payload checksum mismatch for {}: expected {}, got {actual}",
-                payload.path, payload.sha256
-            ));
-        }
-        codex_verified |= relative == codex_relative;
-    }
-    if !codex_verified {
-        return Err("bundled Codex CLI provenance does not verify the CLI path".to_string());
-    }
-    Ok(bundle_root.join(codex_relative))
 }
 
 fn cli_state() -> &'static CliState {
@@ -126,85 +41,103 @@ fn cli_state() -> &'static CliState {
                 "Tauri resource directory was not initialized before Codex launch".to_string(),
             );
         };
-        match verify_cli(
+        match verify_bundle(
             &resource_dir.join("codex-cli"),
-            expected_sha,
+            Some(expected_sha),
             expected_target,
         ) {
-            Ok(path) => CliState::Ready(path),
+            Ok((codex_path, _)) => CliState::Ready(codex_path),
             Err(error) => CliState::Invalid(error),
         }
     })
 }
 
+fn verified_cli_path_from_state(state: &CliState) -> Result<&Path, String> {
+    match state {
+        CliState::NotConfigured => {
+            Err("verified bundled Codex CLI is unavailable in this build".to_string())
+        }
+        CliState::Ready(path) => Ok(path),
+        CliState::Invalid(error) => Err(format!("invalid bundled Codex CLI: {error}")),
+    }
+}
+
+fn configure_command_from_state(command: &mut Command, state: &CliState) -> Result<(), String> {
+    // Record an explicit removal before consulting state. A missing or invalid
+    // bundle must never fall back to an ambient executable selected by the
+    // parent process.
+    command.env_remove(CODEX_PATH_ENV);
+    let path = verified_cli_path_from_state(state)?;
+    command.env(CODEX_PATH_ENV, path);
+    Ok(())
+}
+
+/// Return the verified native Codex executable for non-child launch surfaces.
+pub(crate) fn verified_cli_path() -> Result<PathBuf, String> {
+    verified_cli_path_from_state(cli_state()).map(Path::to_path_buf)
+}
+
 /// Bind an adapter process to the verified native Codex executable.
 ///
-/// Development builds without a bundled CLI preserve their existing PATH
-/// behavior. Release builds fail closed if the packaged payload is absent or
-/// does not match its build-stamped provenance.
+/// A debug build without staged resources remains buildable for unrelated
+/// desktop work, but Codex surfaces report the runtime unavailable. Release
+/// builds require a verified staged bundle at build time.
 pub(crate) fn configure_command(command: &mut Command) -> Result<(), String> {
-    match cli_state() {
-        CliState::NotConfigured => Ok(()),
-        CliState::Ready(path) => {
-            command.env("CODEX_PATH", path);
-            Ok(())
-        }
-        CliState::Invalid(error) => {
-            command.env_remove("CODEX_PATH");
-            Err(format!("invalid bundled Codex CLI: {error}"))
-        }
-    }
+    configure_command_from_state(command, cli_state())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{safe_relative_path, verify_cli};
-    use serde_json::json;
-
-    fn write_manifest(root: &Path, payload: &[u8], recorded_hash: String) -> Vec<u8> {
-        std::fs::create_dir_all(root.join("runtime/bin")).unwrap();
-        std::fs::write(root.join("runtime/bin/codex"), payload).unwrap();
-        let manifest = json!({
-            "target": "aarch64-apple-darwin",
-            "codexPath": "runtime/bin/codex",
-            "payloads": [{"path": "runtime/bin/codex", "sha256": recorded_hash}]
-        });
-        let bytes = serde_json::to_vec(&manifest).unwrap();
-        std::fs::write(root.join("PROVENANCE.json"), &bytes).unwrap();
-        bytes
-    }
-
+    use super::{configure_command_from_state, CliState, CODEX_PATH_ENV};
+    use std::{ffi::OsString, process::Command};
     use std::path::Path;
 
-    #[test]
-    fn verified_manifest_binds_cli_payload() {
-        let dir = tempfile::tempdir().unwrap();
-        let bytes = write_manifest(dir.path(), b"codex", super::sha256(b"codex"));
-        let path = verify_cli(
-            dir.path(),
-            &super::sha256(&bytes),
-            "aarch64-apple-darwin",
-        )
-        .unwrap();
-        assert_eq!(path, dir.path().join("runtime/bin/codex"));
+    fn command_env(command: &Command, key: &str) -> Option<Option<OsString>> {
+        command
+            .get_envs()
+            .find(|(candidate, _)| *candidate == key)
+            .map(|(_, value)| value.map(OsString::from))
     }
 
     #[test]
-    fn verified_manifest_rejects_payload_tampering() {
-        let dir = tempfile::tempdir().unwrap();
-        let bytes = write_manifest(dir.path(), b"tampered", super::sha256(b"original"));
-        let error = verify_cli(
-            dir.path(),
-            &super::sha256(&bytes),
-            "aarch64-apple-darwin",
+    fn ready_state_replaces_ambient_codex_path_with_exact_verified_path() {
+        let verified = Path::new("/Applications/Buzz App.app/Contents/Resources/codex");
+        let mut command = Command::new("codex-acp");
+        command.env(CODEX_PATH_ENV, "/tmp/ambient-codex");
+
+        configure_command_from_state(&mut command, &CliState::Ready(verified.to_path_buf()))
+            .unwrap();
+
+        assert_eq!(
+            command_env(&command, CODEX_PATH_ENV),
+            Some(Some(verified.as_os_str().to_os_string()))
+        );
+    }
+
+    #[test]
+    fn unavailable_state_removes_ambient_codex_path_and_fails_closed() {
+        let mut command = Command::new("codex-acp");
+        command.env(CODEX_PATH_ENV, "/tmp/ambient-codex");
+
+        let error = configure_command_from_state(&mut command, &CliState::NotConfigured)
+            .unwrap_err();
+
+        assert!(error.contains("unavailable"), "{error}");
+        assert_eq!(command_env(&command, CODEX_PATH_ENV), Some(None));
+    }
+
+    #[test]
+    fn invalid_state_removes_ambient_codex_path_and_reports_diagnostic() {
+        let mut command = Command::new("codex-acp");
+        command.env(CODEX_PATH_ENV, "/tmp/ambient-codex");
+
+        let error = configure_command_from_state(
+            &mut command,
+            &CliState::Invalid("payload checksum mismatch".to_string()),
         )
         .unwrap_err();
-        assert!(error.contains("payload checksum mismatch"), "{error}");
-    }
 
-    #[test]
-    fn bundle_paths_reject_parent_traversal() {
-        assert!(safe_relative_path("../codex").is_err());
-        assert!(safe_relative_path("runtime/bin/codex").is_ok());
+        assert!(error.contains("payload checksum mismatch"), "{error}");
+        assert_eq!(command_env(&command, CODEX_PATH_ENV), Some(None));
     }
 }

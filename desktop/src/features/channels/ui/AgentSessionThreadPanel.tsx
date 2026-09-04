@@ -242,11 +242,24 @@ export function AgentSessionThreadPanel({
   const headerScopeLabel = `${viewLabel} · ${scopeLabel}`;
   const animateActivity = useTranscriptAnimationEnabled();
   const showTimestamps = useTranscriptTimestampsEnabled();
+  const stopRequestPendingRef = React.useRef(false);
+  const [stopRequestPending, setStopRequestPending] = React.useState(false);
+  const stopCurrentTurnTitle = stopRequestPending
+    ? "Waiting for the agent to confirm the stop request."
+    : canStopCurrentTurn
+      ? "Interrupt the current ACP turn without stopping the agent process."
+      : !sessionChannelId
+        ? "Open activity for a channel to stop its current turn."
+        : isWorking
+          ? "Only locally managed agents can be interrupted from this community."
+          : "Available while the agent is working.";
   async function handleInterruptTurn() {
-    if (!sessionChannelId) {
+    if (!sessionChannelId || stopRequestPendingRef.current) {
       return;
     }
 
+    stopRequestPendingRef.current = true;
+    setStopRequestPending(true);
     try {
       const requestId = crypto.randomUUID();
       const outcome = await awaitCancelTurnOutcome({
@@ -284,11 +297,34 @@ export function AgentSessionThreadPanel({
           ? error.message
           : `Failed to stop ${agent.name}'s current turn.`,
       );
+    } finally {
+      stopRequestPendingRef.current = false;
+      setStopRequestPending(false);
     }
   }
 
   const agentHeaderActions = (
     <AuxiliaryPanelHeaderActions>
+      {isLive && canInterruptTurn ? (
+        <Button
+          aria-busy={stopRequestPending}
+          aria-label={
+            stopRequestPending ? "Stopping current run" : "Stop current run"
+          }
+          data-testid="agent-session-stop-current-run"
+          disabled={!canStopCurrentTurn || stopRequestPending}
+          onClick={() => {
+            void handleInterruptTurn();
+          }}
+          size="xs"
+          title={stopCurrentTurnTitle}
+          type="button"
+          variant="outline"
+        >
+          <Octagon />
+          {stopRequestPending ? "Stopping…" : "Stop"}
+        </Button>
+      ) : null}
       {isLive ? (
         <DropdownMenu modal={false}>
           <DropdownMenuTrigger asChild>
@@ -406,24 +442,16 @@ export function AgentSessionThreadPanel({
             <DropdownMenuItem
               className="items-start gap-3"
               data-testid="agent-session-stop-turn"
-              disabled={!canStopCurrentTurn}
+              disabled={!canStopCurrentTurn || stopRequestPending}
               onSelect={() => {
                 void handleInterruptTurn();
               }}
-              title={
-                canStopCurrentTurn
-                  ? "Interrupt the current ACP turn without stopping the agent process."
-                  : !sessionChannelId
-                    ? "Open activity for a channel to stop its current turn."
-                    : isWorking
-                      ? "Only locally managed agents can be interrupted from this community."
-                      : "Available while the agent is working."
-              }
+              title={stopCurrentTurnTitle}
             >
               <Octagon className="mt-0.5 h-4 w-4 text-muted-foreground" />
               <span className="min-w-0 flex-1">
                 <span className="block text-sm font-medium">
-                  Stop current turn
+                  {stopRequestPending ? "Stopping…" : "Stop current turn"}
                 </span>
                 {!canStopCurrentTurn ? (
                   <span className="mt-0.5 block text-xs text-muted-foreground">

@@ -104,17 +104,17 @@ async function readControlRequests(page: Page): Promise<ControlRequest[]> {
 }
 
 async function clickStop(page: Page) {
-  await page.getByTestId("agent-session-settings-menu-trigger").click();
-  const stop = page.getByTestId("agent-session-stop-turn");
+  const stop = page.getByTestId("agent-session-stop-current-run");
   await expect(stop).toBeVisible();
   await expect(stop).toBeEnabled();
+  await expect(stop).toHaveAccessibleName("Stop current run");
   await stop.click();
 }
 
 test.describe("agent control browser regressions", () => {
   test.use({ viewport: { width: 1280, height: 720 } });
 
-  test("Stop uses the channelId-only activity scope and carries a requestId", async ({
+  test("prominent Stop uses the channel scope and keeps activity mounted", async ({
     page,
   }) => {
     await installMockBridge(page, {
@@ -238,7 +238,7 @@ test.describe("agent control browser regressions", () => {
     await expect(page.getByText(/Stop signal sent to Charlie/)).toHaveCount(0);
   });
 
-  test("Stop does not accept an unconfirmed or foreign-channel result", async ({
+  test("prominent Stop ignores repeated clicks and foreign-channel results", async ({
     page,
   }) => {
     await installMockBridge(page, {
@@ -261,42 +261,41 @@ test.describe("agent control browser regressions", () => {
     });
     await openAgentActivity(page, CHANNEL_AGENTS);
 
-    // Open the settings menu on real time so the DropdownMenuContent's 150ms
-    // CSS enter-animation (zoom-in-95) can complete before the fake clock is
-    // installed. Once the clock is active, every setTimeout — including those
-    // used by the correlation timeout the test exercises — is fake-controlled.
-    await page.getByTestId("agent-session-settings-menu-trigger").click();
-    const stop = page.getByTestId("agent-session-stop-turn");
+    const panel = page.getByTestId("agent-session-thread-panel");
+    const stop = page.getByTestId("agent-session-stop-current-run");
     await expect(stop).toBeVisible();
     await expect(stop).toBeEnabled();
-    // Settle the enter-animation before installing the fake clock. Real
-    // setTimeout here; waitForAnimations works normally with no fake clock.
     await waitForAnimations(page);
 
-    // Install the fake clock NOW — after the menu is open and stable. Any
-    // setTimeout scheduled from this point forward (e.g. the 8-second
-    // correlation timeout) will be fake-clock-controlled.
+    // Hold the first request open on a foreign result, then dispatch two clicks
+    // in the same browser task. The synchronous ref guard must admit exactly
+    // one request even before React can commit the disabled pending state.
     await page.clock.install({ time: new Date("2026-08-30T17:00:00.000Z") });
-
-    await stop.click();
-    await expect
-      .poll(() => readControlRequests(page))
-      .toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({
-            payload: expect.objectContaining({
-              channelId: CHANNEL_AGENTS,
-              requestId: expect.any(String),
-            }),
-          }),
-        ]),
-      );
+    await stop.evaluate((button) => {
+      button.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      button.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await expect.poll(() => readControlRequests(page)).toHaveLength(1);
+    await expect(stop).toBeDisabled();
+    await expect(stop).toContainText("Stopping…");
+    await expect(stop).toHaveAccessibleName("Stopping current run");
+    await expect(panel).toBeVisible();
+    expect((await readControlRequests(page))[0]).toEqual(
+      expect.objectContaining({
+        payload: expect.objectContaining({
+          channelId: CHANNEL_AGENTS,
+          requestId: expect.any(String),
+        }),
+      }),
+    );
 
     // The configured result is emitted with CHANNEL_FOREIGN. The correlator
     // must ignore it, then report the bounded timeout honestly.
     await page.clock.fastForward(8_001);
     await expect(page.getByText(/hasn't confirmed it/)).toBeVisible();
     await expect(page.getByText(/Stop signal sent to Charlie/)).toHaveCount(0);
+    await expect(panel).toBeVisible();
+    await expect(stop).toBeEnabled();
   });
 
   test("model switch sends requestId and reports ambiguous_target", async ({
@@ -420,6 +419,9 @@ test.describe("agent control browser regressions", () => {
     await expect(page.getByTestId("agent-session-scope-label")).toHaveText(
       "Activity · All channels",
     );
+    await expect(
+      page.getByTestId("agent-session-stop-current-run"),
+    ).toBeDisabled();
     await page.getByTestId("agent-session-settings-menu-trigger").click();
     await expect(page.getByTestId("agent-session-stop-turn")).toBeDisabled();
     await expect(page.getByTestId("agent-session-stop-turn")).toHaveAttribute(

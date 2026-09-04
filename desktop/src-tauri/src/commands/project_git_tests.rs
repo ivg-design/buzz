@@ -1,5 +1,7 @@
 use super::super::project_git_exec::build_test_git_auth_config;
-use super::super::project_git_file_content::validate_repo_file_path;
+use super::super::project_git_file_content::{
+    read_local_preview_content, validate_repo_file_path,
+};
 use super::*;
 
 #[test]
@@ -102,6 +104,135 @@ fn parse_worktree_files_counts_only_files_toward_eager_preview_limit() {
 
     assert_eq!(files.len(), MAX_EAGER_FILE_PREVIEWS);
     assert!(files.iter().all(|file| file.preview_content.is_some()));
+}
+
+#[test]
+fn selected_local_branch_snapshot_and_content_do_not_move_the_worktree() {
+    let auth = build_test_git_auth_config().expect("build test git config");
+    let root = tempfile::tempdir().expect("create test directory");
+    let checkout = root.path().join("checkout");
+    let checkout_path = checkout.to_str().expect("checkout path");
+    run_git(&["init", "--", checkout_path], None, &auth).expect("initialize checkout");
+
+    std::fs::write(checkout.join("shared.txt"), "main committed\n").expect("write main file");
+    std::fs::write(checkout.join("main-only.txt"), "main only\n")
+        .expect("write main-only file");
+    run_git(&["add", "shared.txt", "main-only.txt"], Some(&checkout), &auth)
+        .expect("stage main files");
+    run_git(
+        &[
+            "-c",
+            "user.name=Buzz Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "Main content",
+        ],
+        Some(&checkout),
+        &auth,
+    )
+    .expect("commit main content");
+    run_git(&["branch", "-M", "main"], Some(&checkout), &auth).expect("name main branch");
+
+    run_git(&["checkout", "-b", "feature"], Some(&checkout), &auth)
+        .expect("create feature branch");
+    std::fs::write(checkout.join("shared.txt"), "feature committed\n")
+        .expect("write feature file");
+    std::fs::remove_file(checkout.join("main-only.txt")).expect("remove main-only file");
+    std::fs::write(checkout.join("feature-only.txt"), "feature only\n")
+        .expect("write feature-only file");
+    std::fs::write(checkout.join("feature notes.txt"), "feature notes\n")
+        .expect("write spaced feature file");
+    run_git(&["add", "-A"], Some(&checkout), &auth).expect("stage feature files");
+    run_git(
+        &[
+            "-c",
+            "user.name=Buzz Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "Feature content",
+        ],
+        Some(&checkout),
+        &auth,
+    )
+    .expect("commit feature content");
+    let feature_head = run_git(&["rev-parse", "HEAD"], Some(&checkout), &auth)
+        .expect("read feature head")
+        .trim()
+        .to_string();
+
+    run_git(&["checkout", "main"], Some(&checkout), &auth).expect("restore main branch");
+    std::fs::write(checkout.join("shared.txt"), "main uncommitted\n")
+        .expect("write dirty main file");
+    let head_before = run_git(&["rev-parse", "HEAD"], Some(&checkout), &auth)
+        .expect("read main head")
+        .trim()
+        .to_string();
+    let status_before = run_git(&["status", "--porcelain"], Some(&checkout), &auth)
+        .expect("read main status");
+
+    let feature = snapshot_from_worktree(&checkout, &auth, Some("feature"), Some("main"))
+        .expect("snapshot feature branch");
+    assert_eq!(
+        feature
+            .latest_commit
+            .as_ref()
+            .map(|commit| commit.hash.as_str()),
+        Some(feature_head.as_str())
+    );
+    assert!(feature.files.iter().any(|file| file.path == "feature-only.txt"));
+    assert!(!feature.files.iter().any(|file| file.path == "main-only.txt"));
+    assert_eq!(
+        read_local_preview_content(&checkout, "shared.txt", Some("feature"), &auth)
+            .expect("read feature content")
+            .as_deref(),
+        Some("feature committed\n")
+    );
+    assert_eq!(
+        read_local_preview_content(&checkout, "feature notes.txt", Some("feature"), &auth)
+            .expect("read spaced feature path")
+            .as_deref(),
+        Some("feature notes\n")
+    );
+
+    let main = snapshot_from_worktree(&checkout, &auth, Some("main"), Some("main"))
+        .expect("snapshot current main branch");
+    assert!(main.files.iter().any(|file| file.path == "main-only.txt"));
+    assert!(!main.files.iter().any(|file| file.path == "feature-only.txt"));
+    assert_eq!(
+        main.files
+            .iter()
+            .find(|file| file.path == "shared.txt")
+            .and_then(|file| file.preview_content.as_deref()),
+        Some("main uncommitted\n")
+    );
+    assert_eq!(
+        read_local_preview_content(&checkout, "shared.txt", Some("main"), &auth)
+            .expect("read dirty main content")
+            .as_deref(),
+        Some("main uncommitted\n")
+    );
+
+    assert_eq!(
+        run_git(&["branch", "--show-current"], Some(&checkout), &auth)
+            .expect("read current branch")
+            .trim(),
+        "main"
+    );
+    assert_eq!(
+        run_git(&["rev-parse", "HEAD"], Some(&checkout), &auth)
+            .expect("read unchanged head")
+            .trim(),
+        head_before
+    );
+    assert_eq!(
+        run_git(&["status", "--porcelain"], Some(&checkout), &auth)
+            .expect("read unchanged status"),
+        status_before
+    );
 }
 
 #[test]

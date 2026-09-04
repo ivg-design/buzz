@@ -202,6 +202,7 @@ fn branch_activity_range(
     auth: &GitAuthConfig,
     branch_name: Option<&str>,
     base_branch: Option<&str>,
+    target_ref: &str,
 ) -> Option<String> {
     let branch_name = branch_name.map(normalize_branch_name)?;
     let base_branch = base_branch.map(normalize_branch_name)?;
@@ -221,7 +222,7 @@ fn branch_activity_range(
         return None;
     }
 
-    Some(format!("origin/{base_branch}..HEAD"))
+    Some(format!("origin/{base_branch}..{target_ref}"))
 }
 
 fn parse_ls_tree(
@@ -370,15 +371,38 @@ fn snapshot_from_worktree(
     branch_name: Option<&str>,
     base_branch: Option<&str>,
 ) -> Result<ProjectRepoSnapshotInfo, String> {
-    let has_head = run_git(
-        &["rev-parse", "--verify", "--quiet", "HEAD"],
+    let current_branch = run_git(&["branch", "--show-current"], Some(repo_dir), auth)
+        .ok()
+        .and_then(|output| first_output_line(&output));
+    let selected_ref = branch_name
+        .map(normalize_branch_name)
+        .filter(|branch| !branch.is_empty())
+        .filter(|branch| current_branch.as_deref() != Some(*branch))
+        .map(|branch| format!("refs/heads/{branch}"));
+    if let Some(selected_ref) = selected_ref.as_deref() {
+        let commit_ref = format!("{selected_ref}^{{commit}}");
+        run_git(
+            &["rev-parse", "--verify", "--quiet", commit_ref.as_str()],
+            Some(repo_dir),
+            auth,
+        )
+        .map_err(|_| "The selected local repository branch was not found.".to_string())?;
+    }
+    let treeish = selected_ref.as_deref().unwrap_or("HEAD");
+    let has_commit = run_git(
+        &["rev-parse", "--verify", "--quiet", treeish],
         Some(repo_dir),
         auth,
     )
     .is_ok();
-    let latest_commit = if has_head {
+    let latest_commit = if has_commit {
         let output = run_git(
-            &["log", "-1", "--format=%H%x00%h%x00%an%x00%ae%x00%at%x00%s"],
+            &[
+                "log",
+                "-1",
+                "--format=%H%x00%h%x00%an%x00%ae%x00%at%x00%s",
+                treeish,
+            ],
             Some(repo_dir),
             auth,
         )
@@ -390,8 +414,9 @@ fn snapshot_from_worktree(
     } else {
         None
     };
-    let branch_activity_range = branch_activity_range(repo_dir, auth, branch_name, base_branch);
-    let branch_activity_ref = branch_activity_range.as_deref().unwrap_or("HEAD");
+    let branch_activity_range =
+        branch_activity_range(repo_dir, auth, branch_name, base_branch, treeish);
+    let branch_activity_ref = branch_activity_range.as_deref().unwrap_or(treeish);
     let (commits, contributors, latest_commit_by_path) = if latest_commit.is_some() {
         let commits = run_git(
             &[
@@ -424,6 +449,7 @@ fn snapshot_from_worktree(
                 "--format=%H%x00%h%x00%an%x00%ae%x00%at%x00%s",
                 "--name-only",
                 "--diff-filter=ACMRT",
+                treeish,
                 "--",
             ],
             Some(repo_dir),
@@ -436,19 +462,25 @@ fn snapshot_from_worktree(
         (Vec::new(), Vec::new(), std::collections::HashMap::new())
     };
 
-    let files = run_git(
-        &[
-            "ls-files",
-            "--cached",
-            "--others",
-            "--exclude-standard",
-            "-z",
-        ],
-        Some(repo_dir),
-        auth,
-    )
-    .map(|output| parse_worktree_files(repo_dir, &output, &latest_commit_by_path))
-    .map_err(|error| format!("read local repository file list: {error}"))?;
+    let files = if selected_ref.is_some() {
+        run_git(&["ls-tree", "-r", treeish], Some(repo_dir), auth)
+            .map(|output| parse_ls_tree(&output, &latest_commit_by_path))
+            .map_err(|error| format!("read selected local branch file tree: {error}"))?
+    } else {
+        run_git(
+            &[
+                "ls-files",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+                "-z",
+            ],
+            Some(repo_dir),
+            auth,
+        )
+        .map(|output| parse_worktree_files(repo_dir, &output, &latest_commit_by_path))
+        .map_err(|error| format!("read local repository file list: {error}"))?
+    };
 
     Ok(ProjectRepoSnapshotInfo {
         latest_commit,

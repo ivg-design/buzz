@@ -127,6 +127,7 @@ pub(crate) fn run_git(
     auth: &GitAuthConfig,
 ) -> Result<String, String> {
     run_git_with_limits(args, cwd, auth, None)
+        .map(|stdout| String::from_utf8_lossy(&stdout).to_string())
 }
 
 pub(crate) fn run_git_in_request(
@@ -136,6 +137,19 @@ pub(crate) fn run_git_in_request(
     budget: &mut GitRequestBudget,
 ) -> Result<String, String> {
     run_git_with_limits(args, cwd, auth, Some(budget))
+        .map(|stdout| String::from_utf8_lossy(&stdout).to_string())
+}
+
+/// Run a bounded local Git command while preserving stdout bytes exactly.
+///
+/// Repository previews use this for committed blobs so invalid UTF-8 and NUL
+/// bytes can be rejected rather than silently replaced during decoding.
+pub(crate) fn run_git_bytes(
+    args: &[&str],
+    cwd: Option<&std::path::Path>,
+    auth: &GitAuthConfig,
+) -> Result<Vec<u8>, String> {
+    run_git_with_limits(args, cwd, auth, None)
 }
 
 fn run_git_with_limits(
@@ -143,7 +157,7 @@ fn run_git_with_limits(
     cwd: Option<&std::path::Path>,
     auth: &GitAuthConfig,
     mut budget: Option<&mut GitRequestBudget>,
-) -> Result<String, String> {
+) -> Result<Vec<u8>, String> {
     let mut command = Command::new(&auth.git_path);
     command.args(args);
     if let Some(cwd) = cwd {
@@ -198,7 +212,6 @@ fn run_git_with_limits(
     if let Some(budget) = budget {
         budget.charge_output((stdout.len() + stderr.len()) as u64)?;
     }
-    let stdout = String::from_utf8_lossy(&stdout).to_string();
     let stderr = String::from_utf8_lossy(&stderr).to_string();
     if !status.success() {
         let stderr = stderr.trim().to_string();

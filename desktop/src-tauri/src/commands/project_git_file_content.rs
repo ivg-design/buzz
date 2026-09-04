@@ -1,7 +1,8 @@
 use super::project_git::first_output_line;
 use super::project_git_exec::{
-    build_git_clone_auth_config, clean_branch, clean_target_ref, run_git_in_request,
-    validate_local_clone_url_for_workspace, GitAuthConfig, GitRequestBudget,
+    build_git_auth_config, build_git_clone_auth_config, clean_branch, clean_target_ref, run_git,
+    run_git_bytes, run_git_in_request, validate_local_clone_url_for_workspace, GitAuthConfig,
+    GitRequestBudget,
 };
 use super::project_repo_paths::find_local_repo_dir;
 use crate::app_state::AppState;
@@ -91,6 +92,61 @@ pub(crate) fn read_preview_content(
         return None;
     }
     String::from_utf8(bytes).ok()
+}
+
+pub(crate) fn read_local_preview_content(
+    repo_dir: &std::path::Path,
+    path: &str,
+    branch: Option<&str>,
+    auth: &GitAuthConfig,
+) -> Result<Option<String>, String> {
+    let current_branch = run_git(&["branch", "--show-current"], Some(repo_dir), auth)
+        .ok()
+        .and_then(|output| first_output_line(&output));
+    let Some(branch) = branch.filter(|branch| current_branch.as_deref() != Some(*branch)) else {
+        return Ok(read_preview_content(repo_dir, path, None));
+    };
+    let branch_ref = format!("refs/heads/{branch}");
+    let commit_ref = format!("{branch_ref}^{{commit}}");
+    run_git(
+        &["rev-parse", "--verify", "--quiet", commit_ref.as_str()],
+        Some(repo_dir),
+        auth,
+    )
+    .map_err(|_| "The selected local repository branch was not found.".to_string())?;
+
+    let tree_entry = run_git(
+        &["ls-tree", "-z", branch_ref.as_str(), "--", path],
+        Some(repo_dir),
+        auth,
+    )?;
+    let Some(tree_entry) = tree_entry.strip_suffix('\0').filter(|entry| !entry.contains('\0')) else {
+        return Ok(None);
+    };
+    let Some(object) = tree_entry.split_once('\t').and_then(|(metadata, listed_path)| {
+        if listed_path != path {
+            return None;
+        }
+        let mut parts = metadata.split_whitespace();
+        let mode = parts.next()?;
+        let kind = parts.next()?;
+        let object = parts.next()?;
+        (matches!(mode, "100644" | "100755") && kind == "blob").then_some(object)
+    }) else {
+        return Ok(None);
+    };
+    let size = run_git(&["cat-file", "-s", object], Some(repo_dir), auth)?
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| "Requested repository file size was malformed.".to_string())?;
+    if size > MAX_PREVIEW_BYTES {
+        return Ok(None);
+    }
+    let bytes = run_git_bytes(&["cat-file", "blob", object], Some(repo_dir), auth)?;
+    if bytes.len() as u64 != size || bytes.contains(&0) {
+        return Ok(None);
+    }
+    Ok(String::from_utf8(bytes).ok())
 }
 
 pub(crate) fn validate_repo_file_path(path: &str) -> Result<(), String> {
@@ -262,16 +318,20 @@ pub async fn get_project_local_repo_file_content(
     repos_dir: Option<String>,
     project_dtag: String,
     clone_url: Option<String>,
+    default_branch: Option<String>,
     path: String,
+    state: State<'_, AppState>,
 ) -> Result<Option<String>, String> {
     validate_repo_file_path(&path)?;
+    let auth = build_git_auth_config(&state)?;
+    let branch = clean_branch(default_branch);
     tauri::async_runtime::spawn_blocking(move || {
         let Some(repo_dir) =
             find_local_repo_dir(repos_dir.as_deref(), &project_dtag, clone_url.as_deref())?
         else {
             return Ok(None);
         };
-        Ok(read_preview_content(&repo_dir, &path, None))
+        read_local_preview_content(&repo_dir, &path, branch.as_deref(), &auth)
     })
     .await
     .map_err(|error| format!("local repo file content task failed: {error}"))?

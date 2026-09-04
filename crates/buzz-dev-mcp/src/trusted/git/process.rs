@@ -1,12 +1,14 @@
+#[cfg(any(target_os = "macos", windows))]
+use std::collections::BTreeMap;
 #[cfg(target_os = "macos")]
-use std::collections::{BTreeMap, BTreeSet};
-#[cfg(target_os = "macos")]
+use std::collections::BTreeSet;
+#[cfg(any(target_os = "macos", windows))]
 use std::ffi::OsStr;
 #[cfg(any(unix, windows))]
 use std::ffi::OsString;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 use std::fs::{File, OpenOptions};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 use std::io::Write as _;
 #[cfg(target_os = "macos")]
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
@@ -32,11 +34,22 @@ use zeroize::Zeroizing;
 use super::super::scope::TrustedGitCheckout;
 use super::super::{PrivilegedGitDisposition, TrustedRelay};
 
+#[cfg(windows)]
+#[path = "windows_network.rs"]
+mod windows_network;
+#[cfg(windows)]
+#[path = "windows_private.rs"]
+mod windows_private;
+#[cfg(windows)]
+use windows_network::WindowsCredentialBroker;
+#[cfg(windows)]
+use windows_private::{private_tempdir, secure_private_directory, secure_private_file};
+
 #[cfg(any(unix, windows))]
 const GIT_TIMEOUT: Duration = Duration::from_secs(300);
 #[cfg(any(unix, windows))]
 const RECONCILIATION_TIMEOUT: Duration = Duration::from_secs(30);
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 const CREDENTIAL_CAPTURE_TIMEOUT: Duration = Duration::from_secs(20);
 #[cfg(any(unix, windows))]
 const IO_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -50,18 +63,18 @@ const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 const CHECKOUT_INSPECTION_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(any(unix, windows))]
 const MAX_CHECKOUT_INSPECTION_BYTES: usize = 64 * 1024;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 const MAX_CREDENTIAL_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_INPUT_BYTES: usize = 4 * 1024 * 1024;
 const CANCELLED_ERROR: &str = "trusted Git operation was cancelled";
 const TIMED_OUT_ERROR: &str = "trusted Git operation timed out";
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 const MAX_CREDENTIAL_USERNAME_BYTES: usize = 256;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 const MAX_CREDENTIAL_PASSWORD_BYTES: usize = 4096;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 const MAX_PRIVATE_PACKS: usize = 16;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 const MAX_PRIVATE_PACK_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 #[cfg(target_os = "macos")]
 const SECRET_FD: i32 = 3;
@@ -162,18 +175,18 @@ pub(crate) struct GitHubCredentialStore {
 
 #[derive(Default)]
 struct GitHubCredentialStoreInner {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     by_repository: BTreeMap<String, GitHubCredential>,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 struct GitHubCredential {
     username: Zeroizing<String>,
     password: Zeroizing<String>,
 }
 
 impl GitHubCredentialStore {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     fn records_for(&self, repository: &str) -> Result<Zeroizing<Vec<u8>>, String> {
         let path = github_repository_path(repository)?;
         let credential = self._inner.by_repository.get(repository).ok_or_else(|| {
@@ -194,11 +207,11 @@ impl GitHubCredentialStore {
 
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         {
             self._inner.by_repository.is_empty()
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", windows)))]
         {
             true
         }
@@ -217,10 +230,10 @@ pub(crate) async fn capture_operator_github_credentials(
     if repositories.is_empty() {
         return Ok(GitHubCredentialStore::default());
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         let _ = repositories;
-        Err("operator GitHub credential capture is currently available only on macOS".into())
+        Err("operator GitHub credential capture is unavailable on this platform".into())
     }
     #[cfg(target_os = "macos")]
     {
@@ -238,6 +251,17 @@ pub(crate) async fn capture_operator_github_credentials(
         capture_operator_github_credentials_with(
             &git,
             &home,
+            repositories,
+            CREDENTIAL_CAPTURE_TIMEOUT,
+        )
+        .await
+    }
+    #[cfg(windows)]
+    {
+        let git =
+            resolve_system_git().ok_or_else(|| "trusted system git was not found".to_owned())?;
+        windows_network::capture_operator_github_credentials_with(
+            &git,
             repositories,
             CREDENTIAL_CAPTURE_TIMEOUT,
         )
@@ -473,14 +497,12 @@ pub(super) async fn fetch_branch(
     previous_object: Option<String>,
     cancellation: &CancellationToken,
 ) -> Result<RefMutationOutcome, String> {
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         let _ = (relay, checkout, destination, previous_object, cancellation);
-        return Err(
-            "trusted GitHub network operations are currently available only on macOS".into(),
-        );
+        return Err("trusted GitHub network operations are unavailable on this platform".into());
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     {
         github_repository_path(&checkout.repository)?;
         validate_object_id(&checkout.head_sha)?;
@@ -494,6 +516,7 @@ pub(super) async fn fetch_branch(
         run_network_git(
             &git,
             &private,
+            &checkout.repository,
             &[
                 "fetch",
                 "--quiet",
@@ -549,14 +572,12 @@ pub(super) async fn push_commit(
     checkout: &TrustedGitCheckout,
     cancellation: &CancellationToken,
 ) -> Result<RefMutationOutcome, String> {
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         let _ = (relay, checkout, cancellation);
-        return Err(
-            "trusted GitHub network operations are currently available only on macOS".into(),
-        );
+        return Err("trusted GitHub network operations are unavailable on this platform".into());
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     {
         github_repository_path(&checkout.repository)?;
         validate_object_id(&checkout.head_sha)?;
@@ -592,7 +613,7 @@ pub(super) async fn push_commit(
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 async fn credentials_for_operation(
     relay: &TrustedRelay,
     checkout: &TrustedGitCheckout,
@@ -615,7 +636,7 @@ async fn credentials_for_operation(
     Err("operator GitHub credentials were not captured for this repository".into())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 async fn push_ref_reconciled(
     git: &Path,
     private: &PrivateBareRepo,
@@ -649,6 +670,7 @@ async fn push_ref_reconciled(
     let command = run_network_git(
         git,
         private,
+        repository,
         &[
             "push",
             "--porcelain",
@@ -684,19 +706,36 @@ async fn push_ref_reconciled(
 }
 
 #[cfg(target_os = "macos")]
+fn private_tempdir(prefix: &str) -> Result<tempfile::TempDir, String> {
+    let directory = tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir_in(PRIVATE_TEMP_ROOT)
+        .map_err(|_| "failed to create private Git directory".to_owned())?;
+    secure_private_directory(directory.path())?;
+    Ok(directory)
+}
+
+#[cfg(target_os = "macos")]
+fn secure_private_directory(path: &Path) -> Result<(), String> {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .map_err(|_| "failed to secure private Git directory".to_owned())
+}
+
+#[cfg(target_os = "macos")]
+fn secure_private_file(path: &Path) -> Result<(), String> {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|_| "failed to secure private Git file".to_owned())
+}
+
+#[cfg(any(target_os = "macos", windows))]
 struct PrivateBareRepo {
     directory: tempfile::TempDir,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 impl PrivateBareRepo {
     async fn create(git: &Path, cancellation: &CancellationToken) -> Result<Self, String> {
-        let directory = tempfile::Builder::new()
-            .prefix("buzz-trusted-git-")
-            .tempdir_in(PRIVATE_TEMP_ROOT)
-            .map_err(|_| "failed to create private Git repository".to_owned())?;
-        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
-            .map_err(|_| "failed to secure private Git repository".to_owned())?;
+        let directory = private_tempdir("buzz-trusted-git-")?;
         let mut command = Command::new(git);
         command
             .args(["init", "--bare", "--quiet", "."])
@@ -712,8 +751,7 @@ impl PrivateBareRepo {
             return Err("failed to initialize private Git repository".into());
         }
         let config = directory.path().join("config");
-        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600))
-            .map_err(|_| "failed to secure private Git configuration".to_owned())?;
+        secure_private_file(&config)?;
         Ok(Self { directory })
     }
 
@@ -723,20 +761,29 @@ impl PrivateBareRepo {
 
     fn configure_for_network(&self, repository: &str) -> Result<(), String> {
         let path = github_repository_path(repository)?;
+        #[cfg(target_os = "macos")]
+        let credential_helper = format!(
+            "[credential \"https://github.com/{path}\"]\n\
+             \thelper = \"!f() {{ test \\\"$1\\\" = get && /bin/cat <&3 || :; }}; f\"\n"
+        );
+        #[cfg(windows)]
+        let credential_helper = {
+            let _ = path;
+            String::new()
+        };
         let contents = format!(
             "[core]\n\
              \trepositoryFormatVersion = 0\n\
              \tfileMode = true\n\
              \tbare = true\n\
-             \thooksPath = /dev/null\n\
+             \thooksPath = {}\n\
              \tfsmonitor = false\n\
              \taskPass =\n\
-             \tattributesFile = /dev/null\n\
+             \tattributesFile = {}\n\
              [credential]\n\
              \thelper =\n\
              \tuseHttpPath = true\n\
-             [credential \"https://github.com/{path}\"]\n\
-             \thelper = \"!f() {{ test \\\"$1\\\" = get && /bin/cat <&3 || :; }}; f\"\n\
+             {credential_helper}\
              [protocol]\n\
              \tallow = never\n\
              [protocol \"https\"]\n\
@@ -765,7 +812,9 @@ impl PrivateBareRepo {
              [gc]\n\
              \tauto = 0\n\
              [maintenance]\n\
-             \tauto = false\n"
+             \tauto = false\n",
+            null_device(),
+            null_device(),
         );
         write_private_file(&self.path().join("config"), contents.as_bytes())
     }
@@ -778,8 +827,7 @@ impl PrivateBareRepo {
         let info = self.path().join("objects/info");
         std::fs::create_dir_all(&info)
             .map_err(|_| "failed to prepare private Git alternate".to_owned())?;
-        std::fs::set_permissions(&info, std::fs::Permissions::from_mode(0o700))
-            .map_err(|_| "failed to secure private Git alternate".to_owned())?;
+        secure_private_directory(&info)?;
         write_private_file(&info.join("alternates"), format!("{path}\n").as_bytes())
     }
 
@@ -810,15 +858,16 @@ impl PrivateBareRepo {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 async fn run_network_git(
     git: &Path,
     private: &PrivateBareRepo,
+    repository: &str,
     args: &[&str],
     credential: Zeroizing<Vec<u8>>,
     cancellation: &CancellationToken,
 ) -> Result<(), String> {
-    let output = run_network_git_with(git, private, args, credential, cancellation)
+    let output = run_network_git_with(git, private, repository, args, credential, cancellation)
         .await
         .map_err(network_error)?;
     if output.status.success() {
@@ -828,21 +877,32 @@ async fn run_network_git(
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 async fn run_network_git_with(
     git: &Path,
     private: &PrivateBareRepo,
+    repository: &str,
     args: &[&str],
     credential: Zeroizing<Vec<u8>>,
     cancellation: &CancellationToken,
 ) -> Result<ManagedOutput, String> {
-    run_network_git_with_timeout(git, private, args, credential, GIT_TIMEOUT, cancellation).await
+    run_network_git_with_timeout(
+        git,
+        private,
+        repository,
+        args,
+        credential,
+        GIT_TIMEOUT,
+        cancellation,
+    )
+    .await
 }
 
 #[cfg(target_os = "macos")]
 async fn run_network_git_with_timeout(
     git: &Path,
     private: &PrivateBareRepo,
+    _repository: &str,
     args: &[&str],
     credential: Zeroizing<Vec<u8>>,
     timeout: Duration,
@@ -875,7 +935,47 @@ async fn run_network_git_with_timeout(
     .await
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(windows)]
+async fn run_network_git_with_timeout(
+    git: &Path,
+    private: &PrivateBareRepo,
+    repository: &str,
+    args: &[&str],
+    credential: Zeroizing<Vec<u8>>,
+    timeout: Duration,
+    cancellation: &CancellationToken,
+) -> Result<ManagedOutput, String> {
+    let broker = WindowsCredentialBroker::new(credential, repository)?;
+    let helper = broker.git_helper();
+    let mut command = Command::new(git);
+    command
+        .arg("--git-dir=.")
+        .args(args)
+        .current_dir(private.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    apply_isolated_environment(&mut command);
+    apply_config_environment(
+        &mut command,
+        &[
+            ("credential.useHttpPath".into(), "true".into()),
+            ("credential.helper".into(), helper),
+        ],
+    );
+    set_process_group(&mut command);
+    run_managed_with_sidecar(
+        command,
+        None,
+        timeout,
+        MAX_OUTPUT_BYTES,
+        cancellation,
+        ManagedSidecar::WindowsCredential(broker),
+    )
+    .await
+}
+
+#[cfg(any(target_os = "macos", windows))]
 async fn remote_ref(
     git: &Path,
     private: &PrivateBareRepo,
@@ -888,6 +988,7 @@ async fn remote_ref(
     let output = run_network_git_with_timeout(
         git,
         private,
+        repository,
         &["ls-remote", "--quiet", "--refs", repository, branch_ref],
         credential,
         RECONCILIATION_TIMEOUT,
@@ -950,7 +1051,7 @@ fn parse_exact_ref_records(bytes: &[u8], expected_ref: &str) -> Result<Option<St
     Ok(object)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 fn parse_ls_remote(bytes: &[u8], expected_ref: &str) -> Result<Option<String>, String> {
     let mut object = None;
     for row in bytes
@@ -970,7 +1071,7 @@ fn parse_ls_remote(bytes: &[u8], expected_ref: &str) -> Result<Option<String>, S
     Ok(object)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 fn checkout_object_directory(checkout: &TrustedGitCheckout) -> Result<PathBuf, String> {
     let common = checkout
         .git_common_dir
@@ -989,7 +1090,7 @@ fn checkout_object_directory(checkout: &TrustedGitCheckout) -> Result<PathBuf, S
     Ok(objects)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 async fn import_private_packs(
     git: &Path,
     private: &PrivateBareRepo,
@@ -1048,12 +1149,39 @@ struct ManagedOutput {
 }
 
 #[cfg(any(unix, windows))]
+enum ManagedSidecar {
+    None,
+    #[cfg(windows)]
+    WindowsCredential(WindowsCredentialBroker),
+}
+
+#[cfg(any(unix, windows))]
 async fn run_managed(
+    command: Command,
+    input: Option<Zeroizing<Vec<u8>>>,
+    timeout: Duration,
+    max_output: usize,
+    cancellation: &CancellationToken,
+) -> Result<ManagedOutput, String> {
+    run_managed_with_sidecar(
+        command,
+        input,
+        timeout,
+        max_output,
+        cancellation,
+        ManagedSidecar::None,
+    )
+    .await
+}
+
+#[cfg(any(unix, windows))]
+async fn run_managed_with_sidecar(
     mut command: Command,
     input: Option<Zeroizing<Vec<u8>>>,
     timeout: Duration,
     max_output: usize,
     cancellation: &CancellationToken,
+    sidecar: ManagedSidecar,
 ) -> Result<ManagedOutput, String> {
     let mut child = command
         .spawn()
@@ -1069,6 +1197,16 @@ async fn run_managed(
             return Err(error);
         }
     };
+    let mut sidecar_future = Box::pin(async {
+        match sidecar {
+            ManagedSidecar::None => std::future::pending::<Result<(), String>>().await,
+            #[cfg(windows)]
+            ManagedSidecar::WindowsCredential(broker) => {
+                broker.serve(&process_group).await?;
+                std::future::pending::<Result<(), String>>().await
+            }
+        }
+    });
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
         None => {
@@ -1105,12 +1243,12 @@ async fn run_managed(
         Status(ExitStatus),
         Cancelled,
         TimedOut,
-        Failed,
+        Failed(String),
     }
     let outcome = tokio::select! {
         result = tokio::time::timeout(timeout, child.wait()) => match result {
             Ok(Ok(status)) => WaitOutcome::Status(status),
-            Ok(Err(_)) => WaitOutcome::Failed,
+            Ok(Err(_)) => WaitOutcome::Failed("failed to wait for trusted Git".into()),
             Err(_) => WaitOutcome::TimedOut,
         },
         _ = cancellation.cancelled() => match child.try_wait() {
@@ -1119,9 +1257,14 @@ async fn run_managed(
             // applied command is never relabelled as merely cancelled.
             Ok(Some(status)) => WaitOutcome::Status(status),
             Ok(None) => WaitOutcome::Cancelled,
-            Err(_) => WaitOutcome::Failed,
+            Err(_) => WaitOutcome::Failed("failed to wait for trusted Git".into()),
         },
+        result = &mut sidecar_future => WaitOutcome::Failed(match result {
+            Ok(()) => "trusted Git credential broker ended unexpectedly".into(),
+            Err(error) => error,
+        }),
     };
+    drop(sidecar_future);
     if !matches!(outcome, WaitOutcome::Status(_)) {
         terminate_process_group(&process_group, &mut child).await?;
     } else {
@@ -1165,7 +1308,7 @@ async fn run_managed(
         }),
         WaitOutcome::Cancelled => Err(CANCELLED_ERROR.into()),
         WaitOutcome::TimedOut => Err(TIMED_OUT_ERROR.into()),
-        WaitOutcome::Failed => Err("failed to wait for trusted Git".into()),
+        WaitOutcome::Failed(error) => Err(error),
     }
 }
 
@@ -1328,9 +1471,14 @@ fn apply_config_environment(command: &mut Command, config: &[(String, String)]) 
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 fn parse_filled_credential(bytes: &[u8], expected_path: &str) -> Result<GitHubCredential, String> {
-    if bytes.contains(&b'\r') || bytes.contains(&0) {
+    if bytes.contains(&0)
+        || bytes
+            .iter()
+            .enumerate()
+            .any(|(index, byte)| *byte == b'\r' && bytes.get(index + 1) != Some(&b'\n'))
+    {
         return Err("GitHub credential helper returned invalid data".into());
     }
     let output = std::str::from_utf8(bytes)
@@ -1371,7 +1519,7 @@ fn parse_filled_credential(bytes: &[u8], expected_path: &str) -> Result<GitHubCr
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 fn set_once<'a>(slot: &mut Option<&'a str>, value: &'a str) -> Result<(), String> {
     if slot.replace(value).is_some() {
         Err("GitHub credential helper returned duplicate fields".into())
@@ -1380,12 +1528,12 @@ fn set_once<'a>(slot: &mut Option<&'a str>, value: &'a str) -> Result<(), String
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 fn valid_credential_value(value: &str, limit: usize) -> bool {
     !value.is_empty() && value.len() <= limit && !value.chars().any(char::is_control)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 fn github_repository_path(repository: &str) -> Result<&str, String> {
     let path = repository
         .strip_prefix("https://github.com/")
@@ -1399,7 +1547,7 @@ fn github_repository_path(repository: &str) -> Result<&str, String> {
     Ok(path)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 fn valid_github_part(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 100
@@ -1410,7 +1558,7 @@ fn valid_github_part(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 fn validate_object_id(value: &str) -> Result<(), String> {
     if matches!(value.len(), 40 | 64)
         && value
@@ -1437,6 +1585,21 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .map_err(|_| "failed to write private Git configuration".to_owned())?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
         .map_err(|_| "failed to secure private Git configuration".to_owned())
+}
+
+#[cfg(windows)]
+fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)
+        .map_err(|_| "failed to write private Git configuration".to_owned())?;
+    file.write_all(bytes)
+        .map_err(|_| "failed to write private Git configuration".to_owned())?;
+    file.sync_all()
+        .map_err(|_| "failed to persist private Git configuration".to_owned())?;
+    secure_private_file(path)
 }
 
 #[cfg(unix)]
@@ -1813,6 +1976,30 @@ impl ProcessGroupGuard {
         }
     }
 
+    fn contains_process(&self, pid: u32) -> Result<bool, String> {
+        use windows_sys::Win32::Foundation::{CloseHandle, FALSE};
+        use windows_sys::Win32::System::JobObjects::IsProcessInJob;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+
+        // SAFETY: the queried process handle is closed on every successful
+        // open path, and `job` remains owned by this guard for the call.
+        unsafe {
+            let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+            if process.is_null() {
+                return Err("failed to authenticate trusted Git credential client".into());
+            }
+            let mut belongs = FALSE;
+            let result = IsProcessInJob(process, self.job, &mut belongs);
+            CloseHandle(process);
+            if result == FALSE {
+                return Err("failed to authenticate trusted Git credential client".into());
+            }
+            Ok(belongs != FALSE)
+        }
+    }
+
     fn disarm(&mut self) {
         self.armed = false;
     }
@@ -1883,7 +2070,7 @@ fn local_error(bytes: &[u8]) -> String {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 fn network_error(error: String) -> String {
     match error.as_str() {
         CANCELLED_ERROR | TIMED_OUT_ERROR => error,
@@ -2398,6 +2585,7 @@ mod tests {
         let output = run_network_git_with(
             &fake_git,
             &private,
+            "https://github.com/block/buzz",
             &["push", "https://github.com/block/buzz", "deadbeef"],
             Zeroizing::new(format!("username=fake\npassword={sentinel}\n\n").into_bytes()),
             &cancellation,
@@ -2830,6 +3018,13 @@ mod tests {
     #[test]
     fn rejects_noncanonical_or_line_unsafe_credentials() {
         assert!(github_repository_path("https://github.com/Block/buzz").is_err());
+        let crlf = parse_filled_credential(
+            b"protocol=https\r\nhost=github.com\r\npath=block/buzz\r\nusername=user\r\npassword=token\r\n\r\n",
+            "block/buzz",
+        )
+        .expect("canonical Windows CRLF credential");
+        assert_eq!(crlf.username.as_str(), "user");
+        assert_eq!(crlf.password.as_str(), "token");
         assert!(parse_filled_credential(
             b"protocol=https\nhost=github.com\npath=block/buzz\nusername=user\npassword=bad\rvalue\n",
             "block/buzz",
@@ -2843,7 +3038,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, not(unix)))]
+#[cfg(all(test, not(any(unix, windows))))]
 mod unsupported_platform_tests {
     use super::*;
 
@@ -2855,7 +3050,7 @@ mod unsupported_platform_tests {
         };
         assert_eq!(
             error,
-            "local A2A checkout inspection is unavailable on this platform: descendant-safe Git inspection is implemented only on Unix"
+            "local A2A checkout inspection is unavailable on this platform"
         );
     }
 }

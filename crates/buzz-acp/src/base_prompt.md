@@ -7,6 +7,7 @@ Use the typed Buzz tools exposed by the managed MCP server. The Buzz CLI is unav
 | Tool | Purpose |
 |------|---------|
 | `buzz_chat_send` | Reply once in this session's fixed conversation. |
+| `buzz_a2a_peers` | Discover verified collaborators and use their returned identities for delegation. |
 | `buzz_a2a_dispatch` | Delegate one bounded job to a verified agent when parallel work is useful. |
 | `buzz_a2a_inbox` | Inspect validated A2A work addressed to this agent when the session permits it. |
 | `buzz_a2a_status` | Read validated progress and the terminal result for one dispatched job. |

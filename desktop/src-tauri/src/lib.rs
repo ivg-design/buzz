@@ -729,6 +729,7 @@ pub fn run() {
             get_global_agent_config,
             set_global_agent_config,
             get_workspace_project,
+            get_nemo_workspace_status,
             set_workspace_project,
             mesh_start_node,
             mesh_stop_node,

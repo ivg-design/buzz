@@ -33,6 +33,8 @@ const MAX_TOTAL_BYTES: usize = 64 * 1024;
 const MAX_GIT_METADATA_BYTES: u64 = 8 * 1024;
 const MAX_GIT_STDERR_BYTES: u64 = 8 * 1024;
 const GIT_DEADLINE: Duration = Duration::from_secs(5);
+const NEMO_WORKSPACE_INSTRUCTIONS: &str =
+    include_str!("../../../docs/NEMO_WORKSPACE_INSTRUCTIONS.md");
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -99,6 +101,45 @@ pub fn resolve(
         return Ok(None);
     }
 
+    let managed_nemo = project.coordinate == buzz_core::nemo::PROJECT_ADDRESS
+        && project
+            .default_repo_clone_urls
+            .iter()
+            .filter_map(|value| canonical_github_repository(value))
+            .any(|repository| repository == buzz_core::nemo::REPOSITORY);
+
+    if managed_nemo {
+        let (checkout, availability) = match preferred_checkout {
+            Some(path) => (
+                validated_checkout(path, &expected_origins)?.ok_or_else(|| {
+                    "Nemo job checkout does not match its authoritative repository".to_owned()
+                })?,
+                "The runtime verified the Nemo checkout for this session.".to_owned(),
+            ),
+            None => match discover_checkout(harness_cwd, project, &expected_origins)? {
+                Some(checkout) => (
+                    checkout,
+                    "The runtime verified the Nemo checkout for this session.".to_owned(),
+                ),
+                None => (
+                    harness_cwd.to_path_buf(),
+                    "Runtime status: the Nemo repository checkout is unavailable. Do not read, write, or claim Git access until the runtime supplies a verified Nemo checkout."
+                        .to_owned(),
+                ),
+            },
+        };
+        return Ok(Some(ProjectPreload {
+            working_directory: checkout,
+            instructions: Some(format!(
+                "{}\n\nRuntime binding: these are mandatory built-in system instructions for every managed session in the dedicated Nemo workspace. Their authority is limited to {}. {} Source: {}",
+                NEMO_WORKSPACE_INSTRUCTIONS.trim(),
+                buzz_core::nemo::REPOSITORY,
+                availability,
+                buzz_core::nemo::INSTRUCTION_SOURCE,
+            )),
+        }));
+    }
+
     let checkout = match preferred_checkout {
         Some(path) => validated_checkout(path, &expected_origins)?,
         None => discover_checkout(harness_cwd, project, &expected_origins)?,
@@ -148,6 +189,21 @@ fn discover_checkout(
         .filter(|value| valid_component(value))
     {
         push_unique(&mut names, repo_id.to_string());
+    }
+
+    // The dedicated Nemo workspace has one conventional checkout. Prefer it
+    // deterministically so ordinary sibling worktrees never make instruction
+    // loading ambiguous.
+    if project.coordinate == buzz_core::nemo::PROJECT_ADDRESS {
+        let canonical = repos.join("nemo");
+        if let Ok(canonical) = canonical.canonicalize() {
+            if canonical.starts_with(&repos)
+                && canonical.is_dir()
+                && validated_checkout(&canonical, expected_origins)?.is_some()
+            {
+                return Ok(Some(canonical));
+            }
+        }
     }
 
     let mut matches = Vec::new();
@@ -673,6 +729,12 @@ mod tests {
         }
     }
 
+    fn managed_project() -> PromptProjectInfo {
+        let mut project = project();
+        project.coordinate = buzz_core::nemo::PROJECT_ADDRESS.into();
+        project
+    }
+
     fn fixture() -> (TempDir, PathBuf) {
         let temp = TempDir::new().expect("tempdir");
         let checkout = temp.path().join("REPOS/nemo");
@@ -720,6 +782,20 @@ mod tests {
             "the complete declared skill must enter the preload without truncation"
         );
         assert!(!instructions.contains(temp.path().to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn managed_nemo_instructions_are_builtin_first_and_checkout_failure_is_explicit() {
+        let harness = TempDir::new().expect("harness");
+        let preload = resolve(harness.path(), &managed_project(), None, None)
+            .expect("managed preload")
+            .expect("builtin instructions");
+        assert_eq!(preload.working_directory, harness.path());
+        let instructions = preload.instructions.expect("instructions");
+        assert!(instructions.starts_with("<!-- nemo-golden-rules:start -->"));
+        assert!(instructions.contains("NEMO-A2A-1"));
+        assert!(instructions.contains("repository checkout is unavailable"));
+        assert!(instructions.contains(buzz_core::nemo::INSTRUCTION_SOURCE));
     }
 
     #[test]

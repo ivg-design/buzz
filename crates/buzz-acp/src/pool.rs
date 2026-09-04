@@ -1457,22 +1457,26 @@ async fn create_session_and_apply_model_at(
     // its own `<core-memory>` boundary, and canvas carries its own
     // `<channel-canvas>` boundary; both are appended with a blank-line separator.
     let is_goose = agent.agent_name == "goose";
+    let ordinary_instructions = with_team(
+        framed_system_prompt(
+            working_directory,
+            ctx.base_prompt.as_deref(),
+            ctx.system_prompt.as_deref(),
+        ),
+        ctx.team_instructions.as_deref(),
+    );
+    let managed_nemo = ctx.workspace_project_address.as_deref()
+        == Some(buzz_core::nemo::PROJECT_ADDRESS)
+        && ctx.workspace_project_repository.as_deref() == Some(buzz_core::nemo::REPOSITORY)
+        && project_instructions.is_some();
+    let standing_instructions = if managed_nemo {
+        with_project_instructions_first(ordinary_instructions, project_instructions)
+    } else {
+        with_project_instructions(ordinary_instructions, project_instructions)
+    };
     let combined_system_prompt = with_canvas(
         with_huddle_instructions(
-            with_core(
-                with_project_instructions(
-                    with_team(
-                        framed_system_prompt(
-                            working_directory,
-                            ctx.base_prompt.as_deref(),
-                            ctx.system_prompt.as_deref(),
-                        ),
-                        ctx.team_instructions.as_deref(),
-                    ),
-                    project_instructions,
-                ),
-                agent_core,
-            ),
+            with_core(standing_instructions, agent_core),
             channel.huddle_instructions,
         ),
         channel.canvas,
@@ -2220,6 +2224,30 @@ fn with_project_instructions(prompt: Option<String>, instructions: Option<&str>)
     }
 }
 
+/// Put the dedicated workspace contract before every generic, agent, memory,
+/// huddle, and canvas section. Its first lines contain Nemo's golden rules,
+/// which must be the first substantive instructions every managed agent sees.
+fn with_project_instructions_first(
+    prompt: Option<String>,
+    instructions: Option<&str>,
+) -> Option<String> {
+    let instructions = instructions
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    match (instructions, prompt) {
+        (Some(instructions), Some(prompt)) => Some(format!(
+            "{}\n\n{prompt}",
+            crate::prompt_framing::semantic_section("project-instructions", instructions)
+        )),
+        (Some(instructions), None) => Some(crate::prompt_framing::semantic_section(
+            "project-instructions",
+            instructions,
+        )),
+        (None, Some(prompt)) => Some(prompt),
+        (None, None) => None,
+    }
+}
+
 /// Legacy agents receive standing context in the first user message. Preserve
 /// Project provenance in an explicit heading inside the existing team slot.
 fn legacy_team_with_project(
@@ -2544,12 +2572,26 @@ pub async fn run_prompt_task(
                 );
                 return;
             };
-            let Some(revision) = ctx
+            let revision = ctx
                 .workspace_project_revision
                 .as_deref()
                 .map(str::trim)
                 .filter(|revision| !revision.is_empty())
-            else {
+                .map(str::to_owned)
+                .or_else(|| {
+                    let repository_matches = project
+                        .default_repo_clone_urls
+                        .iter()
+                        .filter_map(|value| {
+                            crate::project_preload::canonical_github_repository(value)
+                        })
+                        .any(|value| value == buzz_core::nemo::REPOSITORY);
+                    (project.coordinate == buzz_core::nemo::PROJECT_ADDRESS
+                        && home_channel.to_string() == buzz_core::nemo::HOME_CHANNEL
+                        && repository_matches)
+                        .then(|| buzz_core::nemo::INSTRUCTION_SOURCE.to_owned())
+                });
+            let Some(revision) = revision else {
                 send_prompt_result(
                     &result_tx,
                     &turn_id,
@@ -2565,7 +2607,7 @@ pub async fn run_prompt_task(
             Some(WorkspaceInstructionBinding {
                 home_channel,
                 project: project.clone(),
-                revision: revision.to_string(),
+                revision,
             })
         }
         None => None,
@@ -2616,6 +2658,7 @@ pub async fn run_prompt_task(
             let instruction_revision = if ctx.workspace_project_channel.is_some() {
                 match ctx.workspace_project_revision.as_deref() {
                     Some(revision) => Some(revision),
+                    None if project.coordinate == buzz_core::nemo::PROJECT_ADDRESS => None,
                     None => {
                         send_prompt_result(
                             &result_tx,
@@ -2675,8 +2718,16 @@ pub async fn run_prompt_task(
     let project_instructions = project_preload
         .as_ref()
         .and_then(|preload| preload.instructions.as_deref());
-    let legacy_team_instructions =
-        legacy_team_with_project(ctx.team_instructions.as_deref(), project_instructions);
+    let managed_nemo_instructions = (ctx.workspace_project_address.as_deref()
+        == Some(buzz_core::nemo::PROJECT_ADDRESS)
+        && ctx.workspace_project_repository.as_deref() == Some(buzz_core::nemo::REPOSITORY))
+    .then_some(project_instructions)
+    .flatten();
+    let legacy_team_instructions = if managed_nemo_instructions.is_some() {
+        ctx.team_instructions.clone()
+    } else {
+        legacy_team_with_project(ctx.team_instructions.as_deref(), project_instructions)
+    };
 
     //
     // Core memory is delivered inside the system prompt the harness already
@@ -2971,6 +3022,7 @@ pub async fn run_prompt_task(
     // whenever a session is invalidated — so the replacement session re-delivers
     // rather than leaving the agent unbriefed.
     let standing = crate::queue::StandingContext {
+        leading_project_instructions: managed_nemo_instructions,
         base_prompt: ctx.base_prompt.as_deref(),
         system_prompt: ctx.system_prompt.as_deref(),
         team_instructions: legacy_team_instructions.as_deref(),
@@ -3235,6 +3287,7 @@ pub async fn run_prompt_task(
         crate::queue::format_prompt(
             b,
             &crate::queue::FormatPromptArgs {
+                leading_project_instructions: standing.leading_project_instructions,
                 agent_core: standing.agent_core,
                 huddle_instructions: standing.huddle_instructions,
                 channel_info: channel_info.as_ref(),
@@ -6000,6 +6053,7 @@ mod tests {
 
     fn full_standing() -> crate::queue::StandingContext<'static> {
         crate::queue::StandingContext {
+            leading_project_instructions: None,
             base_prompt: Some("be helpful"),
             system_prompt: Some("you are Eva"),
             team_instructions: Some("ship small"),

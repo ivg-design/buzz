@@ -1,5 +1,98 @@
 use super::super::{ProjectGitCommitParams, ProjectGitParams};
 use super::*;
+use std::process::Command;
+
+fn managed_nemo_relay_without_github_login() -> (tempfile::TempDir, TrustedRelay) {
+    let harness = tempfile::tempdir().expect("harness");
+    let checkout = harness.path().join("REPOS/nemo");
+    std::fs::create_dir_all(&checkout).expect("checkout");
+    let run = |args: &[&str]| {
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(&checkout)
+            .args(args)
+            .status()
+            .expect("Git fixture")
+            .success());
+    };
+    run(&["init", "--quiet"]);
+    run(&["config", "user.name", "Buzz Test"]);
+    run(&["config", "user.email", "buzz-test@example.invalid"]);
+    std::fs::write(checkout.join("fixture.txt"), "fixture\n").expect("fixture");
+    run(&["add", "fixture.txt"]);
+    run(&["commit", "--quiet", "-m", "fixture"]);
+    run(&[
+        "remote",
+        "add",
+        "origin",
+        "https://github.com/mysteropodes/nemo.git",
+    ]);
+    let keys = nostr::Keys::generate();
+    let relay = TrustedRelay::new(super::super::TrustedConfig {
+        relay_url: buzz_core::nemo::RELAY_URL.into(),
+        owner_pubkey: keys.public_key().to_hex(),
+        owner_github_login: None,
+        keys,
+        auth_tag: None,
+        auth_tag_json: None,
+        grants: super::super::GrantSet::load_with_nemo(harness.path(), None, None, true)
+            .expect("managed grants"),
+        a2a_channel_id: Some(buzz_core::nemo::HOME_CHANNEL.into()),
+        session_channel_id: None,
+        session_thread_root_id: None,
+        job_operation_id: None,
+        job_request_event_id: None,
+        session_working_directory: None,
+        github_credentials: Default::default(),
+        allow_insecure_loopback: false,
+    })
+    .expect("trusted relay");
+    (harness, relay)
+}
+
+fn managed_dispatch_params(worktree_id: Option<&str>) -> A2aDispatchParams {
+    A2aDispatchParams {
+        operation_id: "a580ca9b-47b4-4af9-b22a-1068778f26c6".into(),
+        idempotency_key: "nemo-auto".into(),
+        coordinator_epoch: 1,
+        recipient_pubkey: "b".repeat(64),
+        capability: "rust".into(),
+        summary: "Implement bounded Nemo work".into(),
+        acceptance: vec!["Focused tests pass".into()],
+        worktree_id: worktree_id.map(str::to_owned),
+        paths: vec!["new/source.rs".into()],
+        contracts: vec![],
+        github_issue: None,
+        github_pr: None,
+        github_run: None,
+        supersedes_event_id: None,
+        ttl_seconds: 600,
+    }
+}
+
+#[tokio::test]
+async fn managed_nemo_dispatch_needs_no_github_login_and_uses_portable_worktree_ids() {
+    let (_harness, relay) = managed_nemo_relay_without_github_login();
+    let request = build_request(&relay, managed_dispatch_params(Some("worker_2")))
+        .await
+        .expect("managed dispatch");
+    let JobEvent::Request(request) = request else {
+        panic!("expected request");
+    };
+    assert_eq!(
+        request.common.sponsor.github_login,
+        buzz_core::nemo::UNLINKED_GITHUB_LOGIN
+    );
+    assert_eq!(request.common.repository.worktree_id, "worker_2");
+    assert_eq!(request.common.repository.branch, "codex/worker_2");
+
+    for invalid in ["team/worker", ".hidden", "trailing."] {
+        let error = build_request(&relay, managed_dispatch_params(Some(invalid)))
+            .await
+            .expect_err("receiver-incompatible worktree id");
+        assert!(error.contains("outside the Nemo repository policy"));
+    }
+}
 
 #[test]
 fn tool_surface_has_no_lifecycle_outcome_parameters() {
@@ -113,6 +206,7 @@ fn job_bound_relay() -> Arc<TrustedRelay> {
             owner_pubkey: "b".repeat(64),
             owner_github_login: Some("owner".into()),
             grants: super::super::GrantSet::default(),
+            a2a_channel_id: None,
             session_channel_id: Some("3580ca9b-47b4-4af9-b22a-1068778f26c6".into()),
             session_thread_root_id: None,
             job_operation_id: Some("a580ca9b-47b4-4af9-b22a-1068778f26c6".into()),
@@ -137,7 +231,7 @@ async fn job_session_cannot_dispatch_a_sibling_operation() {
             capability: "rust".into(),
             summary: "must not publish".into(),
             acceptance: vec!["no event".into()],
-            worktree_id: "other".into(),
+            worktree_id: Some("other".into()),
             paths: vec!["crates".into()],
             contracts: vec![],
             github_issue: None,

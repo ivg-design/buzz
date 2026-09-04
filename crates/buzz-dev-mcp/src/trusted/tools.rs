@@ -23,7 +23,10 @@ pub struct A2aDispatchParams {
     pub capability: String,
     pub summary: String,
     pub acceptance: Vec<String>,
-    pub worktree_id: String,
+    /// Optional coordination label. The Nemo workspace derives one from the
+    /// operation ID when omitted and binds the signed request to it.
+    #[serde(default)]
+    pub worktree_id: Option<String>,
     pub paths: Vec<String>,
     #[serde(default)]
     pub contracts: Vec<String>,
@@ -238,19 +241,21 @@ async fn build_request(
     if params.coordinator_epoch != 1 {
         return Err("initial A2A requests require coordinator_epoch=1".into());
     }
+    let worktree_id = requested_worktree_id(&params)?;
     let grant = relay
         .grants
         .outbound(
             &params.recipient_pubkey,
             &params.capability,
             &params.paths,
-            &params.worktree_id,
+            &worktree_id,
         )
         .await?;
-    let github_login = relay
-        .owner_github_login
-        .clone()
-        .ok_or_else(|| "outbound A2A requires BUZZ_ACP_OWNER_GITHUB_LOGIN".to_owned())?;
+    let github_login = match relay.owner_github_login.clone() {
+        Some(login) => login,
+        None if relay.grants.is_managed_nemo() => buzz_core::nemo::UNLINKED_GITHUB_LOGIN.into(),
+        None => return Err("outbound A2A requires BUZZ_ACP_OWNER_GITHUB_LOGIN".into()),
+    };
     let request = JobRequest {
         common: common_from(grant, relay, &params, github_login),
         capability: params.capability,
@@ -307,7 +312,10 @@ async fn build_superseding_request(
         || params.capability != old.capability
         || params.summary != old.summary
         || params.acceptance != old.acceptance
-        || params.worktree_id != old.common.repository.worktree_id
+        || params
+            .worktree_id
+            .as_deref()
+            .is_some_and(|value| value != old.common.repository.worktree_id)
         || params.paths != old.common.repository.paths
         || params.contracts != old.common.repository.contracts
         || params.github_issue != old.common.repository.github_issue
@@ -378,11 +386,30 @@ fn common_from(
     }
 }
 
-fn ensure_session_channel(relay: &TrustedRelay, job: &JobEvent) -> Result<(), String> {
-    let bound = relay
-        .session_channel_id
+fn requested_worktree_id(params: &A2aDispatchParams) -> Result<String, String> {
+    if let Some(value) = params
+        .worktree_id
         .as_deref()
-        .ok_or_else(|| "A2A dispatch requires a channel-bound session".to_owned())?;
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(value.to_owned());
+    }
+    let operation = uuid::Uuid::parse_str(&params.operation_id)
+        .map_err(|_| "operation_id must be a UUID before deriving a worktree".to_owned())?;
+    Ok(format!(
+        "buzz-{}",
+        operation
+            .simple()
+            .to_string()
+            .chars()
+            .take(12)
+            .collect::<String>()
+    ))
+}
+
+fn ensure_session_channel(relay: &TrustedRelay, job: &JobEvent) -> Result<(), String> {
+    let bound = relay.bound_a2a_channel()?;
     if bound != job.common().project.home_channel {
         return Err("session channel does not match the locally granted project channel".into());
     }
@@ -390,7 +417,7 @@ fn ensure_session_channel(relay: &TrustedRelay, job: &JobEvent) -> Result<(), St
 }
 
 fn ensure_control_channel(relay: &TrustedRelay, common: &JobCommon) -> Result<(), String> {
-    if relay.session_channel_id.as_deref() != Some(common.project.home_channel.as_str()) {
+    if relay.bound_a2a_channel()? != common.project.home_channel {
         return Err("session channel binding does not match the request".into());
     }
     if relay

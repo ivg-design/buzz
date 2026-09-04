@@ -80,9 +80,15 @@ pub async fn validate_job_event(
 ) -> Result<ValidatedJob, JobAuthError> {
     let job = JobEvent::parse(event).map_err(|error| JobAuthError::Invalid(error.to_string()))?;
     let common = job.common();
+    let managed_nemo = is_managed_nemo_tenant(tenant, state, &job);
     // This shape is only a candidate until the locked request/predecessor
     // checks below prove it is the accepted worker closing its active chain.
     let membership_revoked_terminal = is_membership_revoked_terminal(&job);
+    if managed_nemo && membership_revoked_terminal {
+        return Err(JobAuthError::Restricted(
+            "Nemo workspace membership follows current community enrollment".into(),
+        ));
+    }
     let lock_domains = match &job {
         JobEvent::Request(_) => vec![
             format!(
@@ -137,7 +143,7 @@ pub async fn validate_job_event(
         .home_channel
         .parse()
         .map_err(|_| JobAuthError::Invalid("project.home_channel must be a UUID".into()))?;
-    if !membership_revoked_terminal {
+    if !membership_revoked_terminal && !managed_nemo {
         match state
             .is_member_cached(tenant.community(), channel_id, &actor.to_bytes())
             .await
@@ -157,20 +163,24 @@ pub async fn validate_job_event(
     }
     let recipient = PublicKey::parse(&common.recipient_pubkey)
         .map_err(|_| JobAuthError::Invalid("recipient_pubkey must be a public key".into()))?;
-    match state
-        .is_member_cached(tenant.community(), channel_id, &recipient.to_bytes())
-        .await
-    {
-        Ok(true) => {}
-        Ok(false) => {
-            return Err(JobAuthError::Restricted(
-                "job recipient must be a direct member of the project home channel".into(),
-            ))
-        }
-        Err(error) => {
-            return Err(JobAuthError::Internal(format!(
-                "checking job recipient channel membership: {error}"
-            )))
+    if managed_nemo {
+        require_current_relay_membership(tenant, state, &recipient, "job recipient").await?;
+    } else {
+        match state
+            .is_member_cached(tenant.community(), channel_id, &recipient.to_bytes())
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(JobAuthError::Restricted(
+                    "job recipient must be a direct member of the project home channel".into(),
+                ))
+            }
+            Err(error) => {
+                return Err(JobAuthError::Internal(format!(
+                    "checking job recipient channel membership: {error}"
+                )))
+            }
         }
     }
 
@@ -200,11 +210,16 @@ pub async fn validate_job_event(
     // owner rebinding, and Project replacement therefore cannot commit between
     // validation and storage.
     require_current_relay_membership_locked(tenant, &mut lock, &actor, "job signer").await?;
-    if !membership_revoked_terminal {
+    if !membership_revoked_terminal && !managed_nemo {
         require_channel_member_locked(tenant, &mut lock, channel_id, &actor, "job signer").await?;
     }
-    require_channel_member_locked(tenant, &mut lock, channel_id, &recipient, "job recipient")
-        .await?;
+    if managed_nemo {
+        require_current_relay_membership_locked(tenant, &mut lock, &recipient, "job recipient")
+            .await?;
+    } else {
+        require_channel_member_locked(tenant, &mut lock, channel_id, &recipient, "job recipient")
+            .await?;
+    }
     let project = validate_project_binding_locked(tenant, &mut lock, &job).await?;
     // Every transition, including the receiver's privileged-operation marker,
     // re-resolves and locks the current Project -> repository announcement.
@@ -258,14 +273,16 @@ pub async fn validate_job_event(
         )
         .await?;
         require_registered_agent_locked(tenant, &mut lock, &worker, "stored job recipient").await?;
-        require_channel_member_locked(
-            tenant,
-            &mut lock,
-            channel_id,
-            &requester,
-            "stored job requester",
-        )
-        .await?;
+        if !managed_nemo {
+            require_channel_member_locked(
+                tenant,
+                &mut lock,
+                channel_id,
+                &requester,
+                "stored job requester",
+            )
+            .await?;
+        }
         if membership_revoked_terminal {
             require_channel_nonmember_locked(
                 tenant,
@@ -275,7 +292,7 @@ pub async fn validate_job_event(
                 "stored job recipient",
             )
             .await?;
-        } else {
+        } else if !managed_nemo {
             require_channel_member_locked(
                 tenant,
                 &mut lock,
@@ -307,8 +324,16 @@ pub async fn validate_job_event(
         if let Some(handoff_to) = &control.handoff_to {
             let target = PublicKey::parse(handoff_to)
                 .map_err(|_| JobAuthError::Invalid("handoff_to must be a public key".into()))?;
-            require_channel_member_locked(tenant, &mut lock, channel_id, &target, "handoff target")
+            if !managed_nemo {
+                require_channel_member_locked(
+                    tenant,
+                    &mut lock,
+                    channel_id,
+                    &target,
+                    "handoff target",
+                )
                 .await?;
+            }
             require_registered_agent_locked(tenant, &mut lock, &target, "handoff target").await?;
         }
     }
@@ -320,6 +345,24 @@ pub async fn validate_job_event(
         lock,
         existing: None,
     })
+}
+
+pub(super) fn is_managed_nemo_tenant(
+    tenant: &TenantContext,
+    state: &AppState,
+    job: &JobEvent,
+) -> bool {
+    let common = job.common();
+    tenant.host() == buzz_core::nemo::RELAY_HOST
+        && buzz_core::relay::normalize_relay_url(&state.config.relay_url)
+            .ok()
+            .as_deref()
+            == Some(buzz_core::nemo::RELAY_URL)
+        && buzz_core::nemo::matches(
+            &common.project.address,
+            &common.project.home_channel,
+            &common.repository.canonical,
+        )
 }
 
 pub(super) fn validate_job_time(

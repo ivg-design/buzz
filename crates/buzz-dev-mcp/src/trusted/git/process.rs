@@ -491,7 +491,8 @@ pub(super) async fn fetch_branch(
             resolve_system_git().ok_or_else(|| "trusted system git was not found".to_owned())?;
         let private = PrivateBareRepo::create(&git, cancellation).await?;
         private.configure_for_network(&checkout.repository)?;
-        let credential = relay.github_credentials.records_for(&checkout.repository)?;
+        let credentials = credentials_for_operation(relay, checkout).await?;
+        let credential = credentials.records_for(&checkout.repository)?;
         let source = format!("refs/heads/{}:refs/buzz/remote", checkout.branch);
         run_network_git(
             &git,
@@ -580,10 +581,11 @@ pub(super) async fn push_commit(
             )
             .await?;
         let branch_ref = format!("refs/heads/{}", checkout.branch);
+        let credentials = credentials_for_operation(relay, checkout).await?;
         push_ref_reconciled(
             &git,
             &private,
-            &relay.github_credentials,
+            &credentials,
             &checkout.repository,
             &branch_ref,
             &checkout.head_sha,
@@ -591,6 +593,29 @@ pub(super) async fn push_commit(
         )
         .await
     }
+}
+
+#[cfg(target_os = "macos")]
+async fn credentials_for_operation(
+    relay: &TrustedRelay,
+    checkout: &TrustedGitCheckout,
+) -> Result<GitHubCredentialStore, String> {
+    if relay
+        .github_credentials
+        .records_for(&checkout.repository)
+        .is_ok()
+    {
+        return Ok(relay.github_credentials.clone());
+    }
+    if checkout.repository_wide && checkout.repository == buzz_core::nemo::REPOSITORY {
+        return capture_operator_github_credentials(std::slice::from_ref(&checkout.repository))
+            .await
+            .map_err(|_| {
+                "Nemo GitHub authentication is unavailable; sign in with GitHub before fetch or push"
+                    .to_owned()
+            });
+    }
+    Err("operator GitHub credentials were not captured for this repository".into())
 }
 
 #[cfg(target_os = "macos")]
@@ -1594,6 +1619,7 @@ mod tests {
             auth_tag_json: None,
             owner_github_login: None,
             grants: GrantSet::default(),
+            a2a_channel_id: None,
             session_channel_id: None,
             session_thread_root_id: None,
             job_operation_id: None,
@@ -2006,6 +2032,7 @@ mod tests {
             head_sha: first.clone(),
             branch: "main".to_owned(),
             path_prefixes: vec!["tracked.txt".to_owned()],
+            repository_wide: false,
         };
         let relay = test_relay();
         for full_ref in ["refs/heads/main", "refs/remotes/origin/main"] {

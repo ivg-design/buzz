@@ -63,6 +63,7 @@ pub(super) struct TrustedGitCheckout {
     pub(super) head_sha: String,
     pub(super) branch: String,
     pub(super) path_prefixes: Vec<String>,
+    pub(super) repository_wide: bool,
 }
 
 /// Validated local, operator-controlled collaboration grants.
@@ -72,14 +73,34 @@ pub(super) struct TrustedGitCheckout {
 #[derive(Clone, Default)]
 pub struct GrantSet {
     grants: Vec<JobGrant>,
+    nemo_workspace: bool,
+    nemo_checkout: Option<NemoCheckout>,
+}
+
+#[derive(Clone)]
+struct NemoCheckout {
+    root: PathBuf,
+    git_common_dir: PathBuf,
 }
 
 impl GrantSet {
-    pub fn load(
-        _cwd: &Path,
+    pub fn load(cwd: &Path, inline: Option<String>, file: Option<PathBuf>) -> Result<Self, String> {
+        Self::load_with_nemo(cwd, inline, file, false)
+    }
+
+    pub(crate) fn load_with_nemo(
+        cwd: &Path,
         inline: Option<String>,
         file: Option<PathBuf>,
+        nemo_workspace: bool,
     ) -> Result<Self, String> {
+        if nemo_workspace {
+            return Ok(Self {
+                grants: Vec::new(),
+                nemo_workspace: true,
+                nemo_checkout: discover_nemo_checkout(cwd),
+            });
+        }
         if inline.is_some() && file.is_some() {
             return Err(
                 "set only one of BUZZ_ACP_JOB_GRANTS_JSON or BUZZ_ACP_JOB_GRANTS_FILE".into(),
@@ -111,16 +132,32 @@ impl GrantSet {
         }
         Ok(Self {
             grants: document.grants,
+            nemo_workspace: false,
+            nemo_checkout: None,
         })
     }
 
     pub fn channels(&self) -> Vec<String> {
-        self.grants
+        let mut channels = self
+            .grants
             .iter()
             .map(|grant| grant.home_channel.clone())
             .collect::<BTreeSet<_>>()
             .into_iter()
-            .collect()
+            .collect::<Vec<_>>();
+        if self.nemo_workspace
+            && !channels
+                .iter()
+                .any(|value| value == buzz_core::nemo::HOME_CHANNEL)
+        {
+            channels.push(buzz_core::nemo::HOME_CHANNEL.into());
+            channels.sort();
+        }
+        channels
+    }
+
+    pub(crate) fn is_managed_nemo(&self) -> bool {
+        self.nemo_workspace
     }
 
     /// Canonical repositories whose explicit grant requires an operator
@@ -148,6 +185,12 @@ impl GrantSet {
             .ok_or_else(|| "trusted Git requires a receiver-verified checkout".to_owned())?
             .canonicalize()
             .map_err(|_| "trusted Git checkout is unavailable".to_owned())?;
+        if let Some(nemo) = &self.nemo_checkout {
+            let common = resolve_git_common_dir(&root)?;
+            if common == nemo.git_common_dir {
+                return Ok(common);
+            }
+        }
         let keys = self
             .grants
             .iter()
@@ -168,6 +211,22 @@ impl GrantSet {
         paths: &[String],
         worktree_id: &str,
     ) -> Result<GrantMatch, String> {
+        if self.nemo_workspace {
+            let checkout = self
+                .nemo_checkout
+                .as_ref()
+                .ok_or_else(|| "the Nemo repository checkout is unavailable".to_owned())?;
+            validate_nemo_request_fields(recipient, capability, paths, worktree_id)?;
+            let observed = inspect_nemo_source(checkout).await?;
+            return Ok(GrantMatch {
+                project_address: buzz_core::nemo::PROJECT_ADDRESS.into(),
+                home_channel: buzz_core::nemo::HOME_CHANNEL.into(),
+                repository: buzz_core::nemo::REPOSITORY.into(),
+                base_sha: observed.base_sha,
+                branch: format!("codex/{worktree_id}"),
+                worktree_id: worktree_id.into(),
+            });
+        }
         let mut matches = Vec::new();
         for grant in &self.grants {
             let statically_allowed = grant.requester_pubkeys.iter().any(|peer| peer == recipient)
@@ -201,6 +260,12 @@ impl GrantSet {
 
     pub fn allows_event(&self, job: &buzz_core::job::JobEvent, signer: &str) -> bool {
         let common = job.common();
+        if self.nemo_workspace && nemo_common_allowed(common, signer) {
+            return match job {
+                buzz_core::job::JobEvent::Request(request) => valid_token(&request.capability),
+                _ => true,
+            };
+        }
         self.grants.iter().any(|grant| {
             grant.project_address == common.project.address
                 && grant.home_channel == common.project.home_channel
@@ -242,6 +307,18 @@ impl GrantSet {
         recipient: &str,
         capability: &str,
     ) -> bool {
+        if self.nemo_workspace
+            && buzz_core::nemo::matches(
+                &project.address,
+                &project.home_channel,
+                &repository.canonical,
+            )
+            && valid_pubkey(recipient)
+            && valid_token(capability)
+            && valid_nemo_repository_scope(repository)
+        {
+            return true;
+        }
         self.grants.iter().any(|grant| {
             grant.project_address == project.address
                 && grant.home_channel == project.home_channel
@@ -283,6 +360,22 @@ impl GrantSet {
         let common = &request.common;
         if common.project.home_channel != channel {
             return Err("trusted Git request does not match the session channel".into());
+        }
+        if let Some(nemo) = &self.nemo_checkout {
+            if buzz_core::nemo::matches(
+                &common.project.address,
+                &common.project.home_channel,
+                &common.repository.canonical,
+            ) && valid_nemo_repository_scope(&common.repository)
+                && matches!(operation.as_str(), "commit" | "fetch" | "push")
+            {
+                return inspect_nemo_trusted_git_checkout(
+                    nemo,
+                    &working_directory,
+                    &common.repository,
+                )
+                .await;
+            }
         }
         let candidate_grants = self.grants.iter().filter(|grant| {
             grant.home_channel == channel
@@ -336,6 +429,170 @@ impl GrantSet {
 struct Checkout {
     base_sha: String,
     branch: String,
+}
+
+fn discover_nemo_checkout(cwd: &Path) -> Option<NemoCheckout> {
+    let repos = cwd.join("REPOS").canonicalize().ok();
+    let mut candidates = Vec::new();
+    if let Some(repos) = &repos {
+        candidates.push((repos.join("nemo"), Some(repos)));
+        candidates.push((repos.join("mysteropodes--nemo"), Some(repos)));
+    }
+    candidates.push((cwd.to_path_buf(), None));
+    for (candidate, boundary) in candidates {
+        let Ok(root) = candidate.canonicalize() else {
+            continue;
+        };
+        if !root.is_dir()
+            || boundary.is_some_and(|boundary| !root.starts_with(boundary))
+            || !root.join(".git").exists()
+        {
+            continue;
+        }
+        if let Ok(git_common_dir) = resolve_git_common_dir(&root) {
+            return Some(NemoCheckout {
+                root,
+                git_common_dir,
+            });
+        }
+    }
+    None
+}
+
+fn validate_nemo_request_fields(
+    recipient: &str,
+    capability: &str,
+    paths: &[String],
+    worktree_id: &str,
+) -> Result<(), String> {
+    if !valid_pubkey(recipient)
+        || !valid_token(capability)
+        || paths.is_empty()
+        || paths.iter().any(|path| !valid_relative_path(path))
+        || !buzz_core::nemo::valid_worktree_component(worktree_id)
+        || !valid_branch(&format!("codex/{worktree_id}"))
+    {
+        return Err("A2A request fields are outside the Nemo repository policy".into());
+    }
+    Ok(())
+}
+
+fn valid_nemo_repository_scope(repository: &buzz_core::job::JobRepository) -> bool {
+    repository.canonical == buzz_core::nemo::REPOSITORY
+        && valid_sha(&repository.base_sha)
+        && buzz_core::nemo::valid_worktree_component(&repository.worktree_id)
+        && repository.branch == format!("codex/{}", repository.worktree_id)
+        && !repository.paths.is_empty()
+        && repository
+            .paths
+            .iter()
+            .all(|path| valid_relative_path(path))
+}
+
+fn nemo_common_allowed(common: &buzz_core::job::JobCommon, signer: &str) -> bool {
+    buzz_core::nemo::matches(
+        &common.project.address,
+        &common.project.home_channel,
+        &common.repository.canonical,
+    ) && (common.sender_pubkey == signer || common.recipient_pubkey == signer)
+        && valid_pubkey(&common.sender_pubkey)
+        && valid_pubkey(&common.recipient_pubkey)
+        && valid_nemo_repository_scope(&common.repository)
+}
+
+async fn inspect_nemo_source(checkout: &NemoCheckout) -> Result<Checkout, String> {
+    let root = checkout
+        .root
+        .canonicalize()
+        .map_err(|_| "the Nemo repository checkout is unavailable".to_owned())?;
+    let top = PathBuf::from(git(&root, &["rev-parse", "--show-toplevel"]).await?);
+    let remote = git(
+        &root,
+        &[
+            "config",
+            "--local",
+            "--no-includes",
+            "--get",
+            "remote.origin.url",
+        ],
+    )
+    .await?;
+    let common = PathBuf::from(
+        git(
+            &root,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )
+        .await?,
+    )
+    .canonicalize()
+    .map_err(|_| "the Nemo Git directory is unavailable".to_owned())?;
+    if top.canonicalize().ok().as_ref() != Some(&root)
+        || canonical_github_remote(&remote)? != buzz_core::nemo::REPOSITORY
+        || common != checkout.git_common_dir
+    {
+        return Err("the Nemo checkout no longer matches the managed workspace".into());
+    }
+    Ok(Checkout {
+        base_sha: git(&root, &["rev-parse", "HEAD"]).await?,
+        branch: git(&root, &["symbolic-ref", "--quiet", "--short", "HEAD"]).await?,
+    })
+}
+
+async fn inspect_nemo_trusted_git_checkout(
+    nemo: &NemoCheckout,
+    root: &Path,
+    repository: &buzz_core::job::JobRepository,
+) -> Result<TrustedGitCheckout, String> {
+    let top = PathBuf::from(git(root, &["rev-parse", "--show-toplevel"]).await?);
+    let head_sha = git(root, &["rev-parse", "HEAD"]).await?;
+    let branch = git(root, &["symbolic-ref", "--quiet", "--short", "HEAD"]).await?;
+    let remote = git(
+        root,
+        &[
+            "config",
+            "--local",
+            "--no-includes",
+            "--get",
+            "remote.origin.url",
+        ],
+    )
+    .await?;
+    let common = PathBuf::from(
+        git(
+            root,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )
+        .await?,
+    )
+    .canonicalize()
+    .map_err(|_| "the Nemo Git directory is unavailable".to_owned())?;
+    if top.canonicalize().ok().as_deref() != Some(root)
+        || canonical_github_remote(&remote)? != buzz_core::nemo::REPOSITORY
+        || common != nemo.git_common_dir
+        || branch != repository.branch
+        || !git_status(
+            root,
+            &[
+                "merge-base",
+                "--is-ancestor",
+                &repository.base_sha,
+                &head_sha,
+            ],
+        )
+        .await?
+    {
+        return Err("the job checkout no longer matches its signed Nemo scope".into());
+    }
+    Ok(TrustedGitCheckout {
+        root: root.to_path_buf(),
+        git_common_dir: common,
+        repository: buzz_core::nemo::REPOSITORY.into(),
+        base_sha: repository.base_sha.clone(),
+        head_sha,
+        branch,
+        path_prefixes: repository.paths.clone(),
+        repository_wide: true,
+    })
 }
 
 async fn inspect_checkout(grant: &JobGrant) -> Result<Checkout, String> {
@@ -439,6 +696,7 @@ async fn inspect_trusted_git_checkout(
         // The accepted signed request may be narrower than the operator's
         // reusable grant. Git operations use the request's exact path scope.
         path_prefixes: request_paths.to_vec(),
+        repository_wide: false,
     })
 }
 

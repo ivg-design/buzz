@@ -16,6 +16,8 @@ pub(crate) const WORKSPACE_PROJECT_ADDRESS_ENV: &str = "BUZZ_ACP_WORKSPACE_PROJE
 pub(crate) const WORKSPACE_PROJECT_REPOSITORY_ENV: &str = "BUZZ_ACP_WORKSPACE_PROJECT_REPOSITORY";
 pub(crate) const WORKSPACE_PROJECT_REVISION_ENV: &str = "BUZZ_ACP_WORKSPACE_PROJECT_REVISION";
 
+pub(crate) const BUILTIN_INSTRUCTION_REVISION: &str = "builtin";
+
 const STORE_KEY: &str = "workspace-projects.v1";
 const SCHEMA_VERSION: u32 = 1;
 const MAX_PROJECTS: usize = 128;
@@ -30,6 +32,23 @@ pub struct WorkspaceProject {
     pub repository: String,
     pub display_name: String,
     pub instruction_revision: String,
+}
+
+impl WorkspaceProject {
+    pub(crate) fn managed_nemo() -> Self {
+        Self {
+            project_address: buzz_core_pkg::nemo::PROJECT_ADDRESS.into(),
+            home_channel: buzz_core_pkg::nemo::HOME_CHANNEL.into(),
+            repository: buzz_core_pkg::nemo::REPOSITORY.into(),
+            display_name: buzz_core_pkg::nemo::DISPLAY_NAME.into(),
+            instruction_revision: BUILTIN_INSTRUCTION_REVISION.into(),
+        }
+    }
+
+    pub(crate) fn is_managed_nemo(&self) -> bool {
+        buzz_core_pkg::nemo::matches(&self.project_address, &self.home_channel, &self.repository)
+            && self.instruction_revision == BUILTIN_INSTRUCTION_REVISION
+    }
 }
 
 #[derive(Default, Deserialize, Serialize)]
@@ -146,11 +165,12 @@ pub(crate) fn validate_workspace_project(project: &WorkspaceProject) -> Result<(
     {
         return Err("displayName must be trimmed visible text within 256 bytes".into());
     }
-    if !matches!(project.instruction_revision.len(), 40 | 64)
-        || !project
-            .instruction_revision
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    if !project.is_managed_nemo()
+        && (!matches!(project.instruction_revision.len(), 40 | 64)
+            || !project
+                .instruction_revision
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()))
     {
         return Err("instructionRevision must be a lowercase Git commit hash".into());
     }
@@ -232,6 +252,9 @@ fn set_project_for_relay(
 pub(crate) fn load_workspace_project_for_relay(
     relay_url: &str,
 ) -> Result<Option<WorkspaceProject>, String> {
+    if canonical_relay(relay_url)? == buzz_core_pkg::nemo::RELAY_URL {
+        return Ok(Some(WorkspaceProject::managed_nemo()));
+    }
     if !cfg!(feature = "system-keyring") {
         return Ok(None);
     }
@@ -242,6 +265,11 @@ pub(crate) fn save_workspace_project_for_relay(
     relay_url: &str,
     project: Option<WorkspaceProject>,
 ) -> Result<(Option<WorkspaceProject>, bool), String> {
+    if canonical_relay(relay_url)? == buzz_core_pkg::nemo::RELAY_URL {
+        let managed = WorkspaceProject::managed_nemo();
+        let _ = project;
+        return Ok((Some(managed), false));
+    }
     if !cfg!(feature = "system-keyring") {
         return Err("Workspace Project settings require the OS credential vault".into());
     }
@@ -261,10 +289,12 @@ pub(crate) fn apply_workspace_project_env(
         command.env(WORKSPACE_PROJECT_CHANNEL_ENV, &project.home_channel);
         command.env(WORKSPACE_PROJECT_ADDRESS_ENV, &project.project_address);
         command.env(WORKSPACE_PROJECT_REPOSITORY_ENV, &project.repository);
-        command.env(
-            WORKSPACE_PROJECT_REVISION_ENV,
-            &project.instruction_revision,
-        );
+        if project.instruction_revision != BUILTIN_INSTRUCTION_REVISION {
+            command.env(
+                WORKSPACE_PROJECT_REVISION_ENV,
+                &project.instruction_revision,
+            );
+        }
     }
     Ok(())
 }
@@ -324,6 +354,42 @@ mod tests {
         assert_eq!(
             project_for_relay(&store, "wss://b.example").unwrap(),
             Some(other)
+        );
+    }
+
+    #[test]
+    fn nemo_relay_always_uses_builtin_workspace_without_saved_configuration() {
+        let expected = WorkspaceProject::managed_nemo();
+        assert!(expected.is_managed_nemo());
+        assert!(validate_workspace_project(&expected).is_ok());
+        assert_eq!(
+            load_workspace_project_for_relay("WSS://BUZZ.MOGRAPH.LIFE/")
+                .expect("managed workspace"),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            save_workspace_project_for_relay(buzz_core_pkg::nemo::RELAY_URL, None)
+                .expect("managed workspace is immutable"),
+            (Some(expected), false)
+        );
+    }
+
+    #[test]
+    fn builtin_nemo_selector_omits_revision_pin_from_agent_environment() {
+        let mut command = std::process::Command::new("true");
+        apply_workspace_project_env(&mut command, Some(&WorkspaceProject::managed_nemo()))
+            .expect("managed environment");
+        let env = command.get_envs().collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            env.get(std::ffi::OsStr::new(WORKSPACE_PROJECT_ADDRESS_ENV))
+                .and_then(|value| value.as_ref())
+                .and_then(|value| value.to_str()),
+            Some(buzz_core_pkg::nemo::PROJECT_ADDRESS)
+        );
+        assert_eq!(
+            env.get(std::ffi::OsStr::new(WORKSPACE_PROJECT_REVISION_ENV)),
+            Some(&None),
+            "the child environment must explicitly remove any inherited revision pin"
         );
     }
 

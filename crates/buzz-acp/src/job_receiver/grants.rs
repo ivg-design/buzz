@@ -15,6 +15,7 @@ const MAX_PATH_PREFIXES_PER_GRANT: usize = 128;
 const MAX_GRANT_DOCUMENT_BYTES: u64 = 768 * 1024;
 const MAX_GIT_OUTPUT_BYTES: u64 = 64 * 1024;
 const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+const GIT_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Error)]
 pub enum GrantError {
@@ -68,6 +69,13 @@ pub(crate) struct PreparedJobSources {
 #[derive(Debug, Clone, Default)]
 pub struct GrantSet {
     grants: Vec<JobGrant>,
+    nemo_workspace: bool,
+    nemo_checkout: Option<NemoCheckout>,
+}
+
+#[derive(Debug, Clone)]
+struct NemoCheckout {
+    root: PathBuf,
 }
 
 impl GrantSet {
@@ -76,6 +84,22 @@ impl GrantSet {
         grants_json: Option<String>,
         grants_file: Option<std::path::PathBuf>,
     ) -> Result<Self, GrantError> {
+        Self::load_with_nemo(cwd, grants_json, grants_file, false)
+    }
+
+    pub fn load_with_nemo(
+        cwd: &Path,
+        grants_json: Option<String>,
+        grants_file: Option<std::path::PathBuf>,
+        nemo_workspace: bool,
+    ) -> Result<Self, GrantError> {
+        if nemo_workspace {
+            return Ok(Self {
+                grants: Vec::new(),
+                nemo_workspace: true,
+                nemo_checkout: discover_nemo_checkout(cwd),
+            });
+        }
         match (grants_json, grants_file) {
             (Some(_), Some(_)) => Err(GrantError::Invalid(
                 "grant JSON and grant file are mutually exclusive".into(),
@@ -111,28 +135,51 @@ impl GrantSet {
         }
         Ok(Self {
             grants: document.grants,
+            nemo_workspace: false,
+            nemo_checkout: None,
         })
     }
 
     pub fn is_empty(&self) -> bool {
-        self.grants.is_empty()
+        self.grants.is_empty() && !self.nemo_workspace
     }
 
     pub fn capabilities_for(&self, request: &JobRequest) -> Option<Vec<String>> {
+        if self.nemo_workspace && static_nemo_request_allowed(request) {
+            return Some(vec![request.capability.clone()]);
+        }
         Some(self.matching_grant(request)?.capabilities.clone())
     }
 
     pub fn git_operations_for(&self, request: &JobRequest) -> Option<Vec<String>> {
+        if self.nemo_workspace && static_nemo_request_allowed(request) {
+            return Some(vec!["commit".into(), "fetch".into(), "push".into()]);
+        }
         Some(self.matching_grant(request)?.git_operations.clone())
     }
 
-    pub fn authorize_request(&self, request: &JobRequest) -> Option<GrantMatch> {
-        let grant = self.matching_grant(request)?;
-        let checkout_root = checkout_matches(grant, request)?;
-        Some(GrantMatch {
+    pub fn authorize_request(&self, request: &JobRequest) -> Result<Option<GrantMatch>, String> {
+        if self.nemo_workspace && static_nemo_request_allowed(request) {
+            let checkout = self
+                .nemo_checkout
+                .as_ref()
+                .ok_or_else(|| "the Nemo repository checkout is unavailable".to_owned())?;
+            let checkout_root = prepare_nemo_worktree(checkout, request)?;
+            return Ok(Some(GrantMatch {
+                capabilities: vec![request.capability.clone()],
+                checkout_root,
+            }));
+        }
+        let Some(grant) = self.matching_grant(request) else {
+            return Ok(None);
+        };
+        let Some(checkout_root) = checkout_matches(grant, request) else {
+            return Ok(None);
+        };
+        Ok(Some(GrantMatch {
             capabilities: grant.capabilities.clone(),
             checkout_root,
-        })
+        }))
     }
 
     /// Canonical Project home channels that need an agent-job subscription.
@@ -140,24 +187,41 @@ impl GrantSet {
     /// The grant document is the sole source: chat subscription mode and its
     /// channel allowlist must never widen or narrow this receiver surface.
     pub fn home_channels(&self) -> Vec<Uuid> {
-        self.grants
+        let mut channels = self
+            .grants
             .iter()
             .filter_map(|grant| Uuid::parse_str(&grant.home_channel).ok())
             .collect::<BTreeSet<_>>()
             .into_iter()
-            .collect()
+            .collect::<Vec<_>>();
+        if self.nemo_workspace {
+            if let Ok(channel) = Uuid::parse_str(buzz_core::nemo::HOME_CHANNEL) {
+                if !channels.contains(&channel) {
+                    channels.push(channel);
+                    channels.sort();
+                }
+            }
+        }
+        channels
     }
 
     pub fn contains_home_channel(&self, channel_id: Uuid) -> bool {
-        self.grants
-            .iter()
-            .any(|grant| grant.home_channel == channel_id.to_string())
+        (self.nemo_workspace && channel_id.to_string() == buzz_core::nemo::HOME_CHANNEL)
+            || self
+                .grants
+                .iter()
+                .any(|grant| grant.home_channel == channel_id.to_string())
     }
 
     pub(super) fn checkout_roots(&self) -> impl Iterator<Item = &Path> {
         self.grants
             .iter()
             .map(|grant| grant.checkout_root.as_path())
+            .chain(
+                self.nemo_checkout
+                    .iter()
+                    .map(|checkout| checkout.root.as_path()),
+            )
     }
 
     fn matching_grant(&self, request: &JobRequest) -> Option<&JobGrant> {
@@ -193,7 +257,28 @@ pub(crate) fn prepare_job_sources(
     grants_json: Option<String>,
     grants_file: Option<PathBuf>,
     ledger_root: Option<PathBuf>,
+    nemo_workspace: bool,
 ) -> Result<PreparedJobSources, GrantError> {
+    if nemo_workspace {
+        let grants = GrantSet::load_with_nemo(cwd, None, None, true)?;
+        let (ledger_root, protected_ledger_root) = match ledger_root {
+            Some(root) => {
+                let root = prepare_private_ledger_root(cwd, &root, grants.checkout_roots())?;
+                (Some(root.clone()), Some(root))
+            }
+            None => {
+                let base = super::default_ledger_base()?;
+                let base = prepare_private_ledger_root(cwd, &base, grants.checkout_roots())?;
+                (None, Some(base))
+            }
+        };
+        return Ok(PreparedJobSources {
+            grants_json: None,
+            grant_source_file: None,
+            ledger_root,
+            protected_ledger_root,
+        });
+    }
     let (grants_json, grant_source_file) = match (grants_json, grants_file) {
         (Some(_), Some(_)) => {
             return Err(GrantError::Invalid(
@@ -552,6 +637,227 @@ fn valid_sha(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn static_nemo_request_allowed(request: &JobRequest) -> bool {
+    let repository = &request.common.repository;
+    buzz_core::nemo::matches(
+        &request.common.project.address,
+        &request.common.project.home_channel,
+        &repository.canonical,
+    ) && nostr::PublicKey::parse(&request.common.sender_pubkey)
+        .is_ok_and(|key| key.to_hex() == request.common.sender_pubkey)
+        && valid_token(&request.capability)
+        && valid_sha(&repository.base_sha)
+        && buzz_core::nemo::valid_worktree_component(&repository.worktree_id)
+        && repository.branch == format!("codex/{}", repository.worktree_id)
+        && !repository.paths.is_empty()
+        && repository
+            .paths
+            .iter()
+            .all(|path| valid_relative_path(path))
+}
+
+fn discover_nemo_checkout(cwd: &Path) -> Option<NemoCheckout> {
+    let repos = cwd.join("REPOS").canonicalize().ok();
+    let mut candidates = Vec::new();
+    if let Some(repos) = &repos {
+        candidates.push((repos.join("nemo"), Some(repos)));
+        candidates.push((repos.join("mysteropodes--nemo"), Some(repos)));
+    }
+    candidates.push((cwd.to_path_buf(), None));
+    candidates.into_iter().find_map(|(candidate, boundary)| {
+        let root = candidate.canonicalize().ok()?;
+        (root.is_dir()
+            && root.join(".git").exists()
+            && boundary.is_none_or(|boundary| root.starts_with(boundary)))
+        .then_some(NemoCheckout { root })
+    })
+}
+
+fn prepare_nemo_worktree(checkout: &NemoCheckout, request: &JobRequest) -> Result<PathBuf, String> {
+    let source = checkout
+        .root
+        .canonicalize()
+        .map_err(|_| "the Nemo repository checkout is unavailable".to_owned())?;
+    checkout_config_is_safe(&source)
+        .ok_or_else(|| "the Nemo repository Git configuration is unsafe".to_owned())?;
+    let top = PathBuf::from(
+        git_output(&source, &["rev-parse", "--show-toplevel"])
+            .ok_or_else(|| "the Nemo repository root could not be verified".to_owned())?,
+    );
+    let origin = canonical_git_origin(
+        &git_output(&source, &["remote", "get-url", "origin"])
+            .ok_or_else(|| "the Nemo repository origin could not be verified".to_owned())?,
+    )
+    .ok_or_else(|| "the Nemo repository origin is not canonical".to_owned())?;
+    if top.canonicalize().ok().as_ref() != Some(&source) || origin != buzz_core::nemo::REPOSITORY {
+        return Err("the local checkout is not the managed Nemo repository".into());
+    }
+
+    let commit_spec = format!("{}^{{commit}}", request.common.repository.base_sha);
+    let mut resolved = git_output(&source, &["rev-parse", "--verify", &commit_spec]);
+    if resolved.as_deref() != Some(request.common.repository.base_sha.as_str()) {
+        let fetched = git_success_with_timeout(
+            &source,
+            &[
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                "--no-write-fetch-head",
+                "--no-recurse-submodules",
+                "origin",
+                &request.common.repository.base_sha,
+            ],
+            GIT_FETCH_TIMEOUT,
+        );
+        if !fetched {
+            return Err(
+                "the requested Nemo base commit is absent locally and fetch from origin failed; check network or GitHub authentication"
+                    .into(),
+            );
+        }
+        resolved = git_output(&source, &["rev-parse", "--verify", &commit_spec]);
+    }
+    if resolved.as_deref() != Some(request.common.repository.base_sha.as_str()) {
+        return Err("the requested Nemo base commit is unavailable after fetch".into());
+    }
+
+    let parent = source
+        .parent()
+        .and_then(|path| path.canonicalize().ok())
+        .ok_or_else(|| "the Nemo checkout parent is unavailable".to_owned())?;
+    let worktrees = parent.join("nemo-worktrees");
+    match std::fs::symlink_metadata(&worktrees) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err("the Nemo worktree directory is unsafe".into())
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(&worktrees)
+                .map_err(|_| "the Nemo worktree directory could not be created".to_owned())?;
+        }
+        Err(_) => return Err("the Nemo worktree directory is unavailable".into()),
+    }
+    let worktrees = worktrees
+        .canonicalize()
+        .map_err(|_| "the Nemo worktree directory could not be verified".to_owned())?;
+    if worktrees.parent() != Some(parent.as_path()) {
+        return Err("the Nemo worktree directory escaped its repository root".into());
+    }
+    let target = worktrees.join(&request.common.repository.worktree_id);
+    match std::fs::symlink_metadata(&target) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err("the requested Nemo worktree path is unsafe".into())
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let branch_ref = format!("refs/heads/{}", request.common.repository.branch);
+            let existing = git_output(&source, &["rev-parse", "--verify", &branch_ref]);
+            let added = match existing {
+                Some(value)
+                    if git_success(
+                        &source,
+                        &[
+                            "merge-base",
+                            "--is-ancestor",
+                            &request.common.repository.base_sha,
+                            &value,
+                        ],
+                    ) =>
+                {
+                    git_success(
+                        &source,
+                        &[
+                            "-c",
+                            &format!("core.hooksPath={}", null_device()),
+                            "worktree",
+                            "add",
+                            target
+                                .to_str()
+                                .ok_or_else(|| "the Nemo worktree path is not UTF-8".to_owned())?,
+                            &request.common.repository.branch,
+                        ],
+                    )
+                }
+                None => git_success(
+                    &source,
+                    &[
+                        "-c",
+                        &format!("core.hooksPath={}", null_device()),
+                        "worktree",
+                        "add",
+                        "-b",
+                        &request.common.repository.branch,
+                        target
+                            .to_str()
+                            .ok_or_else(|| "the Nemo worktree path is not UTF-8".to_owned())?,
+                        &request.common.repository.base_sha,
+                    ],
+                ),
+                _ => false,
+            };
+            if !added {
+                return Err(
+                    "the Nemo job worktree could not be created from its signed base".into(),
+                );
+            }
+        }
+        Err(_) => return Err("the Nemo job worktree path could not be inspected".into()),
+    }
+
+    let target = target
+        .canonicalize()
+        .map_err(|_| "the Nemo job worktree is unavailable".to_owned())?;
+    if !target.starts_with(&worktrees) {
+        return Err("the Nemo job worktree escaped its managed root".into());
+    }
+    checkout_config_is_safe(&target)
+        .ok_or_else(|| "the Nemo job worktree Git configuration is unsafe".to_owned())?;
+    let target_top = PathBuf::from(
+        git_output(&target, &["rev-parse", "--show-toplevel"])
+            .ok_or_else(|| "the Nemo job worktree root could not be verified".to_owned())?,
+    );
+    let branch = git_output(&target, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .ok_or_else(|| "the Nemo job worktree branch could not be verified".to_owned())?;
+    let head = git_output(&target, &["rev-parse", "HEAD"])
+        .ok_or_else(|| "the Nemo job worktree head could not be verified".to_owned())?;
+    let target_origin = canonical_git_origin(
+        &git_output(&target, &["remote", "get-url", "origin"])
+            .ok_or_else(|| "the Nemo job worktree origin could not be verified".to_owned())?,
+    )
+    .ok_or_else(|| "the Nemo job worktree origin is not canonical".to_owned())?;
+    let source_common = git_common_dir(&source)
+        .ok_or_else(|| "the Nemo repository common Git directory is unavailable".to_owned())?;
+    let target_common = git_common_dir(&target)
+        .ok_or_else(|| "the Nemo job worktree common Git directory is unavailable".to_owned())?;
+    let base_is_ancestor = git_success(
+        &target,
+        &[
+            "merge-base",
+            "--is-ancestor",
+            &request.common.repository.base_sha,
+            &head,
+        ],
+    );
+    if target_top.canonicalize().ok().as_ref() != Some(&target)
+        || branch != request.common.repository.branch
+        || target_origin != buzz_core::nemo::REPOSITORY
+        || source_common != target_common
+        || !base_is_ancestor
+    {
+        return Err("the Nemo job worktree no longer matches its signed repository scope".into());
+    }
+    Ok(target)
+}
+
+fn git_common_dir(root: &Path) -> Option<PathBuf> {
+    PathBuf::from(git_output(
+        root,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?)
+    .canonicalize()
+    .ok()
+}
+
 fn checkout_matches(grant: &JobGrant, request: &JobRequest) -> Option<PathBuf> {
     let root = grant.checkout_root.canonicalize().ok()?;
     checkout_config_is_safe(&root)?;
@@ -569,6 +875,25 @@ fn checkout_matches(grant: &JobGrant, request: &JobRequest) -> Option<PathBuf> {
 }
 
 fn git_output(root: &Path, args: &[&str]) -> Option<String> {
+    let bytes = git_run(root, args)?;
+    let value = String::from_utf8(bytes).ok()?;
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+fn git_success(root: &Path, args: &[&str]) -> bool {
+    git_run(root, args).is_some()
+}
+
+fn git_run(root: &Path, args: &[&str]) -> Option<Vec<u8>> {
+    git_run_with_timeout(root, args, GIT_COMMAND_TIMEOUT)
+}
+
+fn git_success_with_timeout(root: &Path, args: &[&str], timeout: Duration) -> bool {
+    git_run_with_timeout(root, args, timeout).is_some()
+}
+
+fn git_run_with_timeout(root: &Path, args: &[&str], timeout: Duration) -> Option<Vec<u8>> {
     let mut command = Command::new(system_git()?);
     command
         .arg("-C")
@@ -598,7 +923,7 @@ fn git_output(root: &Path, args: &[&str]) -> Option<String> {
             .ok()
             .map(|_| bytes)
     });
-    let deadline = Instant::now() + GIT_COMMAND_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait().ok()? {
             Some(status) => break status,
@@ -617,9 +942,7 @@ fn git_output(root: &Path, args: &[&str]) -> Option<String> {
     if !status.success() || bytes.len() as u64 > MAX_GIT_OUTPUT_BYTES {
         return None;
     }
-    let value = String::from_utf8(bytes).ok()?;
-    let value = value.trim();
-    (!value.is_empty()).then(|| value.to_owned())
+    Some(bytes)
 }
 
 fn checkout_config_is_safe(root: &Path) -> Option<()> {
@@ -975,6 +1298,7 @@ mod tests {
             None,
             Some(path.clone()),
             Some(ledger.clone()),
+            false,
         )
         .expect("secure source");
         std::fs::write(&path, "not-json").expect("mutate source after capture");
@@ -1155,7 +1479,7 @@ mod tests {
             }]
         });
         let grants = GrantSet::from_json(&raw.to_string()).expect("valid checkout grant");
-        assert!(grants.authorize_request(&candidate).is_some());
+        assert!(grants.authorize_request(&candidate).unwrap().is_some());
 
         let run = |args: &[&str]| {
             assert!(Command::new("git")
@@ -1167,12 +1491,12 @@ mod tests {
                 .success());
         };
         run(&["checkout", "-b", "other"]);
-        assert!(grants.authorize_request(&candidate).is_none());
+        assert!(grants.authorize_request(&candidate).unwrap().is_none());
         run(&["checkout", "codex/a2a"]);
         std::fs::write(checkout.path().join("second.txt"), "second\n").expect("second");
         run(&["add", "second.txt"]);
         run(&["commit", "-m", "head drift"]);
-        assert!(grants.authorize_request(&candidate).is_none());
+        assert!(grants.authorize_request(&candidate).unwrap().is_none());
         run(&["reset", "--hard", &candidate.common.repository.base_sha]);
         run(&[
             "remote",
@@ -1180,7 +1504,7 @@ mod tests {
             "origin",
             "https://github.com/mysteropodes/other.git",
         ]);
-        assert!(grants.authorize_request(&candidate).is_none());
+        assert!(grants.authorize_request(&candidate).unwrap().is_none());
     }
 
     #[test]
@@ -1205,7 +1529,7 @@ mod tests {
             }]
         });
         let grants = GrantSet::from_json(&raw.to_string()).expect("valid checkout grant");
-        assert!(grants.authorize_request(&candidate).is_some());
+        assert!(grants.authorize_request(&candidate).unwrap().is_some());
 
         let run = |args: &[&str]| {
             assert!(Command::new(system_git().expect("system git"))
@@ -1217,7 +1541,7 @@ mod tests {
                 .success());
         };
         run(&["config", "--local", "credential.helper", "!/tmp/steal"]);
-        assert!(grants.authorize_request(&candidate).is_none());
+        assert!(grants.authorize_request(&candidate).unwrap().is_none());
         run(&["config", "--local", "--unset", "credential.helper"]);
         run(&[
             "remote",
@@ -1225,7 +1549,7 @@ mod tests {
             "attacker",
             "https://github.com/attacker/other.git",
         ]);
-        assert!(grants.authorize_request(&candidate).is_none());
+        assert!(grants.authorize_request(&candidate).unwrap().is_none());
     }
 
     #[test]
@@ -1233,5 +1557,75 @@ mod tests {
         let git = system_git().expect("supported Unix test host has system Git");
         assert!(git.is_absolute());
         assert!(!git.starts_with(std::env::current_dir().expect("cwd")));
+    }
+
+    #[test]
+    fn managed_nemo_worktree_is_created_and_reused_after_worker_progress() {
+        let harness = tempfile::tempdir().expect("harness");
+        let checkout = harness.path().join("REPOS/nemo");
+        std::fs::create_dir_all(&checkout).expect("checkout");
+        let run = |root: &Path, args: &[&str]| {
+            assert!(Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .status()
+                .expect("Git fixture")
+                .success());
+        };
+        run(&checkout, &["init", "--quiet"]);
+        run(&checkout, &["config", "user.name", "Buzz Test"]);
+        run(
+            &checkout,
+            &["config", "user.email", "buzz-test@example.invalid"],
+        );
+        std::fs::write(checkout.join("fixture.txt"), "fixture\n").expect("fixture");
+        run(&checkout, &["add", "fixture.txt"]);
+        run(&checkout, &["commit", "--quiet", "-m", "fixture"]);
+        run(
+            &checkout,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/mysteropodes/nemo.git",
+            ],
+        );
+        let base = git_output(&checkout, &["rev-parse", "HEAD"]).expect("base");
+        let mut candidate = request();
+        candidate.common.project.address = buzz_core::nemo::PROJECT_ADDRESS.into();
+        candidate.common.project.home_channel = buzz_core::nemo::HOME_CHANNEL.into();
+        candidate.common.repository.canonical = buzz_core::nemo::REPOSITORY.into();
+        candidate.common.repository.base_sha = base;
+        candidate.common.repository.worktree_id = "worker_2".into();
+        candidate.common.repository.branch = "codex/worker_2".into();
+        candidate.common.repository.paths = vec!["new/source.rs".into()];
+        candidate.common.sender_pubkey = nostr::Keys::generate().public_key().to_hex();
+
+        let grants = GrantSet::load_with_nemo(harness.path(), None, None, true)
+            .expect("managed Nemo grants");
+        let first = grants
+            .authorize_request(&candidate)
+            .expect("first admission")
+            .expect("managed grant")
+            .checkout_root;
+        assert!(first.ends_with("nemo-worktrees/worker_2"));
+
+        std::fs::write(first.join("progress.txt"), "progress\n").expect("progress");
+        run(&first, &["add", "progress.txt"]);
+        run(&first, &["commit", "--quiet", "-m", "worker progress"]);
+        let progressed_head = git_output(&first, &["rev-parse", "HEAD"]).expect("progress head");
+
+        let resumed = grants
+            .authorize_request(&candidate)
+            .expect("resume admission")
+            .expect("managed grant")
+            .checkout_root;
+        assert_eq!(resumed, first);
+        assert_eq!(
+            git_output(&resumed, &["rev-parse", "HEAD"]).as_deref(),
+            Some(progressed_head.as_str()),
+            "resume must preserve legitimate worker commits"
+        );
     }
 }

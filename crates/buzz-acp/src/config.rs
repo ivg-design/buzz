@@ -1200,6 +1200,17 @@ impl Config {
 
         validate_multiple_event_handling(args.multiple_event_handling, args.dedup)?;
 
+        let managed_nemo_workspace = buzz_core::relay::normalize_relay_url(&args.relay_url)
+            .ok()
+            .as_deref()
+            == Some(buzz_core::nemo::RELAY_URL)
+            && args
+                .workspace_project_channel
+                .map(|value| value.to_string())
+                .as_deref()
+                == Some(buzz_core::nemo::HOME_CHANNEL)
+            && args.workspace_project_address.as_deref() == Some(buzz_core::nemo::PROJECT_ADDRESS)
+            && args.workspace_project_repository.as_deref() == Some(buzz_core::nemo::REPOSITORY);
         let workspace_project_revision = match (
             args.workspace_project_channel,
             args.workspace_project_revision,
@@ -1212,6 +1223,7 @@ impl Config {
                             .into(),
                     ));
             }
+            (Some(_), None) if managed_nemo_workspace => None,
             (Some(_), None) => {
                 return Err(ConfigError::ConfigFile(
                     "workspace_project_channel requires workspace_project_revision".into(),
@@ -1311,6 +1323,21 @@ impl Config {
         Ok(config)
     }
 
+    /// Whether this process is bound to the exact built-in Nemo workspace.
+    pub fn managed_nemo_workspace(&self) -> bool {
+        buzz_core::relay::normalize_relay_url(&self.relay_url)
+            .ok()
+            .as_deref()
+            == Some(buzz_core::nemo::RELAY_URL)
+            && self
+                .workspace_project_channel
+                .map(|value| value.to_string())
+                .as_deref()
+                == Some(buzz_core::nemo::HOME_CHANNEL)
+            && self.workspace_project_address.as_deref() == Some(buzz_core::nemo::PROJECT_ADDRESS)
+            && self.workspace_project_repository.as_deref() == Some(buzz_core::nemo::REPOSITORY)
+    }
+
     /// Human-readable summary (no secrets).
     pub fn summary(&self) -> String {
         let respond_to_detail = match &self.respond_to {
@@ -1331,6 +1358,19 @@ impl Config {
             self.workspace_project_revision.as_deref(),
         ) {
             (Some(channel), Some(revision)) => format!("{channel}@{revision}"),
+            (Some(channel), None)
+                if buzz_core::nemo::matches(
+                    self.workspace_project_address
+                        .as_deref()
+                        .unwrap_or_default(),
+                    &channel.to_string(),
+                    self.workspace_project_repository
+                        .as_deref()
+                        .unwrap_or_default(),
+                ) =>
+            {
+                format!("{channel}@builtin")
+            }
             _ => "(channel-scoped)".into(),
         };
         format!(
@@ -1842,6 +1882,28 @@ mod tests {
             Some(revision.as_str())
         );
         assert!(config.summary().contains(&format!("{channel}@{revision}")));
+    }
+
+    #[test]
+    fn exact_nemo_workspace_uses_builtin_instructions_without_a_revision_pin() {
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--relay-url",
+            buzz_core::nemo::RELAY_URL,
+            "--workspace-project-channel",
+            buzz_core::nemo::HOME_CHANNEL,
+            "--workspace-project-address",
+            buzz_core::nemo::PROJECT_ADDRESS,
+            "--workspace-project-repository",
+            buzz_core::nemo::REPOSITORY,
+        ])
+        .expect("managed arguments");
+        let config = Config::from_args(args).expect("managed Nemo workspace");
+        assert!(config.managed_nemo_workspace());
+        assert_eq!(config.workspace_project_revision, None);
+        assert!(config.summary().contains("@builtin"));
     }
 
     #[test]

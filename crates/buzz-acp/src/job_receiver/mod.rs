@@ -287,6 +287,7 @@ pub struct ReceiverSources {
     pub grants_file: Option<PathBuf>,
     pub ledger_root: Option<PathBuf>,
     pub allow_insecure_loopback: bool,
+    pub nemo_workspace: bool,
 }
 
 /// Durable admission boundary for addressed agent-job requests.
@@ -309,10 +310,11 @@ impl JobReceiver {
         cwd: &Path,
         sources: &ReceiverSources,
     ) -> Result<bool, ReceiverError> {
-        Ok(!GrantSet::load_from(
+        Ok(!GrantSet::load_with_nemo(
             cwd,
             sources.grants_json.clone(),
             sources.grants_file.clone(),
+            sources.nemo_workspace,
         )?
         .is_empty())
     }
@@ -337,7 +339,12 @@ impl JobReceiver {
                 "agent sponsor must contain a canonical owner key and login metadata".into(),
             ));
         }
-        let grants = GrantSet::load_from(cwd, sources.grants_json, sources.grants_file)?;
+        let grants = GrantSet::load_with_nemo(
+            cwd,
+            sources.grants_json,
+            sources.grants_file,
+            sources.nemo_workspace,
+        )?;
         let ledger_candidate = match sources.ledger_root {
             Some(root) => root,
             None => default_ledger_root(&tenant.community_id, &agent_pubkey)?,
@@ -608,21 +615,13 @@ impl JobReceiver {
             Some(request) => request,
             None => return Ok(HandleOutcome::Consumed),
         };
-        let grant_match = self.grants.authorize_request(&request);
-        if !project_authorizes(project, &request) || grant_match.is_none() {
+        if !project_authorizes(project, &request)
+            || self.grants.capabilities_for(&request).is_none()
+        {
             tracing::warn!(
                 channel_id = %channel_id,
                 request_event_id = %event.id,
                 "dropping agent job outside the authoritative local grant"
-            );
-            return Ok(HandleOutcome::Consumed);
-        }
-        let grant_match = grant_match.expect("checked above");
-        if !paths::request_paths_are_contained(&grant_match.checkout_root, &request) {
-            tracing::warn!(
-                channel_id = %channel_id,
-                request_event_id = %event.id,
-                "dropping agent job whose requested paths escape the verified checkout"
             );
             return Ok(HandleOutcome::Consumed);
         }
@@ -664,6 +663,33 @@ impl JobReceiver {
             self.allow_insecure_loopback,
         )
         .await?;
+        let grant_match = match self.grants.authorize_request(&request) {
+            Ok(Some(grant_match)) => grant_match,
+            Ok(None) => {
+                tracing::warn!(
+                    channel_id = %channel_id,
+                    request_event_id = %event.id,
+                    "dropping agent job outside the verified local repository scope"
+                );
+                return Ok(HandleOutcome::Consumed);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    channel_id = %channel_id,
+                    request_event_id = %event.id,
+                    "dropping agent job because its Nemo worktree could not be prepared: {error}"
+                );
+                return Ok(HandleOutcome::Consumed);
+            }
+        };
+        if !paths::request_paths_are_contained(&grant_match.checkout_root, &request) {
+            tracing::warn!(
+                channel_id = %channel_id,
+                request_event_id = %event.id,
+                "dropping agent job whose requested paths escape the verified checkout"
+            );
+            return Ok(HandleOutcome::Consumed);
+        }
         let (stored, force_receipt_replay) = match self.ledger.claim(candidate).await? {
             ClaimDecision::New(stored) => (stored, false),
             ClaimDecision::Replay(stored) => (stored, true),

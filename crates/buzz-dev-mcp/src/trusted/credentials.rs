@@ -21,6 +21,7 @@ pub struct TrustedConfig {
     pub(super) owner_pubkey: String,
     pub(super) owner_github_login: Option<String>,
     pub(super) grants: GrantSet,
+    pub(super) a2a_channel_id: Option<String>,
     pub(super) session_channel_id: Option<String>,
     pub(super) session_thread_root_id: Option<String>,
     pub(super) job_operation_id: Option<String>,
@@ -45,6 +46,7 @@ pub struct HarnessTrustedIdentity {
     owner_pubkey: String,
     owner_github_login: Option<String>,
     grants: GrantSet,
+    a2a_channel_id: Option<String>,
     github_credentials: GitHubCredentialStore,
     allow_insecure_loopback: bool,
 }
@@ -91,6 +93,11 @@ impl HarnessTrustedIdentity {
             }
             None => (None, keys.public_key().to_hex()),
         };
+        let nemo_workspace = buzz_core::relay::normalize_relay_url(&relay_url)
+            .ok()
+            .as_deref()
+            == Some(buzz_core::nemo::RELAY_URL);
+        let grants = GrantSet::load_with_nemo(cwd, grants_json, grants_file, nemo_workspace)?;
         Ok(Self {
             relay_url,
             keys,
@@ -98,7 +105,8 @@ impl HarnessTrustedIdentity {
             auth_tag_json,
             owner_pubkey,
             owner_github_login,
-            grants: GrantSet::load(cwd, grants_json, grants_file)?,
+            grants,
+            a2a_channel_id: nemo_workspace.then(|| buzz_core::nemo::HOME_CHANNEL.into()),
             // Synchronous construction is used by tests and deliberately has
             // no access to the operator's HOME or credential helpers. Any
             // network grant therefore fails closed unless production startup
@@ -113,6 +121,9 @@ impl HarnessTrustedIdentity {
     ///
     /// Credential helpers run only during this bounded trusted capture. Their
     /// configuration is never retained or replayed into later Git children.
+    /// The managed Nemo repository is deliberately omitted here: its optional
+    /// credential is resolved by the trusted Git operation that needs it, so a
+    /// missing GitHub login can never prevent local chat or A2A startup.
     #[allow(clippy::too_many_arguments)]
     pub async fn new_with_operator_git_credentials(
         cwd: &Path,
@@ -150,6 +161,7 @@ impl HarnessTrustedIdentity {
             owner_pubkey: self.owner_pubkey.clone(),
             owner_github_login: self.owner_github_login.clone(),
             grants: self.grants.clone(),
+            a2a_channel_id: self.a2a_channel_id.clone(),
             session_channel_id: scope.channel_id,
             session_thread_root_id: scope.thread_root_id,
             job_operation_id: scope.job_operation_id,
@@ -220,7 +232,11 @@ impl TrustedConfig {
             None => (None, None, keys.public_key().to_hex()),
         };
 
-        let grants = GrantSet::load(cwd, grants_json, grants_file)?;
+        let nemo_workspace = buzz_core::relay::normalize_relay_url(&relay_url)
+            .ok()
+            .as_deref()
+            == Some(buzz_core::nemo::RELAY_URL);
+        let grants = GrantSet::load_with_nemo(cwd, grants_json, grants_file, nemo_workspace)?;
         Ok(Some(Self {
             relay_url,
             keys,
@@ -229,6 +245,7 @@ impl TrustedConfig {
             owner_pubkey,
             owner_github_login,
             grants,
+            a2a_channel_id: nemo_workspace.then(|| buzz_core::nemo::HOME_CHANNEL.into()),
             session_channel_id,
             session_thread_root_id,
             job_operation_id,

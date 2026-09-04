@@ -31,6 +31,7 @@ pub struct TrustedRelay {
     pub(super) owner_pubkey: String,
     pub(super) owner_github_login: Option<String>,
     pub(super) grants: super::GrantSet,
+    pub(super) a2a_channel_id: Option<String>,
     pub(super) session_channel_id: Option<String>,
     pub(super) session_thread_root_id: Option<String>,
     pub(super) job_operation_id: Option<String>,
@@ -75,6 +76,7 @@ impl TrustedRelay {
             owner_pubkey: config.owner_pubkey,
             owner_github_login: config.owner_github_login,
             grants: config.grants,
+            a2a_channel_id: config.a2a_channel_id,
             session_channel_id: config.session_channel_id,
             session_thread_root_id: config.session_thread_root_id,
             job_operation_id: config.job_operation_id,
@@ -294,10 +296,14 @@ impl TrustedRelay {
         Ok(validated)
     }
 
-    fn bound_a2a_channel(&self) -> Result<&str, String> {
-        let channel = self.session_channel_id.as_deref().ok_or_else(|| {
-            "A2A reads are unavailable outside a channel-bound session".to_owned()
-        })?;
+    pub(super) fn bound_a2a_channel(&self) -> Result<&str, String> {
+        let channel = self
+            .a2a_channel_id
+            .as_deref()
+            .or(self.session_channel_id.as_deref())
+            .ok_or_else(|| {
+                "A2A reads are unavailable outside a channel-bound session".to_owned()
+            })?;
         if !self
             .grants
             .channels()

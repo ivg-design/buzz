@@ -13,6 +13,7 @@ fn test_relay() -> TrustedRelay {
         auth_tag: None,
         auth_tag_json: None,
         grants: super::super::GrantSet::default(),
+        a2a_channel_id: None,
         session_channel_id: None,
         session_thread_root_id: None,
         job_operation_id: None,

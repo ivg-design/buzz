@@ -2840,11 +2840,13 @@ async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
     // GitHub credentials before the first model-controlled provider process is
     // launched. No helper command or operator HOME path survives this capture.
     let cwd = current_working_directory()?;
+    let nemo_workspace = config.managed_nemo_workspace();
     let prepared_job_sources = job_receiver::prepare_job_sources(
         std::path::Path::new(&cwd),
         grants_json,
         grants_file,
         ledger_dir,
+        nemo_workspace,
     )
     .map_err(|error| anyhow::anyhow!("agent job startup configuration error: {error}"))?;
     let grants_json = prepared_job_sources.grants_json;
@@ -3146,6 +3148,7 @@ async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
         grants_file: None,
         ledger_root: ledger_dir,
         allow_insecure_loopback,
+        nemo_workspace,
     };
     let ctx = Arc::new(PromptContext {
         mcp_servers: build_mcp_servers(&config, &protected_mcp_paths),
@@ -3210,7 +3213,7 @@ async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
             pubkey: sponsor_pubkey,
             github_login: receiver_owner_github_login
                 .clone()
-                .unwrap_or_else(|| "buzz-owner".into()),
+                .unwrap_or_else(|| buzz_core::nemo::UNLINKED_GITHUB_LOGIN.into()),
         };
         Some(
             job_receiver::JobReceiver::from_sources(

@@ -134,14 +134,16 @@ pub(crate) async fn authorize_stored_request(
         .map_err(|_| JobAuthError::Invalid("requester_pubkey is invalid".into()))?;
     let recipient = PublicKey::parse(&authorization.recipient_pubkey)
         .map_err(|_| JobAuthError::Invalid("recipient_pubkey is invalid".into()))?;
-    require_channel_member_locked(tenant, &mut lock, channel_id, &requester, "job requester")
-        .await?;
-    require_channel_member_locked(tenant, &mut lock, channel_id, &recipient, "job recipient")
-        .await?;
     let requester_owner =
         effective_owner_locked(tenant, &mut lock, &requester, false, "job requester").await?;
     let recipient_owner =
         effective_owner_locked(tenant, &mut lock, &recipient, true, "job recipient").await?;
+    if !gate::is_managed_nemo_tenant(tenant, state, &root) {
+        require_channel_member_locked(tenant, &mut lock, channel_id, &requester, "job requester")
+            .await?;
+        require_channel_member_locked(tenant, &mut lock, channel_id, &recipient, "job recipient")
+            .await?;
+    }
     validate_sponsor_locked(tenant, &mut lock, &root).await?;
     ensure_authorizable_history(
         tenant,

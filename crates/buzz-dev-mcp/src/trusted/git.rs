@@ -147,7 +147,7 @@ pub async fn commit(
         if paths.is_empty() {
             return Err("trusted Git commit requires staged changes".to_owned());
         }
-        ensure_paths_allowed(&paths, &checkout.path_prefixes)?;
+        ensure_paths_allowed(&paths, &checkout.path_prefixes, checkout.repository_wide)?;
 
         let message = signed_commit_message(relay, &request, &params.message)?;
         let unsigned = git_output(
@@ -545,8 +545,18 @@ fn parse_nul_paths(bytes: &[u8]) -> Result<Vec<String>, String> {
         .collect()
 }
 
-fn ensure_paths_allowed(paths: &[String], prefixes: &[String]) -> Result<(), String> {
-    if paths.iter().all(|path| path_allowed(path, prefixes)) {
+fn ensure_paths_allowed(
+    paths: &[String],
+    prefixes: &[String],
+    repository_wide: bool,
+) -> Result<(), String> {
+    if paths.iter().all(|path| {
+        if repository_wide {
+            path_allowed(path, std::slice::from_ref(path))
+        } else {
+            path_allowed(path, prefixes)
+        }
+    }) {
         Ok(())
     } else {
         Err("staged or committed changes extend outside the local Project path grant".into())
@@ -609,7 +619,11 @@ async fn ensure_commit_range(
             cancellation,
         )
         .await?;
-        ensure_paths_allowed(&parse_nul_paths(&changed.stdout)?, &checkout.path_prefixes)?;
+        ensure_paths_allowed(
+            &parse_nul_paths(&changed.stdout)?,
+            &checkout.path_prefixes,
+            checkout.repository_wide,
+        )?;
         let raw_commit = git_output(
             relay,
             checkout,
@@ -885,6 +899,7 @@ committer Buzz <buzz@example.invalid> 1 +0000\n\nmessage\n"
             owner_pubkey: owner_keys.public_key().to_hex(),
             owner_github_login: None,
             grants: GrantSet::default(),
+            a2a_channel_id: None,
             session_channel_id: None,
             session_thread_root_id: None,
             job_operation_id: None,

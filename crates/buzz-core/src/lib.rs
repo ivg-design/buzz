@@ -30,6 +30,8 @@ pub mod job;
 pub mod job_authorization;
 /// Buzz kind number registry — custom event type constants.
 pub mod kind;
+/// Built-in policy for Buzz's dedicated Nemo development community.
+pub mod nemo;
 /// Network utilities — SSRF-safe IP classification.
 pub mod network;
 /// NIP-10 thread-marker parsing — shared `root`/`reply` marker resolver.

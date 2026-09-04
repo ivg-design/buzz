@@ -1891,6 +1891,8 @@ fn format_conversation_context(
 /// Arguments for [`format_prompt`] beyond the required [`FlushBatch`].
 #[derive(Default)]
 pub struct FormatPromptArgs<'a> {
+    /// Managed project instructions that must lead every legacy session.
+    pub leading_project_instructions: Option<&'a str>,
     pub agent_core: Option<&'a str>,
     /// Owner-signed instructions for an active huddle channel.
     pub huddle_instructions: Option<&'a str>,
@@ -1939,6 +1941,7 @@ pub struct FormatPromptArgs<'a> {
 /// this one type so their section set and ordering cannot drift apart.
 #[derive(Default)]
 pub(crate) struct StandingContext<'a> {
+    pub leading_project_instructions: Option<&'a str>,
     pub base_prompt: Option<&'a str>,
     pub system_prompt: Option<&'a str>,
     pub team_instructions: Option<&'a str>,
@@ -1950,7 +1953,17 @@ pub(crate) struct StandingContext<'a> {
 impl StandingContext<'_> {
     /// Render the sections in the order legacy agents have always seen them.
     pub(crate) fn sections(&self) -> Vec<String> {
-        let mut sections = Vec::with_capacity(6);
+        let mut sections = Vec::with_capacity(7);
+        if let Some(project) = self
+            .leading_project_instructions
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            sections.push(crate::prompt_framing::semantic_section(
+                "project-instructions",
+                project,
+            ));
+        }
         if let Some(bp) = self.base_prompt {
             sections.push(base_section(bp));
         }
@@ -2051,6 +2064,7 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
     if !args.has_system_prompt_support && !args.standing_context_sent {
         sections.extend(
             StandingContext {
+                leading_project_instructions: args.leading_project_instructions,
                 base_prompt: args.base_prompt,
                 system_prompt: args.system_prompt,
                 team_instructions: args.team_instructions,
@@ -3182,6 +3196,35 @@ mod tests {
             prompt.starts_with("<core-memory>\nbe helpful\n</core-memory>\n\n<context>"),
             "expected core block first, then <context>; got: {prompt}"
         );
+    }
+
+    #[test]
+    fn legacy_managed_project_instructions_precede_every_other_section() {
+        let ch = Uuid::new_v4();
+        let batch = FlushBatch {
+            channel_id: ch,
+            scope: conv(ch),
+            events: vec![BatchEvent {
+                event: make_event("hi"),
+                prompt_tag: "test".into(),
+                received_at: Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let prompt = format_prompt(
+            &batch,
+            &FormatPromptArgs {
+                leading_project_instructions: Some("golden rules first"),
+                base_prompt: Some("runtime mechanics"),
+                system_prompt: Some("agent persona"),
+                ..Default::default()
+            },
+        )
+        .join("\n\n");
+        assert!(prompt.starts_with(
+            "<project-instructions>\ngolden rules first\n</project-instructions>\n\n<base>"
+        ));
     }
 
     #[test]

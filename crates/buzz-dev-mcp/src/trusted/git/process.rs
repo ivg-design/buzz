@@ -10,10 +10,12 @@ use std::fs::{File, OpenOptions};
 use std::io::Write as _;
 #[cfg(target_os = "macos")]
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+use std::path::Path;
 #[cfg(unix)]
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::process::ExitStatus;
 #[cfg(unix)]
-use std::process::{ExitStatus, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 #[cfg(unix)]
 use std::time::Duration;
@@ -41,7 +43,13 @@ const IO_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(unix)]
 const PROCESS_GROUP_POLL_INTERVAL: Duration = Duration::from_millis(10);
 #[cfg(unix)]
+const PROCESS_GROUP_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(unix)]
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
+#[cfg(unix)]
+const CHECKOUT_INSPECTION_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(unix)]
+const MAX_CHECKOUT_INSPECTION_BYTES: usize = 64 * 1024;
 #[cfg(target_os = "macos")]
 const MAX_CREDENTIAL_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_INPUT_BYTES: usize = 4 * 1024 * 1024;
@@ -62,6 +70,78 @@ const PRIVATE_TEMP_ROOT: &str = "/private/tmp";
 
 pub(super) struct GitOutput {
     pub(super) stdout: Vec<u8>,
+}
+
+pub(in crate::trusted) struct CheckoutInspectionOutput {
+    pub(in crate::trusted) status: ExitStatus,
+    pub(in crate::trusted) stdout: Vec<u8>,
+    pub(in crate::trusted) stderr: Vec<u8>,
+}
+
+/// Run read-only checkout inspection through the same bounded, descendant-safe
+/// process seam as privileged Git. This is deliberately unavailable on
+/// platforms where the process-tree containment proof is not implemented.
+pub(in crate::trusted) async fn inspect_checkout_git(
+    cwd: &Path,
+    args: &[&str],
+) -> Result<CheckoutInspectionOutput, String> {
+    #[cfg(not(unix))]
+    {
+        let _ = (cwd, args);
+        Err(
+            "local A2A checkout inspection is unavailable on this platform: descendant-safe Git inspection is implemented only on Unix"
+                .into(),
+        )
+    }
+    #[cfg(unix)]
+    {
+        let git =
+            resolve_system_git().ok_or_else(|| "trusted system git was not found".to_owned())?;
+        inspect_checkout_git_with(&git, cwd, args, CHECKOUT_INSPECTION_TIMEOUT).await
+    }
+}
+
+#[cfg(unix)]
+async fn inspect_checkout_git_with(
+    git: &Path,
+    cwd: &Path,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<CheckoutInspectionOutput, String> {
+    let mut command = Command::new(git);
+    command
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    apply_isolated_environment(&mut command);
+    apply_config_environment(
+        &mut command,
+        &[
+            ("core.hooksPath".into(), "/dev/null".into()),
+            ("core.fsmonitor".into(), "false".into()),
+            ("core.attributesFile".into(), "/dev/null".into()),
+            ("credential.helper".into(), String::new()),
+            ("protocol.allow".into(), "never".into()),
+        ],
+    );
+    set_process_group(&mut command);
+    let cancellation = CancellationToken::new();
+    let mut output = run_managed(
+        command,
+        None,
+        timeout,
+        MAX_CHECKOUT_INSPECTION_BYTES,
+        &cancellation,
+    )
+    .await
+    .map_err(|error| format!("bounded local checkout inspection failed: {error}"))?;
+    Ok(CheckoutInspectionOutput {
+        status: output.status,
+        stdout: std::mem::take(&mut *output.stdout),
+        stderr: std::mem::take(&mut *output.stderr),
+    })
 }
 
 /// Exact observation made after a possibly side-effecting ref command.
@@ -1097,10 +1177,10 @@ async fn terminate_process_group(
 ) -> Result<(), String> {
     kill_process_group(pid);
     let _ = child.start_kill();
-    child
-        .wait()
-        .await
-        .map_err(|_| "failed to reap trusted Git child".to_owned())?;
+    match tokio::time::timeout(PROCESS_GROUP_CLEANUP_TIMEOUT, child.wait()).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(_)) | Err(_) => abort_process_containment_failure(),
+    }
     wait_for_process_group_exit(pid).await
 }
 
@@ -1111,20 +1191,25 @@ async fn wait_for_process_group_exit(pid: Option<u32>) -> Result<(), String> {
     use nix::unistd::Pid;
 
     let Some(pid) = pid.and_then(|pid| i32::try_from(pid).ok()) else {
-        return Err("trusted Git child did not expose a process-group ID".into());
+        abort_process_containment_failure();
     };
     let group = Pid::from_raw(pid);
+    let deadline = tokio::time::Instant::now() + PROCESS_GROUP_CLEANUP_TIMEOUT;
     loop {
         match killpg(group, None) {
             Err(Errno::ESRCH) => return Ok(()),
             Ok(()) | Err(Errno::EPERM) => {
                 // Reassert SIGKILL in case a group member was between fork and
-                // exec during the first signal. There is deliberately no
-                // timeout that would release the operation lease early.
+                // exec during the first signal. If the bounded proof cannot
+                // complete, terminate the harness rather than release the
+                // outer privilege lease while a child may still be alive.
                 kill_process_group(Some(pid as u32));
+                if tokio::time::Instant::now() >= deadline {
+                    abort_process_containment_failure();
+                }
                 tokio::time::sleep(PROCESS_GROUP_POLL_INTERVAL).await;
             }
-            Err(_) => return Err("failed to verify trusted Git process-group cleanup".into()),
+            Err(_) => abort_process_containment_failure(),
         }
     }
 }
@@ -1143,6 +1228,7 @@ fn apply_isolated_environment(command: &mut Command) {
         .env("GIT_PROTOCOL_FROM_USER", "0")
         .env("GIT_ATTR_NOSYSTEM", "1")
         .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_NO_REPLACE_OBJECTS", "1");
 }
 
@@ -1300,8 +1386,17 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
 
 #[cfg(unix)]
 fn resolve_system_git() -> Option<PathBuf> {
-    ["/usr/bin/git", "/bin/git"]
-        .into_iter()
+    let candidates: &[&str] = if cfg!(target_os = "macos") {
+        &[
+            "/Library/Developer/CommandLineTools/usr/bin/git",
+            "/Applications/Xcode.app/Contents/Developer/usr/bin/git",
+            "/usr/bin/git",
+        ]
+    } else {
+        &["/usr/bin/git", "/bin/git"]
+    };
+    candidates
+        .iter()
         .map(PathBuf::from)
         .find(|candidate| candidate.is_file())
         .and_then(|candidate| candidate.canonicalize().ok())
@@ -1345,8 +1440,8 @@ impl Drop for ProcessGroupGuard {
         // `run_managed` normally disarms only after its async reap proof. If
         // the whole future is dropped or unwinds, synchronously complete the
         // same proof before stack unwinding can drop the outer operation
-        // lease. SIGKILL bounds the child side; no timeout is allowed to turn
-        // an unreaped process into an apparently finished invocation.
+        // lease. Cleanup is time-bounded, but failure to prove containment is
+        // fatal so the lease is never silently released around a live child.
         reap_process_group_blocking(self.pid);
     }
 }
@@ -1364,30 +1459,51 @@ fn kill_process_group(pid: Option<u32>) {
 fn reap_process_group_blocking(pid: Option<u32>) {
     use nix::errno::Errno;
     use nix::sys::signal::killpg;
-    use nix::sys::wait::waitpid;
+    use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
     use nix::unistd::Pid;
 
     let Some(pid) = pid.and_then(|pid| i32::try_from(pid).ok()) else {
+        // A disarmed guard stores `None`; there is no process left to reap.
         return;
     };
     let process = Pid::from_raw(pid);
+    let deadline = std::time::Instant::now() + PROCESS_GROUP_CLEANUP_TIMEOUT;
     loop {
-        match waitpid(process, None) {
+        match waitpid(process, Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::StillAlive) => {
+                kill_process_group(Some(pid as u32));
+            }
             Ok(_) | Err(Errno::ECHILD) => break,
             Err(Errno::EINTR) => continue,
-            Err(_) => std::thread::sleep(PROCESS_GROUP_POLL_INTERVAL),
+            Err(_) => abort_process_containment_failure(),
         }
+        if std::time::Instant::now() >= deadline {
+            abort_process_containment_failure();
+        }
+        std::thread::sleep(PROCESS_GROUP_POLL_INTERVAL);
     }
     loop {
         match killpg(process, None) {
             Err(Errno::ESRCH) => break,
             Ok(()) | Err(Errno::EPERM) => {
                 kill_process_group(Some(pid as u32));
-                std::thread::sleep(PROCESS_GROUP_POLL_INTERVAL);
             }
-            Err(_) => std::thread::sleep(PROCESS_GROUP_POLL_INTERVAL),
+            Err(_) => abort_process_containment_failure(),
         }
+        if std::time::Instant::now() >= deadline {
+            abort_process_containment_failure();
+        }
+        std::thread::sleep(PROCESS_GROUP_POLL_INTERVAL);
     }
+}
+
+#[cfg(unix)]
+fn abort_process_containment_failure() -> ! {
+    // This path means an active trusted child may still hold the operation's
+    // privilege lease. Continuing would be a boundary violation; abort is the
+    // bounded fail-closed outcome and lets the supervisor restart cleanly.
+    eprintln!("fatal: failed to contain a trusted Git process tree");
+    std::process::abort()
 }
 
 #[cfg(unix)]
@@ -1706,6 +1822,41 @@ mod tests {
         assert!(
             nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err(),
             "runner future dropped before its process group was gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkout_inspection_timeout_reaps_descendants() {
+        let fixture = tempfile::tempdir().expect("fixture");
+        let fake_git = fixture.path().join("fake-git");
+        write_executable(
+            &fake_git,
+            "#!/bin/sh\n/bin/sleep 30 &\nprintf '%s' \"$!\" > \"${0%/*}/inspection-child-pid\"\nwait\n",
+        );
+        let started = std::time::Instant::now();
+        let error = match inspect_checkout_git_with(
+            &fake_git,
+            fixture.path(),
+            &["rev-parse", "HEAD"],
+            Duration::from_millis(500),
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("inspection must time out"),
+        };
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "bounded inspection exceeded its cleanup budget"
+        );
+        assert!(error.contains("timed out"));
+        let pid = std::fs::read_to_string(fixture.path().join("inspection-child-pid"))
+            .expect("inspection child pid")
+            .parse::<i32>()
+            .expect("numeric inspection child pid");
+        assert!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err(),
+            "bounded inspection returned before its process group was gone"
         );
     }
 
@@ -2171,5 +2322,22 @@ mod tests {
             "block/buzz",
         )
         .is_err());
+    }
+}
+
+#[cfg(all(test, not(unix)))]
+mod unsupported_platform_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn checkout_inspection_fails_closed_without_descendant_containment() {
+        let error = match inspect_checkout_git(Path::new("."), &["rev-parse", "HEAD"]).await {
+            Err(error) => error,
+            Ok(_) => panic!("unsupported platform must fail closed"),
+        };
+        assert_eq!(
+            error,
+            "local A2A checkout inspection is unavailable on this platform: descendant-safe Git inspection is implemented only on Unix"
+        );
     }
 }

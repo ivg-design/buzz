@@ -1570,10 +1570,12 @@ async fn deferred_terminal_finisher_waits_then_uses_final_git_effect() {
                 && error.code == "ambiguous_git_operation"
                 && !error.retryable
     ));
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(registry
-        .for_session(&scope, &admitted.dispatch.checkout_root)
-        .is_err());
+    assert!(
+        registry
+            .for_session(&scope, &admitted.dispatch.checkout_root)
+            .is_err(),
+        "terminal publication must never overtake registry removal"
+    );
 }
 
 #[tokio::test]

@@ -500,13 +500,14 @@ fn macos_sandbox_profile(
             "operator HOME must name an existing canonical directory",
         ));
     }
-    let temporary_root = std::env::temp_dir()
-        .canonicalize()
-        .unwrap_or_else(|_| std::env::temp_dir());
     let git_directories = git_storage_directories(cwd);
     let mut profile = String::from(
         "(version 1)\n\
-         (allow default)\n\
+         (import \"system.sb\")\n\
+         (deny default)\n\
+         (allow process-fork)\n\
+         (allow signal (target same-sandbox))\n\
+         (allow network-outbound)\n\
          (deny process-exec (literal \"/usr/bin/security\"))\n\
          (deny process-exec (literal \"/usr/bin/osascript\"))\n\
          (deny process-exec (literal \"/usr/bin/open\"))\n\
@@ -526,39 +527,90 @@ fn macos_sandbox_profile(
         operator_home.join(".nvm/versions"),
         operator_home.join(".local/bin"),
     ];
+    let system_executable_roots = [
+        PathBuf::from("/bin"),
+        PathBuf::from("/sbin"),
+        PathBuf::from("/usr/bin"),
+        PathBuf::from("/usr/sbin"),
+        PathBuf::from("/usr/libexec"),
+    ];
+    let homebrew_read_roots = [
+        PathBuf::from("/opt/homebrew/bin"),
+        PathBuf::from("/opt/homebrew/sbin"),
+        PathBuf::from("/opt/homebrew/Cellar"),
+        PathBuf::from("/opt/homebrew/opt"),
+        PathBuf::from("/opt/homebrew/lib"),
+        PathBuf::from("/usr/local/bin"),
+        PathBuf::from("/usr/local/lib"),
+    ];
+    let developer_tool_roots = [
+        PathBuf::from("/Library/Developer/CommandLineTools"),
+        PathBuf::from("/Applications/Xcode.app/Contents/Developer"),
+    ];
     let mut readable_roots = vec![cwd.to_path_buf(), session_dir.clone()];
     readable_roots.extend(git_directories.iter().cloned());
     readable_roots.extend(
         read_only_tool_roots
-            .into_iter()
-            .filter(|path| path.exists()),
+            .iter()
+            .filter(|path| path.exists())
+            .cloned(),
     );
     readable_roots.extend(shim_read_roots.iter().cloned());
+    readable_roots.extend(
+        system_executable_roots
+            .iter()
+            .chain(homebrew_read_roots.iter())
+            .chain(developer_tool_roots.iter())
+            .filter(|path| path.exists())
+            .cloned(),
+    );
     let mut writable_roots = vec![cwd.to_path_buf(), session_dir.clone()];
     writable_roots.extend(git_directories.iter().cloned());
-    append_tree_denies(
-        &mut profile,
-        &operator_home,
-        &readable_roots,
-        &writable_roots,
-        &literal,
+
+    // Seatbelt's default is deny. Add only the exact checkout, session and
+    // toolchain roots needed by a developer shell. In particular, nothing
+    // grants ambient access to /Users/Shared, /Volumes, another home, or an
+    // operator-selected absolute path.
+    for root in &readable_roots {
+        profile.push_str(&format!(
+            "(allow file-read* file-test-existence (literal \"{}\") (subpath \"{}\"))\n",
+            literal(root),
+            literal(root)
+        ));
+    }
+    for root in &writable_roots {
+        profile.push_str(&format!(
+            "(allow file-write* (literal \"{}\") (subpath \"{}\"))\n",
+            literal(root),
+            literal(root)
+        ));
+    }
+    let mut executable_roots = vec![cwd.to_path_buf(), session_dir.clone()];
+    executable_roots.extend(
+        system_executable_roots
+            .iter()
+            .chain(read_only_tool_roots.iter())
+            .chain(homebrew_read_roots.iter())
+            .chain(developer_tool_roots.iter())
+            .chain(shim_read_roots.iter())
+            .filter(|path| path.exists())
+            .cloned(),
     );
-    append_tree_denies(
-        &mut profile,
-        &temporary_root,
-        &readable_roots,
-        &writable_roots,
-        &literal,
-    );
-    let private_tmp = Path::new("/private/tmp");
-    if private_tmp != temporary_root {
-        append_tree_denies(
-            &mut profile,
-            private_tmp,
-            &readable_roots,
-            &writable_roots,
-            &literal,
-        );
+    for root in &executable_roots {
+        profile.push_str(&format!(
+            "(allow process-exec (literal \"{}\") (subpath \"{}\"))\n",
+            literal(root),
+            literal(root)
+        ));
+    }
+    for selector in [
+        Path::new("/var/select/developer_dir"),
+        Path::new("/private/var/select/developer_dir"),
+    ] {
+        profile.push_str(&format!(
+            "(allow file-read* file-test-existence (literal \"{}\"))\n",
+            literal(selector)
+        ));
     }
 
     // A linked worktree's Git storage normally lives outside `cwd` (and often
@@ -595,60 +647,12 @@ fn macos_sandbox_profile(
     ));
     for protected in protected_paths.paths() {
         profile.push_str(&format!(
-            "(deny file-write* (literal \"{}\") (subpath \"{}\"))\n",
+            "(deny file-read* file-write* file-test-existence (literal \"{}\") (subpath \"{}\"))\n",
             literal(protected),
             literal(protected)
         ));
     }
     Ok(profile)
-}
-
-/// Deny an operator-owned tree except for pre-resolved capabilities. The
-/// compound filter matters: Seatbelt deny rules cannot be reopened by a later
-/// allow, while `require-not` gives the checkout one narrow exception directly
-/// in the deny rule.
-#[cfg(target_os = "macos")]
-fn append_tree_denies(
-    profile: &mut String,
-    root: &Path,
-    readable_roots: &[PathBuf],
-    writable_roots: &[PathBuf],
-    literal: &impl Fn(&Path) -> String,
-) {
-    if !root.exists() {
-        return;
-    }
-    append_operation_tree(profile, "file-read*", root, readable_roots, literal);
-    append_operation_tree(profile, "file-write*", root, writable_roots, literal);
-}
-
-#[cfg(target_os = "macos")]
-fn append_operation_tree(
-    profile: &mut String,
-    operation: &str,
-    root: &Path,
-    allowed_roots: &[PathBuf],
-    literal: &impl Fn(&Path) -> String,
-) {
-    let allowed = allowed_roots
-        .iter()
-        .filter(|allowed| allowed.starts_with(root))
-        .collect::<Vec<_>>();
-    if allowed.is_empty() {
-        profile.push_str(&format!(
-            "(deny {operation} (subpath \"{}\"))\n",
-            literal(root)
-        ));
-        return;
-    }
-    profile.push_str(&format!(
-        "(deny {operation} (require-all (subpath \"{}\") (require-not (require-any",
-        literal(root)
-    ));
-    for allowed in allowed {
-        profile.push_str(&format!(" (subpath \"{}\")", literal(allowed)));
-    }
-    profile.push_str("))))\n");
 }
 
 #[cfg(target_os = "macos")]
@@ -1574,6 +1578,79 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[tokio::test(flavor = "current_thread")]
+    async fn deny_by_default_blocks_shared_volumes_and_external_protected_paths() {
+        let checkout = tempdir().expect("checkout");
+        let shared = tempfile::Builder::new()
+            .prefix("buzz-shell-shared-")
+            .tempdir_in("/Users/Shared")
+            .expect("shared fixture");
+        let ordinary = shared.path().join("ordinary-sentinel");
+        let protected_root = shared.path().join("external-authority");
+        let protected = protected_root.join("grant.json");
+        let shared_write = shared.path().join("model-write");
+        std::fs::create_dir(&protected_root).expect("protected fixture");
+        std::fs::write(&ordinary, "shared-secret").expect("ordinary sentinel");
+        std::fs::write(&protected, "authority-secret").expect("authority sentinel");
+
+        let shim = Shim::install().expect("shim");
+        let state = SharedState::new_for_test(
+            checkout.path().to_path_buf(),
+            shim,
+            crate::paths::ProtectedPathPolicy::from_paths([protected_root.clone()]),
+        )
+        .expect("state");
+        let command = format!(
+            "/bin/cat '{}' >/dev/null 2>&1; printf 'shared_read=%s\\n' $?; \
+             printf poison > '{}' 2>/dev/null; printf 'shared_write=%s\\n' $?; \
+             /bin/ls /Volumes >/dev/null 2>&1; printf 'volumes_read=%s\\n' $?; \
+             /bin/cat '{}' >/dev/null 2>&1; printf 'protected_read=%s\\n' $?; \
+             printf poison > '{}' 2>/dev/null; printf 'protected_write=%s\\n' $?",
+            ordinary.display(),
+            shared_write.display(),
+            protected.display(),
+            protected.display(),
+        );
+        let result = run(
+            &state,
+            ShellParams {
+                command,
+                workdir: None,
+                timeout_ms: Some(5_000),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .expect("shell result");
+        let result = body(result);
+        assert_eq!(result["exit_code"], 0, "{result}");
+        let stdout = result["stdout"].as_str().expect("stdout");
+        for operation in [
+            "shared_read",
+            "shared_write",
+            "volumes_read",
+            "protected_read",
+            "protected_write",
+        ] {
+            assert!(
+                !stdout.contains(&format!("{operation}=0")),
+                "{operation} escaped the production Seatbelt profile: {result}"
+            );
+        }
+        assert!(!shared_write.exists());
+        assert_eq!(
+            std::fs::read_to_string(&protected).expect("protected sentinel"),
+            "authority-secret"
+        );
+        let profile = std::fs::read_to_string(&state.sandbox_profile).expect("profile");
+        assert!(profile.contains("(deny default)"));
+        let protected_literal = protected_root.to_string_lossy();
+        assert!(profile.contains(&format!(
+            "(deny file-read* file-write* file-test-existence (literal \"{protected_literal}\")"
+        )));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "current_thread")]
     async fn model_shell_can_edit_and_stage_ordinary_checkout_files() {
         let checkout = tempdir().expect("checkout");
         let init = std::process::Command::new("/usr/bin/git")
@@ -1587,7 +1664,9 @@ mod tests {
         let result = run(
             &state,
             ShellParams {
-                command: "printf 'after\\n' > ordinary.txt && /usr/bin/git add ordinary.txt && /usr/bin/git status --short".into(),
+                command:
+                    "printf 'after\\n' > ordinary.txt && git add ordinary.txt && git status --short"
+                        .into(),
                 workdir: None,
                 timeout_ms: Some(5_000),
             },

@@ -21,7 +21,9 @@ use process::{
 
 mod process;
 
-pub(super) use process::{capture_operator_github_credentials, GitHubCredentialStore};
+pub(super) use process::{
+    capture_operator_github_credentials, inspect_checkout_git, GitHubCredentialStore,
+};
 
 const MAX_COMMIT_MESSAGE_BYTES: usize = 16 * 1024;
 const MAX_PUSH_COMMITS: usize = 256;
@@ -346,12 +348,15 @@ async fn resolve_checkout(
     {
         return Err("the bound Project job request is outside the local grant".into());
     }
-    let checkout = relay.grants.trusted_git_checkout(
-        relay.session_channel_id.as_deref(),
-        relay.session_working_directory.as_deref(),
-        &request,
-        operation,
-    )?;
+    let checkout = relay
+        .grants
+        .trusted_git_checkout(
+            relay.session_channel_id.as_deref(),
+            relay.session_working_directory.as_deref(),
+            &request,
+            operation,
+        )
+        .await?;
     Ok((checkout, request))
 }
 
@@ -690,8 +695,8 @@ fn disallowed_local_config_key(key: &str) -> bool {
         || key.starts_with("url.")
         || key == "include"
         || key.starts_with("include.")
-        || key == "includif"
-        || key.starts_with("includif.")
+        || key == "includeif"
+        || key.starts_with("includeif.")
         || key == "filter"
         || key.starts_with("filter.")
         || key == "submodule"
@@ -852,8 +857,8 @@ fn mutation_error_result(
 #[cfg(test)]
 mod tests {
     use super::{
-        insert_commit_signature, sign_commit_payload, split_commit_signature,
-        validate_commit_message, verify_commit_signature,
+        disallowed_local_config_key, insert_commit_signature, sign_commit_payload,
+        split_commit_signature, validate_commit_message, verify_commit_signature,
     };
     use crate::trusted::{GrantSet, TrustedConfig, TrustedRelay};
 
@@ -951,5 +956,13 @@ gpgsig second\n\nmessage\n";
         }
         validate_commit_message("Make the Buzz-worthy behavior clearer: safely")
             .expect("ordinary body text is not a reserved trailer");
+    }
+
+    #[test]
+    fn conditional_git_includes_are_rejected() {
+        assert!(disallowed_local_config_key("includeif"));
+        assert!(disallowed_local_config_key(
+            "includeif.gitdir:/tmp/project.path"
+        ));
     }
 }

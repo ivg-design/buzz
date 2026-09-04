@@ -88,7 +88,7 @@ pub async fn dispatch(
     }
     let result = match params.supersedes_event_id.clone() {
         Some(event_id) => build_superseding_request(relay, params, &event_id, &cancellation).await,
-        None => build_request(relay, params),
+        None => build_request(relay, params).await,
     };
     match result.and_then(|job| ensure_session_channel(relay, &job).map(|_| job)) {
         Ok(job) => publish_result(relay.publish_job(job, &cancellation).await),
@@ -169,12 +169,15 @@ pub(super) async fn prepare_handoff(
     chain.ensure_recipient(relay)?;
     chain.ensure_active()?;
     ensure_bound_job_session(relay, &chain.request.common, &params.request_event_id)?;
-    let target_grant = relay.grants.outbound(
-        &params.handoff_to,
-        &chain.request.capability,
-        &chain.request.common.repository.paths,
-        &params.worktree_id,
-    )?;
+    let target_grant = relay
+        .grants
+        .outbound(
+            &params.handoff_to,
+            &chain.request.capability,
+            &chain.request.common.repository.paths,
+            &params.worktree_id,
+        )
+        .await?;
     if target_grant.repository != chain.request.common.repository.canonical
         || target_grant.project_address != chain.request.common.project.address
         || target_grant.home_channel != chain.request.common.project.home_channel
@@ -228,16 +231,22 @@ pub async fn send_chat(
     publish_result(relay.publish_chat(&params.content, &cancellation).await)
 }
 
-fn build_request(relay: &TrustedRelay, params: A2aDispatchParams) -> Result<JobEvent, String> {
+async fn build_request(
+    relay: &TrustedRelay,
+    params: A2aDispatchParams,
+) -> Result<JobEvent, String> {
     if params.coordinator_epoch != 1 {
         return Err("initial A2A requests require coordinator_epoch=1".into());
     }
-    let grant = relay.grants.outbound(
-        &params.recipient_pubkey,
-        &params.capability,
-        &params.paths,
-        &params.worktree_id,
-    )?;
+    let grant = relay
+        .grants
+        .outbound(
+            &params.recipient_pubkey,
+            &params.capability,
+            &params.paths,
+            &params.worktree_id,
+        )
+        .await?;
     let github_login = relay
         .owner_github_login
         .clone()

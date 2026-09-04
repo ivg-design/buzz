@@ -394,7 +394,7 @@ where
     );
     let mut total = 0usize;
     for name in &manifest.skills {
-        if !valid_skill_name(&name) || !seen.insert(name.clone()) {
+        if !valid_skill_name(name) || !seen.insert(name.clone()) {
             return Err(format!(
                 "{MANIFEST_PATH} contains an invalid or duplicate skill name"
             ));

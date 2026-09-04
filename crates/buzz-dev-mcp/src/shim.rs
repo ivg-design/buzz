@@ -23,6 +23,21 @@ impl Shim {
         for name in ["rg", "tree"] {
             symlink(&self_exe, &dir.path().join(name))?;
         }
+        // `/usr/bin/git` is an xcrun launcher on macOS. It writes an ambient
+        // per-user cache outside the session before starting Git, which a
+        // deny-by-default model sandbox must not permit. Resolve the immutable
+        // developer-tool binary up front and expose only that binary through
+        // the private shim directory.
+        #[cfg(target_os = "macos")]
+        if let Some(git) = [
+            PathBuf::from("/Library/Developer/CommandLineTools/usr/bin/git"),
+            PathBuf::from("/Applications/Xcode.app/Contents/Developer/usr/bin/git"),
+        ]
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+        {
+            symlink(&git, &dir.path().join("git"))?;
+        }
 
         let mut entries = vec![PathBuf::from(dir.path())];
         // Never relay the ambient PATH into the model shell. It may contain a

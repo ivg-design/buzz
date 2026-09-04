@@ -20,7 +20,7 @@ pub(crate) enum CancellationTerminal {
         lifecycle: super::lifecycle::LifecycleStore,
         community_id: String,
         worker_pubkey: String,
-        claim: super::ledger::StoredClaim,
+        claim: Box<super::ledger::StoredClaim>,
     },
     Cancelled,
     Indeterminate {
@@ -212,7 +212,7 @@ pub(super) async fn handle(
             lifecycle,
             community_id: receiver.tenant.community_id.clone(),
             worker_pubkey: receiver.agent_pubkey.clone(),
-            claim,
+            claim: Box::new(claim),
         },
     })))
 }

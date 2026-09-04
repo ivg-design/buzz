@@ -1,8 +1,9 @@
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
 
 use serde::Deserialize;
+
+use super::git::inspect_checkout_git;
 
 const MAX_GRANTS: usize = 128;
 
@@ -160,36 +161,30 @@ impl GrantSet {
         }
     }
 
-    pub fn outbound(
+    pub async fn outbound(
         &self,
         recipient: &str,
         capability: &str,
         paths: &[String],
         worktree_id: &str,
     ) -> Result<GrantMatch, String> {
-        let matches: Vec<(&JobGrant, Checkout)> = self
-            .grants
-            .iter()
-            .filter_map(|grant| {
-                let statically_allowed =
-                    grant.requester_pubkeys.iter().any(|peer| peer == recipient)
-                        && grant
-                            .capabilities
-                            .iter()
-                            .any(|allowed| allowed == capability)
-                        && grant.worktree_id == worktree_id
-                        && paths
-                            .iter()
-                            .all(|path| path_allowed(path, &grant.path_prefixes));
-                if statically_allowed {
-                    inspect_checkout(grant)
-                        .ok()
-                        .map(|checkout| (grant, checkout))
-                } else {
-                    None
+        let mut matches = Vec::new();
+        for grant in &self.grants {
+            let statically_allowed = grant.requester_pubkeys.iter().any(|peer| peer == recipient)
+                && grant
+                    .capabilities
+                    .iter()
+                    .any(|allowed| allowed == capability)
+                && grant.worktree_id == worktree_id
+                && paths
+                    .iter()
+                    .all(|path| path_allowed(path, &grant.path_prefixes));
+            if statically_allowed {
+                if let Ok(checkout) = inspect_checkout(grant).await {
+                    matches.push((grant, checkout));
                 }
-            })
-            .collect();
+            }
+        }
         match matches.as_slice() {
             [(grant, checkout)] => Ok(GrantMatch {
                 project_address: grant.project_address.clone(),
@@ -272,7 +267,7 @@ impl GrantSet {
     /// Unlike outbound dispatch, Git operations may advance HEAD after a
     /// signed commit. The original grant SHA must remain an ancestor and every
     /// other checkout invariant remains exact.
-    pub(super) fn trusted_git_checkout(
+    pub(super) async fn trusted_git_checkout(
         &self,
         session_channel_id: Option<&str>,
         session_working_directory: Option<&Path>,
@@ -289,29 +284,32 @@ impl GrantSet {
         if common.project.home_channel != channel {
             return Err("trusted Git request does not match the session channel".into());
         }
-        let mut matches = self
-            .grants
-            .iter()
-            .filter(|grant| {
-                grant.home_channel == channel
-                    && grant.project_address == common.project.address
-                    && grant.repository == common.repository.canonical
-                    && grant.base_sha == common.repository.base_sha
-                    && grant.branch == common.repository.branch
-                    && grant.worktree_id == common.repository.worktree_id
-                    && common
-                        .repository
-                        .paths
-                        .iter()
-                        .all(|path| path_allowed(path, &grant.path_prefixes))
-                    && grant.checkout_root == working_directory
-                    && grant
-                        .git_operations
-                        .iter()
-                        .any(|allowed| allowed == operation.as_str())
-            })
-            .filter_map(|grant| inspect_trusted_git_checkout(grant, &common.repository.paths).ok())
-            .collect::<Vec<_>>();
+        let candidate_grants = self.grants.iter().filter(|grant| {
+            grant.home_channel == channel
+                && grant.project_address == common.project.address
+                && grant.repository == common.repository.canonical
+                && grant.base_sha == common.repository.base_sha
+                && grant.branch == common.repository.branch
+                && grant.worktree_id == common.repository.worktree_id
+                && common
+                    .repository
+                    .paths
+                    .iter()
+                    .all(|path| path_allowed(path, &grant.path_prefixes))
+                && grant.checkout_root == working_directory
+                && grant
+                    .git_operations
+                    .iter()
+                    .any(|allowed| allowed == operation.as_str())
+        });
+        let mut matches = Vec::new();
+        for grant in candidate_grants {
+            if let Ok(checkout) =
+                inspect_trusted_git_checkout(grant, &common.repository.paths).await
+            {
+                matches.push(checkout);
+            }
+        }
         matches.sort_by(|left, right| {
             (
                 &left.repository,
@@ -340,23 +338,36 @@ struct Checkout {
     branch: String,
 }
 
-fn inspect_checkout(grant: &JobGrant) -> Result<Checkout, String> {
+async fn inspect_checkout(grant: &JobGrant) -> Result<Checkout, String> {
     let cwd = grant
         .checkout_root
         .canonicalize()
         .map_err(|_| "local A2A checkout is unavailable".to_owned())?;
-    let top = PathBuf::from(git(&cwd, &["rev-parse", "--show-toplevel"])?);
+    let top = PathBuf::from(git(&cwd, &["rev-parse", "--show-toplevel"]).await?);
     if top.canonicalize().ok().as_ref() != Some(&cwd) {
         return Err("local A2A checkout root no longer matches its grant".into());
     }
-    let base_sha = git(&cwd, &["rev-parse", "HEAD"])?;
-    let branch = git(&cwd, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
-    let remote = git(&cwd, &["remote", "get-url", "origin"])?;
-    let repository = canonical_github_remote(&remote)?;
-    let git_common_dir = PathBuf::from(git(
+    let base_sha = git(&cwd, &["rev-parse", "HEAD"]).await?;
+    let branch = git(&cwd, &["symbolic-ref", "--quiet", "--short", "HEAD"]).await?;
+    let remote = git(
         &cwd,
-        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    )?)
+        &[
+            "config",
+            "--local",
+            "--no-includes",
+            "--get",
+            "remote.origin.url",
+        ],
+    )
+    .await?;
+    let repository = canonical_github_remote(&remote)?;
+    let git_common_dir = PathBuf::from(
+        git(
+            &cwd,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )
+        .await?,
+    )
     .canonicalize()
     .map_err(|_| "local A2A Git directory is unavailable".to_owned())?;
     if repository != grant.repository
@@ -369,7 +380,7 @@ fn inspect_checkout(grant: &JobGrant) -> Result<Checkout, String> {
     Ok(Checkout { base_sha, branch })
 }
 
-fn inspect_trusted_git_checkout(
+async fn inspect_trusted_git_checkout(
     grant: &JobGrant,
     request_paths: &[String],
 ) -> Result<TrustedGitCheckout, String> {
@@ -377,18 +388,31 @@ fn inspect_trusted_git_checkout(
         .checkout_root
         .canonicalize()
         .map_err(|_| "local Project checkout is unavailable".to_owned())?;
-    let top = PathBuf::from(git(&root, &["rev-parse", "--show-toplevel"])?);
+    let top = PathBuf::from(git(&root, &["rev-parse", "--show-toplevel"]).await?);
     if top.canonicalize().ok().as_ref() != Some(&root) {
         return Err("local Project checkout root no longer matches its grant".into());
     }
-    let head_sha = git(&root, &["rev-parse", "HEAD"])?;
-    let branch = git(&root, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
-    let remote = git(&root, &["remote", "get-url", "origin"])?;
-    let repository = canonical_github_remote(&remote)?;
-    let git_common_dir = PathBuf::from(git(
+    let head_sha = git(&root, &["rev-parse", "HEAD"]).await?;
+    let branch = git(&root, &["symbolic-ref", "--quiet", "--short", "HEAD"]).await?;
+    let remote = git(
         &root,
-        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    )?)
+        &[
+            "config",
+            "--local",
+            "--no-includes",
+            "--get",
+            "remote.origin.url",
+        ],
+    )
+    .await?;
+    let repository = canonical_github_remote(&remote)?;
+    let git_common_dir = PathBuf::from(
+        git(
+            &root,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )
+        .await?,
+    )
     .canonicalize()
     .map_err(|_| "local Project Git directory is unavailable".to_owned())?;
     if repository != grant.repository
@@ -400,7 +424,9 @@ fn inspect_trusted_git_checkout(
     if !git_status(
         &root,
         &["merge-base", "--is-ancestor", &grant.base_sha, &head_sha],
-    )? {
+    )
+    .await?
+    {
         return Err("local Project checkout no longer descends from its granted base".into());
     }
     Ok(TrustedGitCheckout {
@@ -416,24 +442,8 @@ fn inspect_trusted_git_checkout(
     })
 }
 
-fn git(cwd: &Path, args: &[&str]) -> Result<String, String> {
-    let mut command = Command::new(system_git()?);
-    command
-        .args(args)
-        .current_dir(cwd)
-        .env_clear()
-        .env(
-            "PATH",
-            "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-        )
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_NO_REPLACE_OBJECTS", "1");
-    let output = command
-        .output()
-        .map_err(|error| format!("running git: {error}"))?;
+async fn git(cwd: &Path, args: &[&str]) -> Result<String, String> {
+    let output = inspect_checkout_git(cwd, args).await?;
     if !output.status.success() || !output.stderr.is_empty() {
         return Err("local checkout inspection failed".into());
     }
@@ -442,25 +452,12 @@ fn git(cwd: &Path, args: &[&str]) -> Result<String, String> {
         .map_err(|_| "git output was not UTF-8".into())
 }
 
-fn git_status(cwd: &Path, args: &[&str]) -> Result<bool, String> {
-    let mut command = Command::new(system_git()?);
-    command
-        .args(args)
-        .current_dir(cwd)
-        .env_clear()
-        .env(
-            "PATH",
-            "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-        )
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_NO_REPLACE_OBJECTS", "1");
-    let status = command
-        .status()
-        .map_err(|error| format!("running git: {error}"))?;
-    match status.code() {
+async fn git_status(cwd: &Path, args: &[&str]) -> Result<bool, String> {
+    let output = inspect_checkout_git(cwd, args).await?;
+    if !output.stderr.is_empty() {
+        return Err("local checkout ancestry inspection failed".into());
+    }
+    match output.status.code() {
         Some(0) => Ok(true),
         Some(1) => Ok(false),
         _ => Err("local checkout ancestry inspection failed".into()),
@@ -487,13 +484,6 @@ fn valid_github_part(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-}
-
-fn system_git() -> Result<&'static str, String> {
-    ["/usr/bin/git", "/bin/git"]
-        .into_iter()
-        .find(|path| Path::new(path).is_file())
-        .ok_or_else(|| "trusted system git was not found".to_owned())
 }
 
 pub(super) fn path_allowed(path: &str, prefixes: &[String]) -> bool {
@@ -533,13 +523,69 @@ fn validate_grant(grant: &mut JobGrant) -> Result<(), String> {
         .checkout_root
         .canonicalize()
         .map_err(|_| "checkout_root must be an absolute existing directory".to_owned())?;
-    grant.git_common_dir = PathBuf::from(git(
-        &grant.checkout_root,
-        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    )?)
-    .canonicalize()
-    .map_err(|_| "checkout_root must name an existing Git worktree".to_owned())?;
+    grant.git_common_dir = resolve_git_common_dir(&grant.checkout_root)?;
     Ok(())
+}
+
+/// Resolve the immutable Git storage identity without launching a process.
+///
+/// Grant loading is synchronous and occurs before any model process starts.
+/// The checkout itself is revalidated through the bounded Git inspection seam
+/// immediately before dispatch or a privileged Git operation.
+fn resolve_git_common_dir(checkout_root: &Path) -> Result<PathBuf, String> {
+    fn one_path(raw: &str, prefix: Option<&str>) -> Option<PathBuf> {
+        let value = raw.trim();
+        if value.is_empty() || value.as_bytes().contains(&0) || value.lines().count() != 1 {
+            return None;
+        }
+        let value = match prefix {
+            Some(prefix) => value.strip_prefix(prefix)?.trim(),
+            None => value,
+        };
+        (!value.is_empty()).then(|| PathBuf::from(value))
+    }
+
+    let dot_git = checkout_root.join(".git");
+    let git_dir = if dot_git.is_dir() {
+        dot_git
+            .canonicalize()
+            .map_err(|_| "checkout_root must name an existing Git worktree".to_owned())?
+    } else {
+        let raw = std::fs::read_to_string(&dot_git)
+            .map_err(|_| "checkout_root must name an existing Git worktree".to_owned())?;
+        let path = one_path(&raw, Some("gitdir:"))
+            .ok_or_else(|| "checkout_root has an invalid Git worktree pointer".to_owned())?;
+        let path = if path.is_absolute() {
+            path
+        } else {
+            checkout_root.join(path)
+        };
+        path.canonicalize()
+            .map_err(|_| "checkout_root must name an existing Git worktree".to_owned())?
+    };
+    if !git_dir.is_dir() {
+        return Err("checkout_root must name an existing Git worktree".into());
+    }
+    let common_path = git_dir.join("commondir");
+    if !common_path.exists() {
+        return Ok(git_dir);
+    }
+    let raw = std::fs::read_to_string(common_path)
+        .map_err(|_| "checkout_root has an invalid Git common directory".to_owned())?;
+    let path = one_path(&raw, None)
+        .ok_or_else(|| "checkout_root has an invalid Git common directory".to_owned())?;
+    let path = if path.is_absolute() {
+        path
+    } else {
+        git_dir.join(path)
+    };
+    let common = path
+        .canonicalize()
+        .map_err(|_| "checkout_root has an invalid Git common directory".to_owned())?;
+    if !common.is_dir() {
+        return Err("checkout_root has an invalid Git common directory".into());
+    }
+    Ok(common)
 }
 
 fn unique_valid(values: &[String], valid: fn(&str) -> bool, name: &str) -> Result<(), String> {
@@ -623,6 +669,7 @@ fn valid_relative_path(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     #[test]
     fn legacy_grant_is_rejected_without_an_exact_checkout() {
@@ -706,8 +753,8 @@ mod tests {
         assert!(grants.channels().is_empty());
     }
 
-    #[test]
-    fn outbound_revalidates_the_exact_local_checkout() {
+    #[tokio::test]
+    async fn outbound_revalidates_the_exact_local_checkout() {
         let checkout = tempfile::tempdir().expect("checkout");
         let run = |args: &[&str]| {
             let output = Command::new("git")
@@ -734,7 +781,21 @@ mod tests {
             "origin",
             "https://github.com/mysteropodes/nemo.git",
         ]);
-        let head = git(checkout.path(), &["rev-parse", "HEAD"]).expect("head");
+        let head = String::from_utf8(
+            Command::new("git")
+                .args([
+                    "-C",
+                    checkout.path().to_str().expect("path"),
+                    "rev-parse",
+                    "HEAD",
+                ])
+                .output()
+                .expect("head")
+                .stdout,
+        )
+        .expect("utf8 head")
+        .trim()
+        .to_owned();
         let peer = "a".repeat(64);
         let grant = serde_json::json!({
             "version": 1,
@@ -755,11 +816,13 @@ mod tests {
             .expect("exact checkout grant");
         assert!(grants
             .outbound(&"a".repeat(64), "rust", &["crates/buzz-acp".into()], "a2a")
+            .await
             .is_ok());
 
         run(&["checkout", "-b", "other"]);
         assert!(grants
             .outbound(&"a".repeat(64), "rust", &["crates/buzz-acp".into()], "a2a")
+            .await
             .is_err());
     }
 }

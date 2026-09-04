@@ -144,7 +144,7 @@ fn emit_runtime_lifecycle(
 
 #[derive(Clone)]
 enum DeferredJobTerminal {
-    Cancellation(job_receiver::CancellationTerminal),
+    Cancellation(Box<job_receiver::CancellationTerminal>),
     Outcome(job_receiver::TerminalDisposition),
 }
 
@@ -169,19 +169,36 @@ fn spawn_job_terminal_finisher(
             }
         }
 
+        // Resolve every registry-backed fact while the drained capability is
+        // still addressable, then revoke/remove it before any terminal event
+        // becomes externally observable. The relay can expose a publish to a
+        // subscriber before the HTTP acknowledgement returns, so removal
+        // after `publish().await` leaves a real post-terminal privilege window.
+        let terminal = terminal.map(|(emitter, terminal)| {
+            let terminal = match terminal {
+                DeferredJobTerminal::Cancellation(terminal) => {
+                    DeferredJobTerminal::Cancellation(Box::new((*terminal).resolve()))
+                }
+                DeferredJobTerminal::Outcome(disposition) => {
+                    DeferredJobTerminal::Outcome(job_receiver::guard_terminal_with_git_effect(
+                        disposition,
+                        privileges.git_effect_summary(&scope),
+                    ))
+                }
+            };
+            (emitter, terminal)
+        });
+        privileges.remove(&scope);
+
         if let Some((emitter, terminal)) = terminal {
             match emitter.is_terminal().await {
                 Ok(true) => {}
                 Ok(false) => {
                     let publish = match terminal {
                         DeferredJobTerminal::Cancellation(terminal) => {
-                            terminal.publish(&emitter).await
+                            (*terminal).publish(&emitter).await
                         }
                         DeferredJobTerminal::Outcome(disposition) => {
-                            let disposition = job_receiver::guard_terminal_with_git_effect(
-                                disposition,
-                                privileges.git_effect_summary(&scope),
-                            );
                             emitter.terminal(disposition).await
                         }
                     };
@@ -198,7 +215,6 @@ fn spawn_job_terminal_finisher(
                 ),
             }
         }
-        privileges.remove(&scope);
     });
 }
 
@@ -3960,7 +3976,7 @@ async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
                                                 scope,
                                                 Some((
                                                     emitter,
-                                                    DeferredJobTerminal::Cancellation(terminal),
+                                                    DeferredJobTerminal::Cancellation(Box::new(terminal)),
                                                 )),
                                             );
                                         }
@@ -4438,7 +4454,9 @@ async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
                     let cancellation = job_cancellations.remove(scope);
                     let emitter = job_emitters.remove(scope)?;
                     let terminal = match cancellation {
-                        Some(cancellation) => DeferredJobTerminal::Cancellation(cancellation),
+                        Some(cancellation) => {
+                            DeferredJobTerminal::Cancellation(Box::new(cancellation))
+                        }
                         None => {
                             let disposition = match &result.outcome {
                                 PromptOutcome::Ok(_) => job_receiver::parse_terminal_outcome(
@@ -4578,7 +4596,9 @@ async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
                     let cancellation = job_cancellations.remove(scope);
                     job_emitters.remove(scope).map(|emitter| {
                         let terminal = match cancellation {
-                            Some(cancellation) => DeferredJobTerminal::Cancellation(cancellation),
+                            Some(cancellation) => {
+                                DeferredJobTerminal::Cancellation(Box::new(cancellation))
+                            }
                             None => DeferredJobTerminal::Outcome(
                                 job_receiver::TerminalDisposition::Indeterminate {
                                     code: "worker_panicked".into(),

@@ -128,7 +128,7 @@ impl WindowsCredentialBroker {
         format!("store --file={}", self.helper_path)
     }
 
-    pub(super) async fn serve(mut self, process_group: &ProcessGroupGuard) -> Result<(), String> {
+    pub(super) async fn serve(&mut self, process_group: &ProcessGroupGuard) -> Result<(), String> {
         use std::os::windows::io::AsRawHandle as _;
         use windows_sys::Win32::System::Pipes::GetNamedPipeClientProcessId;
 
@@ -147,10 +147,6 @@ impl WindowsCredentialBroker {
             .write_all(&self.credential)
             .await
             .map_err(|_| "trusted Git credential broker delivery failed".to_owned())?;
-        self.server
-            .shutdown()
-            .await
-            .map_err(|_| "trusted Git credential broker shutdown failed".to_owned())?;
         self.credential.zeroize();
         Ok(())
     }
@@ -206,16 +202,28 @@ mod tests {
         )
         .await
         .expect("one-shot credential delivery");
-        assert!(output.status.success());
+        let native_pipe = broker_pipe_display(&helper_file);
+        let diagnostic = String::from_utf8_lossy(&output.stderr)
+            .replace(&helper_file, "<credential-pipe>")
+            .replace(&native_pipe, "<credential-pipe>");
+        assert!(
+            output.status.success(),
+            "credential-store failed with status {:?}: {diagnostic}",
+            output.status.code()
+        );
         let fields = String::from_utf8(output.stdout.to_vec()).expect("credential output");
         assert!(fields.lines().any(|line| line == "username=probe+user"));
         assert!(fields.lines().any(|line| line == "password=se:cr@t/%"));
     }
 
+    fn broker_pipe_display(helper_path: &str) -> String {
+        helper_path.replace("//./pipe/", r"\\.\pipe\")
+    }
+
     #[tokio::test]
     async fn credential_pipe_rejects_client_outside_exact_job() {
         let git = resolve_system_git().expect("Git for Windows");
-        let broker = WindowsCredentialBroker::new(credential_records(), REPOSITORY)
+        let mut broker = WindowsCredentialBroker::new(credential_records(), REPOSITORY)
             .expect("credential broker");
         let pipe_name = broker.pipe_name.clone();
 
@@ -243,6 +251,7 @@ mod tests {
             error,
             "trusted Git credential broker rejected an unauthorized client"
         );
+        drop(broker);
         let mut received = Zeroizing::new(Vec::new());
         let _ = client.read_to_end(&mut received).await;
         assert!(!received.windows(6).any(|window| window == b"se:cr@"));

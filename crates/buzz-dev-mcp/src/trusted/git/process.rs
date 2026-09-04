@@ -1201,7 +1201,7 @@ async fn run_managed_with_sidecar(
         match sidecar {
             ManagedSidecar::None => std::future::pending::<Result<(), String>>().await,
             #[cfg(windows)]
-            ManagedSidecar::WindowsCredential(broker) => {
+            ManagedSidecar::WindowsCredential(mut broker) => {
                 broker.serve(&process_group).await?;
                 std::future::pending::<Result<(), String>>().await
             }

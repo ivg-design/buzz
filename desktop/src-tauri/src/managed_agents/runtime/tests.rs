@@ -119,6 +119,19 @@ fn npm_windows_wrappers_resolve_to_pinned_runtimes() {
 }
 
 #[test]
+fn codex_never_falls_back_to_an_unverified_raw_adapter_command() {
+    let runtime = known_acp_runtime(r"C:\Tools\codex-acp.bat");
+    let error = super::resolved_standard_agent_command(runtime, r"C:\Tools\codex-acp.bat", None)
+        .expect_err("a pinned Codex runtime requires a verified private adapter");
+
+    assert!(error.contains("checksum-pinned bundled Codex ACP adapter"));
+    assert_eq!(
+        super::resolved_standard_agent_command(None, "custom-acp", None).unwrap(),
+        "custom-acp"
+    );
+}
+
+#[test]
 fn goose_has_no_mcp_hooks() {
     let p = known_acp_runtime("goose").expect("should resolve");
     assert!(!p.mcp_hooks);

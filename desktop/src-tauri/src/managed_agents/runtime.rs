@@ -76,6 +76,21 @@ pub use lifecycle::{kill_stale_tracked_processes, sync_managed_agent_processes};
 mod spawn_key; // production spawn-key derivation + its regressions
 pub(crate) use spawn_key::bound_runtime_key;
 
+fn resolved_standard_agent_command(
+    runtime: Option<&KnownAcpRuntime>,
+    effective_command: &str,
+    resolved_adapter: Option<std::path::PathBuf>,
+) -> Result<String, String> {
+    if runtime.is_some_and(|runtime| runtime.id == "codex") {
+        return resolved_adapter
+            .map(|path| path.display().to_string())
+            .ok_or_else(|| "checksum-pinned bundled Codex ACP adapter is unavailable".to_string());
+    }
+    Ok(resolved_adapter
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| effective_command.to_string()))
+}
+
 /// Classify an agent's persona against the live catalog for the Agents-menu
 /// drift indicator. Returns `(out_of_date, orphaned)`.
 ///
@@ -641,9 +656,7 @@ fn spawn_agent_child_inner(
             (node.display().to_string(), launch_args)
         } else {
             (
-                resolved_adapter
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_else(|| effective_command.clone()),
+                resolved_standard_agent_command(runtime_meta, effective_command, resolved_adapter)?,
                 agent_args.clone(),
             )
         };

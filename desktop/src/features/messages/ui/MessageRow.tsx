@@ -417,6 +417,7 @@ export const MessageRow = React.memo(
 
           return (
             <VideoReviewCommentMarkdown
+              channelId={channelId}
               channelNames={channelNames}
               className={cn(
                 "max-w-full text-message",

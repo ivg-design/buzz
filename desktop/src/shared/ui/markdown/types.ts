@@ -36,6 +36,8 @@ export type MessageLinkPillProps = {
 };
 
 export type MarkdownRuntime = {
+  /** Conversation containing this Markdown, for contextual agent controls. */
+  channelId?: string | null;
   agentMentionPubkeysByName?: Record<string, string>;
   channels: Channel[];
   imetaByUrl?: ImetaLookup;
@@ -70,6 +72,8 @@ export type MarkdownRuntime = {
 };
 
 export type MarkdownProps = {
+  /** Conversation containing this Markdown, for contextual agent controls. */
+  channelId?: string | null;
   channelNames?: string[];
   className?: string;
   content: string;

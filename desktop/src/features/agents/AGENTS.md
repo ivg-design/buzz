@@ -318,7 +318,7 @@ both the outgoing control and result correlation, even without a loaded
 `Channel` object. Stop is unavailable in an unscoped all-channel pane.
 
 The agent hover card shares the Activity stop handler and shows Stop for live
-managed agents with active work. Message author/avatar/address-chip entry points
+managed agents with active work. Message author/avatar/address-chip and literal Markdown mention entry points
 supply the conversation channel; if it has active work, that is the target.
 Otherwise the card uses the sole working channel or offers explicit working
 channel choices. It never guesses between active tasks within one channel or

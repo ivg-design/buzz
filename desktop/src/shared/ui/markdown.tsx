@@ -1674,6 +1674,7 @@ function getMarkdownComponents(
 }
 
 function MarkdownInner({
+  channelId,
   channelNames,
   className,
   configNudgeAuthorPubkey,
@@ -1733,6 +1734,7 @@ function MarkdownInner({
   const runtime = React.useMemo<MarkdownRuntime>(
     () => ({
       agentMentionPubkeysByName,
+      channelId,
       channels,
       imetaByUrl,
       leadingInlineContent,
@@ -1754,6 +1756,7 @@ function MarkdownInner({
     }),
     [
       agentMentionPubkeysByName,
+      channelId,
       channels,
       imetaByUrl,
       leadingInlineContent,

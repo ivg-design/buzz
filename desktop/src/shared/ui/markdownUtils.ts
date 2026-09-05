@@ -107,6 +107,7 @@ export function markdownPropsAreEqual(
 ): boolean {
   return (
     prev.content === next.content &&
+    prev.channelId === next.channelId &&
     prev.className === next.className &&
     prev.customEmoji === next.customEmoji &&
     prev.hardLineBreaks === next.hardLineBreaks &&

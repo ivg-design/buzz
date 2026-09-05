@@ -17,7 +17,7 @@ export function createMarkdownMention(interactive: boolean) {
   }: {
     children?: React.ReactNode;
   }) {
-    const { agentMentionPubkeysByName, mentionPubkeysByName } =
+    const { agentMentionPubkeysByName, channelId, mentionPubkeysByName } =
       useMarkdownRuntime();
     const mentionText = String(children ?? "");
     const mentionName = mentionText.replace(/^@/, "").trim().toLowerCase();
@@ -56,6 +56,7 @@ export function createMarkdownMention(interactive: boolean) {
 
     return opensProfile ? (
       <UserProfilePopover
+        channelId={channelId}
         botIdenticonValue={mentionLabel}
         pubkey={pubkey}
         role={isAgentMention ? "bot" : undefined}

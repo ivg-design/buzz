@@ -263,6 +263,52 @@ test.describe("agent hover Stop", () => {
     await page.screenshot({ path: "test-results/agent-hover-stop-thread.png" });
   });
 
+  test("literal mention hover prefers its conversation over other active channels", async ({
+    page,
+  }) => {
+    await installMockBridge(page, seedAgent());
+    await openAgentsChannel(page);
+    await page.evaluate((pubkey) => {
+      window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__?.({
+        channelName: "agents",
+        content: "Literal mention Stop check for @charlie.",
+        mentionPubkeys: [pubkey],
+      });
+    }, AGENT_PUBKEY);
+    await seedActiveTurns(page, [
+      { channelId: CHANNEL_GENERAL, turnId: "other-channel" },
+      { channelId: CHANNEL_AGENTS, turnId: "mention-conversation" },
+    ]);
+    const message = page
+      .getByTestId("message-row")
+      .filter({ hasText: "Literal mention Stop check" });
+    await message.locator("[data-mention].agent-mention-highlight").hover();
+    const popover = page.getByTestId("user-profile-popover");
+    await expect(popover).toBeVisible();
+    const stop = popover.getByTestId(`agent-popover-stop-${CHANNEL_AGENTS}`);
+    await expect(stop).toHaveText("Stop");
+    await expect(
+      popover.getByTestId(`agent-popover-stop-${CHANNEL_GENERAL}`),
+    ).toHaveCount(0);
+    const before = page.url();
+    await stop.click();
+    await expect
+      .poll(() => controls(page))
+      .toEqual([
+        {
+          agentPubkey: AGENT_PUBKEY,
+          payload: {
+            type: "cancel_turn",
+            channelId: CHANNEL_AGENTS,
+            requestId: expect.any(String),
+          },
+        },
+      ]);
+    await expect(page.getByText(/Stop signal sent to Charlie/)).toBeVisible();
+    await expect(page.getByTestId("agent-session-thread-panel")).toHaveCount(0);
+    expect(page.url()).toBe(before);
+  });
+
   test("multiple other active channels offer an explicit target in the hover card", async ({
     page,
   }) => {

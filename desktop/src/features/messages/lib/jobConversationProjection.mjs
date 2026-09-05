@@ -61,11 +61,15 @@ function requestBody(payload) {
   const summary = nonEmptyString(payload.summary);
   const acceptance = stringList(payload.acceptance);
   if (!summary || !acceptance?.length) return null;
-  return joinSections(
-    `Task: ${summary}`,
-    bulletSection("Acceptance", acceptance),
-  );
+  return summary;
 }
+
+const DECLINE_EXPLANATIONS = new Map([
+  [
+    "workspace_setup_failed",
+    "I couldn't set up the workspace needed for this task.",
+  ],
+]);
 
 function acceptedBody(payload) {
   if (!isRecord(payload.claim)) return null;
@@ -74,7 +78,11 @@ function acceptedBody(payload) {
   if (status === "accepted") return "Accepted the task.";
   if (status === "declined") {
     const reason = nonEmptyString(payload.claim.reason);
-    return reason ? `Declined the task: ${reason}` : null;
+    if (!reason) return null;
+    const explanation = DECLINE_EXPLANATIONS.get(reason);
+    return explanation
+      ? `Declined the task. ${explanation}`
+      : "Declined the task.";
   }
   return null;
 }
@@ -92,10 +100,8 @@ function resultBody(payload) {
   const artifacts = stringList(payload.artifacts);
   const evidence = stringList(payload.evidence);
   if (artifacts === null || evidence === null) return null;
-  const candidate = nonEmptyString(payload.candidate_sha);
   return joinSections(
     "Completed successfully.",
-    candidate ? `Candidate commit: ${candidate}` : null,
     bulletSection("Artifacts", artifacts),
     bulletSection("Evidence", evidence),
   );
@@ -129,7 +135,6 @@ function errorBody(payload) {
   if (payload.outcome === "failed") {
     return joinSections(
       `Failed: ${message}`,
-      `Code: ${code}`,
       payload.retryable ? "Retry is available." : "Retry is not available.",
     );
   }
@@ -137,7 +142,6 @@ function errorBody(payload) {
     if (payload.retryable !== false) return null;
     return joinSections(
       `Outcome indeterminate: ${message}`,
-      `Code: ${code}`,
       "Reconciliation is required before retrying.",
     );
   }

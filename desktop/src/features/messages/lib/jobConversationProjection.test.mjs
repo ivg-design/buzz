@@ -47,10 +47,7 @@ function request() {
 
 test("projects every signed job lifecycle kind into human-readable conversation text", () => {
   const cases = [
-    [
-      request(),
-      "Task: Review the reconnect path\n\nAcceptance:\n- Recovery test passes\n- No duplicate execution",
-    ],
+    [request(), "Review the reconnect path"],
     [
       followup(43002, "b".repeat(64), {
         claim: { status: "processed", scope_digest: "d".repeat(64) },
@@ -68,10 +65,20 @@ test("projects every signed job lifecycle kind into human-readable conversation 
         claim: {
           status: "declined",
           scope_digest: "d".repeat(64),
-          reason: "unsupported_capability",
+          reason: "workspace_setup_failed",
         },
       }),
-      "Declined the task: unsupported_capability",
+      "Declined the task. I couldn't set up the workspace needed for this task.",
+    ],
+    [
+      followup(43002, "7".repeat(64), {
+        claim: {
+          status: "declined",
+          scope_digest: "d".repeat(64),
+          reason: "future_machine_reason",
+        },
+      }),
+      "Declined the task.",
     ],
     [
       followup(43003, "e".repeat(64), {
@@ -93,10 +100,10 @@ test("projects every signed job lifecycle kind into human-readable conversation 
       followup(43004, "3".repeat(64), {
         outcome: "success",
         candidate_sha: "9".repeat(40),
-        artifacts: ["git:candidate"],
-        evidence: ["contract:focused-test"],
+        artifacts: ["Review notes attached"],
+        evidence: ["Focused tests passed"],
       }),
-      `Completed successfully.\n\nCandidate commit: ${"9".repeat(40)}\n\nArtifacts:\n- git:candidate\n\nEvidence:\n- contract:focused-test`,
+      "Completed successfully.\n\nArtifacts:\n- Review notes attached\n\nEvidence:\n- Focused tests passed",
     ],
     [
       followup(43005, "4".repeat(64), {
@@ -112,7 +119,7 @@ test("projects every signed job lifecycle kind into human-readable conversation 
         message: "The focused test failed.",
         retryable: true,
       }),
-      "Failed: The focused test failed.\n\nCode: test_failed\n\nRetry is available.",
+      "Failed: The focused test failed.\n\nRetry is available.",
     ],
     [
       followup(43006, "6".repeat(64), {
@@ -121,7 +128,7 @@ test("projects every signed job lifecycle kind into human-readable conversation 
         message: "The durable effect could not be proven.",
         retryable: false,
       }),
-      "Outcome indeterminate: The durable effect could not be proven.\n\nCode: receipt_unknown\n\nReconciliation is required before retrying.",
+      "Outcome indeterminate: The durable effect could not be proven.\n\nReconciliation is required before retrying.",
     ],
   ];
 
@@ -129,6 +136,43 @@ test("projects every signed job lifecycle kind into human-readable conversation 
     const projection = projectJobConversation(jobEvent);
     assert.equal(projection?.body, expectedBody);
     assert.equal(projection?.malformed, false);
+  }
+});
+
+test("keeps technical contract fields out of conversational rows", () => {
+  const requestProjection = projectJobConversation(request());
+  const resultProjection = projectJobConversation(
+    followup(43004, "3".repeat(64), {
+      outcome: "success",
+      candidate_sha: "9".repeat(40),
+      artifacts: [],
+      evidence: [],
+    }),
+  );
+  const errorProjection = projectJobConversation(
+    followup(43006, "5".repeat(64), {
+      outcome: "failed",
+      code: "workspace_setup_failed",
+      message: "I couldn't prepare the workspace.",
+      retryable: false,
+    }),
+  );
+
+  assert.equal(requestProjection?.body, "Review the reconnect path");
+  assert.equal(resultProjection?.body, "Completed successfully.");
+  assert.equal(
+    errorProjection?.body,
+    "Failed: I couldn't prepare the workspace.\n\nRetry is not available.",
+  );
+  for (const body of [
+    requestProjection?.body,
+    resultProjection?.body,
+    errorProjection?.body,
+  ]) {
+    assert.doesNotMatch(
+      body ?? "",
+      /Acceptance:|Recovery test passes|Candidate commit:|9999999999999999999999999999999999999999|Code:|workspace_setup_failed/,
+    );
   }
 });
 

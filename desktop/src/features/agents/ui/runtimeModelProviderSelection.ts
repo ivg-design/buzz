@@ -35,7 +35,9 @@ import {
  * PRESERVED across the switch: the launch projection normalizes it (or skips it
  * as absent) for the destination runtime, and switching back restores it.
  */
-const EFFORT_ENV_ALIASES = [
+export const CLAUDE_CODE_EFFORT_LEVEL = "CLAUDE_CODE_EFFORT_LEVEL";
+export const EFFORT_ENV_ALIASES = [
+  CLAUDE_CODE_EFFORT_LEVEL,
   "GOOSE_THINKING_EFFORT",
   "BUZZ_AGENT_THINKING_EFFORT",
   "BUZZ_ACP_EFFORT_LEVEL",

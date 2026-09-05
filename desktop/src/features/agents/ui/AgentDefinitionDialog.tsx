@@ -15,8 +15,8 @@ import { AgentIdentityFields } from "./AgentDescriptionField";
 import { PersonaDropdownField } from "./PersonaDropdownField";
 import type { EnvVarsValue } from "./EnvVarsEditor";
 import {
-  claudeEffortEnvDescriptor,
   ClaudeEffortEnvField,
+  claudeEffortHiddenEnvKeys,
 } from "./ClaudeEffortEnvField";
 import { PersonaAdvancedFields } from "./PersonaAdvancedFields";
 import { PersonaModelField } from "./PersonaModelField";
@@ -402,7 +402,6 @@ export function AgentDefinitionDialog({
   }
 
   const selectedRuntime = runtimes.find((p) => p.id === runtime);
-  const claudeEffortDescriptor = claudeEffortEnvDescriptor(selectedRuntime);
   const blankRuntimeModelProviderEditable =
     initialModelProviderEditableWithoutRuntime && runtime.trim().length === 0;
   const runtimeCanChooseLlmProvider =
@@ -986,12 +985,11 @@ export function AgentDefinitionDialog({
                   disabled={isPending}
                   envVars={envVars}
                   fileSatisfiedEnvKeys={localModeGate.fileSatisfiedEnvKeys}
-                  hiddenEnvKeys={[
-                    ...(topLevelSecretEnvVar ? [topLevelSecretEnvVar] : []),
-                    ...(claudeEffortDescriptor
-                      ? [claudeEffortDescriptor.envVar]
-                      : []),
-                  ]}
+                  hiddenEnvKeys={claudeEffortHiddenEnvKeys(
+                    topLevelSecretEnvVar,
+                    selectedRuntime,
+                    envVars,
+                  )}
                   inheritedEnvVars={inheritedEnvVarsForAdvanced}
                   model={model}
                   modelTuningRuntimeId={runtime}

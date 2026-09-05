@@ -639,7 +639,7 @@ test("Claude effort edit persists in envVars and replaces the session-only picke
       ...configSurface(),
       normalized: {
         ...configSurface().normalized,
-        thinkingEffort: { value: "high", source: "persisted" },
+        thinkingEffort: { value: "high", origin: "buzzExplicit" },
       },
     }),
   );
@@ -649,15 +649,15 @@ test("Claude effort edit persists in envVars and replaces the session-only picke
       claudeAgent({
         env_vars: {
           KEEP_ME: "yes",
-          BUZZ_AGENT_THINKING_EFFORT: "high",
-          CLAUDE_CODE_EFFORT_LEVEL: "medium",
+          buzz_agent_thinking_effort: "high",
+          claude_code_effort_level: "low",
         },
       }),
     );
   });
 
   const effort = await screen.findByTestId("claude-effort-level");
-  assert.equal(effort.value, "medium");
+  assert.equal(effort.value, "low");
   assert.equal(
     dom.window.document.getElementById("edit-agent-effort"),
     null,
@@ -678,6 +678,8 @@ test("Claude effort edit persists in envVars and replaces the session-only picke
     !advancedInputValues.includes("CLAUDE_CODE_EFFORT_LEVEL"),
     "the first-class Claude key must not render as a duplicate generic row",
   );
+  assert.ok(!advancedInputValues.includes("claude_code_effort_level"));
+  assert.ok(!advancedInputValues.includes("buzz_agent_thinking_effort"));
   await act(async () => {
     fireEvent.change(effort, { target: { value: "max" } });
     fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
@@ -726,14 +728,42 @@ test("Claude effort edit is discarded by Cancel", async () => {
   );
 });
 
-test("Claude effort default clears the native env key and stale structured effort", async () => {
+test("inherited Claude effort stays on the inherited/default choice", async () => {
+  installIpc();
+  ipcHandlers.set("get_global_agent_config", () =>
+    Promise.resolve({
+      env_vars: { claude_code_effort_level: "high" },
+      provider: null,
+      model: null,
+      preferred_runtime: null,
+    }),
+  );
+  ipcHandlers.set("get_agent_config_surface", () =>
+    Promise.resolve({
+      ...configSurface(),
+      normalized: {
+        ...configSurface().normalized,
+        thinkingEffort: { value: "high", origin: "globalDefault" },
+      },
+    }),
+  );
+  await act(async () => {
+    renderDialog(() => {}, claudeAgent());
+  });
+
+  const effort = await screen.findByTestId("claude-effort-level");
+  assert.equal(effort.value, "");
+  assert.equal(effort.selectedOptions[0].textContent, "Use inherited (High)");
+});
+
+test("legacy structured Claude effort is shown and cleared in one action", async () => {
   installIpc();
   ipcHandlers.set("get_agent_config_surface", () =>
     Promise.resolve({
       ...configSurface(),
       normalized: {
         ...configSurface().normalized,
-        thinkingEffort: { value: "high", source: "persisted" },
+        thinkingEffort: { value: "high", origin: "buzzExplicit" },
       },
     }),
   );
@@ -743,20 +773,24 @@ test("Claude effort default clears the native env key and stale structured effor
       claudeAgent({
         env_vars: {
           KEEP_ME: "yes",
-          CLAUDE_CODE_EFFORT_LEVEL: "medium",
         },
       }),
     );
   });
 
   const effort = await screen.findByTestId("claude-effort-level");
+  assert.equal(effort.value, "high");
   await act(async () => {
     fireEvent.change(effort, { target: { value: "" } });
     fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
   });
 
   const update = ipcCalls.find((call) => call.cmd === "update_managed_agent");
-  assert.deepEqual(update?.args.input.envVars, { KEEP_ME: "yes" });
+  assert.equal(
+    update?.args.input.envVars,
+    undefined,
+    "clearing a structured-only value must not rewrite unrelated env vars",
+  );
   assert.equal(update?.args.input.effortLevel, null);
 });
 

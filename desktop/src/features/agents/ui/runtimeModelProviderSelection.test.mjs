@@ -25,6 +25,7 @@ test("runtime switch clears stale effort env aliases (native + ACP sentinel), pr
     {
       ...base,
       envVars: {
+        claude_code_effort_level: "low",
         BUZZ_ACP_EFFORT_LEVEL: "high",
         BUZZ_AGENT_THINKING_EFFORT: "medium",
         GOOSE_THINKING_EFFORT: "max",

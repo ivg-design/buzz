@@ -4,15 +4,18 @@ import type {
   RuntimeConfigSurface,
 } from "@/shared/api/types";
 import { cn } from "@/shared/lib/cn";
+import { readAgentEnvCaseInsensitive } from "../lib/agentEnvironment";
 import {
   PERSONA_FIELD_CONTROL_CLASS,
   PERSONA_FIELD_SHELL_CLASS,
 } from "./agentConfigOptions";
 import type { EnvVarsValue } from "./EnvVarsEditor";
 import { EffortPickerField } from "./EffortPickerField";
-import { BUZZ_AGENT_THINKING_EFFORT } from "./buzzAgentConfig";
-
-export const CLAUDE_CODE_EFFORT_LEVEL = "CLAUDE_CODE_EFFORT_LEVEL";
+import { envVarsWithoutKeyCaseInsensitive } from "./providerEnvVarUpdates";
+import {
+  CLAUDE_CODE_EFFORT_LEVEL,
+  EFFORT_ENV_ALIASES,
+} from "./runtimeModelProviderSelection";
 
 export function claudeEffortEnvDescriptor(
   runtime: AcpRuntimeCatalogEntry | undefined,
@@ -32,12 +35,31 @@ export function claudeEffortEnvDescriptor(
 export function claudeEffortHiddenEnvKeys(
   secretEnvVar: string | null,
   runtime: AcpRuntimeCatalogEntry | undefined,
+  envVars: EnvVarsValue,
 ): string[] {
   const descriptor = claudeEffortEnvDescriptor(runtime);
+  if (!descriptor) return secretEnvVar ? [secretEnvVar] : [];
+  const aliases = new Set(EFFORT_ENV_ALIASES.map((key) => key.toLowerCase()));
   return [
     ...(secretEnvVar ? [secretEnvVar] : []),
-    ...(descriptor ? [descriptor.envVar] : []),
+    descriptor.envVar,
+    ...Object.keys(envVars).filter((key) => aliases.has(key.toLowerCase())),
   ];
+}
+
+function effortEnvValue(
+  envVars: EnvVarsValue,
+  preferredEnvVar: string,
+): string | undefined {
+  const keys = [
+    preferredEnvVar,
+    ...EFFORT_ENV_ALIASES.filter((key) => key !== preferredEnvVar),
+  ];
+  for (const key of keys) {
+    const value = readAgentEnvCaseInsensitive(envVars, key);
+    if (value !== undefined) return value;
+  }
+  return undefined;
 }
 
 export function updateClaudeEffortEnv(
@@ -45,14 +67,14 @@ export function updateClaudeEffortEnv(
   envVar: string,
   value: string,
 ): EnvVarsValue {
-  const next = { ...envVars };
-  delete next[BUZZ_AGENT_THINKING_EFFORT];
-  if (value === "") {
-    delete next[envVar];
-  } else {
-    next[envVar] = value;
+  let next = envVars;
+  for (const alias of EFFORT_ENV_ALIASES) {
+    next = envVarsWithoutKeyCaseInsensitive(next, alias);
   }
-  return next;
+  if (value === "") {
+    return next;
+  }
+  return { ...next, [envVar]: value };
 }
 
 function effortLabel(value: string): string {
@@ -63,12 +85,14 @@ function effortLabel(value: string): string {
 export function ClaudeEffortEnvField({
   disabled,
   envVars,
+  explicitEffort,
   inheritedEnvVars = {},
   onEnvVarsChange,
   runtime,
 }: {
   disabled?: boolean;
   envVars: EnvVarsValue;
+  explicitEffort?: string;
   inheritedEnvVars?: EnvVarsValue;
   onEnvVarsChange: (value: EnvVarsValue) => void;
   runtime: AcpRuntimeCatalogEntry | undefined;
@@ -76,8 +100,14 @@ export function ClaudeEffortEnvField({
   const descriptor = claudeEffortEnvDescriptor(runtime);
   if (!descriptor) return null;
 
-  const localValue = envVars[descriptor.envVar] ?? "";
-  const inheritedValue = inheritedEnvVars[descriptor.envVar] ?? "";
+  const nativeValue = readAgentEnvCaseInsensitive(envVars, descriptor.envVar);
+  const localValue =
+    nativeValue ??
+    explicitEffort ??
+    effortEnvValue(envVars, descriptor.envVar) ??
+    "";
+  const inheritedValue =
+    effortEnvValue(inheritedEnvVars, descriptor.envVar) ?? "";
   const inheritedLabel = inheritedValue
     ? `Use inherited (${effortLabel(inheritedValue)})`
     : "Use host or Claude default";
@@ -160,6 +190,11 @@ export function AgentInstanceEffortField({
     <ClaudeEffortEnvField
       disabled={disabled}
       envVars={envVars}
+      explicitEffort={
+        config?.normalized.thinkingEffort?.origin === "buzzExplicit"
+          ? (config.normalized.thinkingEffort.value ?? "")
+          : undefined
+      }
       inheritedEnvVars={inheritedEnvVars}
       onEnvVarsChange={(next) => {
         effortTouched.current = true;

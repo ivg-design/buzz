@@ -828,7 +828,6 @@ export function AgentInstanceEditDialog({
     }
   }
 
-  // Model and provider field derived state
   const normalizedConfig = configSurfaceQuery.data?.normalized;
   const modelRequired = isMissingRequiredDropdownField(
     normalizedConfig?.model,
@@ -1181,6 +1180,7 @@ export function AgentInstanceEditDialog({
                       hiddenEnvKeys={claudeEffortHiddenEnvKeys(
                         topLevelSecretEnvVar,
                         prospectiveRuntime,
+                        envVars,
                       )}
                       focusKey={
                         initialFocus?.type === "env_key"

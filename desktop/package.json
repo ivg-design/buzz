@@ -1,7 +1,7 @@
 {
   "name": "buzz",
   "private": true,
-  "version": "0.5.23-nemo.4",
+  "version": "0.5.23-nemo.5",
   "type": "module",
   "scripts": {
     "dev": "vite",

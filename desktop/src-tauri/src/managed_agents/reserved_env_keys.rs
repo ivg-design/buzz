@@ -68,6 +68,9 @@ pub(crate) const RESERVED_ENV_KEYS: &[&str] = &[
     // Desktop experiment policy: the Settings toggle is the sole authority
     // for whether channel threads receive independent ACP sessions.
     "BUZZ_ACP_SESSION_POLICY",
+    // Desktop owns pair-to-provider-session bindings. A user path could mix
+    // session identity across managed agents or communities.
+    "BUZZ_ACP_SESSION_RECOVERY_PATH",
     // Workspace Project coordinates are owner-selected, per-relay launch
     // authority. User env must not substitute a different identity or commit.
     "BUZZ_ACP_WORKSPACE_PROJECT_CHANNEL",

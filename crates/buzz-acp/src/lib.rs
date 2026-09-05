@@ -19,6 +19,7 @@ mod queue;
 mod relay;
 mod reply_placement;
 mod scope;
+mod session_recovery;
 mod setup_mode;
 mod startup_pipe;
 mod trusted_mcp;
@@ -3167,6 +3168,10 @@ async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
     let ctx = Arc::new(PromptContext {
         mcp_servers: build_mcp_servers(&config, &protected_mcp_paths),
         trusted_mcp_factory,
+        session_recovery: config
+            .session_recovery_path
+            .clone()
+            .map(session_recovery::SessionRecoveryStore::open_fail_closed),
         initial_message: config.initial_message.clone(),
         idle_timeout: Duration::from_secs(config.idle_timeout_secs),
         max_turn_duration: Duration::from_secs(config.max_turn_duration_secs),
@@ -5299,7 +5304,12 @@ fn dispatch_pending(
         };
         tracing::debug!(agent = agent.index, channel = %channel_id, scope = %scope.telemetry_label(), affinity_hit, "agent_claimed");
 
-        let recoverable_batch = job_runtime::recoverable_batch_for(ctx.dedup_mode, &scope, &batch);
+        let recoverable_batch = job_runtime::recoverable_batch_for(
+            ctx.dedup_mode,
+            &scope,
+            &batch,
+            ctx.session_recovery.is_some(),
+        );
 
         let result_tx = pool.result_tx();
         let ctx_clone = Arc::clone(ctx);
@@ -9939,6 +9949,7 @@ mod build_mcp_servers_tests {
             subscribe_mode: config::SubscribeMode::All,
             dedup_mode: config::DedupMode::Queue,
             session_policy: scope::SessionPolicy::Channel,
+            session_recovery_path: None,
             reply_placement: reply_placement::ReplyPlacement::Thread,
             multiple_event_handling: config::MultipleEventHandling::Queue,
             ignore_self: true,
@@ -10209,6 +10220,7 @@ mod error_outcome_emission_tests {
             subscribe_mode: config::SubscribeMode::All,
             dedup_mode: config::DedupMode::Queue,
             session_policy: scope::SessionPolicy::Channel,
+            session_recovery_path: None,
             reply_placement: reply_placement::ReplyPlacement::Thread,
             multiple_event_handling: config::MultipleEventHandling::Queue,
             ignore_self: true,

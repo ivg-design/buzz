@@ -246,7 +246,7 @@ pub(crate) fn start_managed_agent_runtime_pair_lazy(
     relay_url: String,
     app: AppHandle,
 ) -> Result<ManagedAgentRuntimeStatus, String> {
-    start_pair(pubkey, relay_url, true, None, app)
+    start_pair(pubkey, relay_url, true, None, true, app)
 }
 
 #[tauri::command]
@@ -283,6 +283,7 @@ fn start_pair(
     relay_url: String,
     lazy: bool,
     expected_updated_at: Option<&str>,
+    explicit_resume: bool,
     app: AppHandle,
 ) -> Result<ManagedAgentRuntimeStatus, String> {
     let state = app.state::<AppState>();
@@ -306,6 +307,11 @@ fn start_pair(
         return Err("managed agent changed while runtime reconciliation was in flight".into());
     }
     let key = ManagedAgentRuntimeKey::new(pubkey, &relay_url)?;
+    if explicit_resume {
+        resume_managed_agent_runtime(&app, &key)?;
+    } else if managed_agent_runtime_is_paused(&app, &key)? {
+        return Ok(status_for(&app, record, &key, None, None));
+    }
     let mut runtimes = state
         .managed_agent_processes
         .lock()
@@ -370,6 +376,10 @@ pub fn stop_managed_agent_runtime(
     let mut records = load_managed_agents(&app)?;
     let record = find_managed_agent_mut(&mut records, &pubkey)?;
     let key = ManagedAgentRuntimeKey::new(pubkey, &relay_url)?;
+    // Persist user intent before terminating anything. A failed kill remains
+    // paused for the next automatic restore, while the still-live child stays
+    // visible and explicitly stoppable through its runtime receipt.
+    pause_managed_agent_runtime(&app, &key)?;
     let mut runtimes = state
         .managed_agent_processes
         .lock()
@@ -515,6 +525,7 @@ fn restart_pair_after_final_adapter_validation(
         return Err("managed runtime pairs require a local agent".into());
     }
     let key = ManagedAgentRuntimeKey::new(pubkey, &relay_url)?;
+    resume_managed_agent_runtime(&app, &key)?;
     let owner = state
         .keys
         .lock()
@@ -778,6 +789,7 @@ pub async fn reconcile_managed_agent_runtimes(
                         key.relay_url.clone(),
                         true,
                         Some(&record.updated_at),
+                        false,
                         app.clone(),
                     ) {
                         Ok(mut status) => {

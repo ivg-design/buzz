@@ -360,6 +360,11 @@ pub async fn restore_managed_agents_on_launch(
                         match super::ManagedAgentRuntimeKey::new(record.pubkey.clone(), &relay_url)
                         {
                             Ok(key) => {
+                                if super::managed_agent_runtime_is_paused(app, &key)
+                                    .unwrap_or(true)
+                                {
+                                    return (record.pubkey.clone(), SpawnOutcome::Skipped);
+                                }
                                 // F2: if a concurrent startup reconcile already
                                 // tracked a live child for this exact pair during
                                 // the Phase A window, leave it alone. Mirrors the

@@ -472,6 +472,10 @@ pub struct AcpClient {
     /// Whether the adapter accepts ACP `McpServerHttp` entries. Unsupported or
     /// missing capability values fail closed to credential-free stdio only.
     http_mcp_supported: bool,
+    /// Whether the initialized adapter advertises protocol-native
+    /// `session/resume`. Recovery never probes an unadvertised method because
+    /// several ACP adapters answer unknown extension methods ambiguously.
+    session_resume_supported: bool,
     /// Whether the adapter explicitly advertises the ACP v1 append-only system
     /// prompt extension targeting Codex `developerInstructions` on session/new.
     developer_instructions_append_supported: bool,
@@ -965,6 +969,7 @@ impl AcpClient {
             active_run_id: None,
             steering_supported: false,
             http_mcp_supported: false,
+            session_resume_supported: false,
             developer_instructions_append_supported: false,
             job_policy_supported: false,
             job_policy_adapter_qualified: checksum_qualified_claude,
@@ -1034,6 +1039,9 @@ impl AcpClient {
             .pointer("/agentCapabilities/mcpCapabilities/http")
             .and_then(|value| value.as_bool())
             .unwrap_or(false);
+        self.session_resume_supported = result
+            .pointer("/agentCapabilities/sessionCapabilities/resume")
+            .is_some_and(serde_json::Value::is_object);
         self.developer_instructions_append_supported =
             supports_developer_instructions_append(&result);
         self.job_policy_supported = self.job_policy_adapter_qualified
@@ -1092,6 +1100,52 @@ impl AcpClient {
     ) -> Result<SessionNewResponse, AcpError> {
         self.session_new_full_with_policy(cwd, mcp_servers, system_prompt, session_title, None)
             .await
+    }
+
+    /// Resume an existing ordinary chat session with this process generation's
+    /// current working directory and MCP endpoints.
+    ///
+    /// `system_prompt` is sent only through the append-only extension. Adapters
+    /// that support refreshing instructions on resume may apply it; adapters
+    /// that retain the provider's stored instructions may ignore it. Job
+    /// sessions deliberately have no resume path.
+    pub async fn session_resume_full(
+        &mut self,
+        session_id: &str,
+        cwd: &str,
+        mcp_servers: Vec<McpServer>,
+        system_prompt: Option<SystemPromptTransport<'_>>,
+    ) -> Result<SessionNewResponse, AcpError> {
+        if !self.session_resume_supported {
+            return Err(AcpError::Protocol(
+                "adapter does not advertise session/resume".into(),
+            ));
+        }
+        let mut params = serde_json::json!({
+            "sessionId": session_id,
+            "cwd": cwd,
+            "mcpServers": mcp_servers,
+        });
+        if let Some(SystemPromptTransport::MetaAppend(prompt)) = system_prompt {
+            params["_meta"]["systemPrompt"] = serde_json::json!({ "append": prompt });
+        }
+        let result = self.send_request("session/resume", params).await?;
+        let resumed_id = result
+            .get("sessionId")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(session_id);
+        if resumed_id != session_id {
+            return Err(AcpError::Protocol(format!(
+                "session/resume changed session identity from {session_id} to {resumed_id}"
+            )));
+        }
+        self.session_permission_policies
+            .insert(session_id.to_owned(), SessionPermissionPolicy::Interactive);
+        tracing::info!(target: "acp::session", "session resumed: {session_id}");
+        Ok(SessionNewResponse {
+            session_id: session_id.to_owned(),
+            raw: result,
+        })
     }
 
     /// Create an immutable job session. The adapter must have advertised the
@@ -1429,6 +1483,12 @@ impl AcpClient {
     /// Whether the initialized adapter accepts Streamable HTTP MCP servers.
     pub fn http_mcp_supported(&self) -> bool {
         self.http_mcp_supported
+    }
+
+    /// Whether the adapter explicitly advertised protocol-native session
+    /// resume during initialization.
+    pub fn session_resume_supported(&self) -> bool {
+        self.session_resume_supported
     }
 
     /// Whether this exact initialized adapter positively advertises the
@@ -5219,6 +5279,19 @@ sleep 10"#,
         client.http_mcp_supported()
     }
 
+    async fn session_resume_supported_after_initialize(init_result: &str) -> bool {
+        let script = format!(
+            "read -r _init; printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{result}}}'; sleep 5",
+            result = init_result,
+        );
+        let mut client = spawn_script(&script).await;
+        client
+            .initialize()
+            .await
+            .expect("initialize should succeed");
+        client.session_resume_supported()
+    }
+
     async fn developer_append_supported_after_initialize(init_result: &str) -> bool {
         let script = format!(
             "read -r _init; printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{result}}}'; \
@@ -5247,6 +5320,75 @@ sleep 10"#,
         ] {
             assert!(!http_mcp_supported_after_initialize(unsupported).await);
         }
+    }
+
+    #[tokio::test]
+    async fn initialize_enables_resume_only_for_advertised_object_capability() {
+        assert!(
+            session_resume_supported_after_initialize(
+                r#"{"protocolVersion":1,"agentCapabilities":{"sessionCapabilities":{"resume":{}}}}"#,
+            )
+            .await
+        );
+        for unsupported in [
+            r#"{"protocolVersion":1,"agentCapabilities":{"sessionCapabilities":{}}}"#,
+            r#"{"protocolVersion":1,"agentCapabilities":{"sessionCapabilities":{"resume":false}}}"#,
+        ] {
+            assert!(!session_resume_supported_after_initialize(unsupported).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn session_resume_writes_exact_identity_cwd_fresh_mcp_and_instruction_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let capture = dir.path().join("resume.json");
+        let script = "read -r _init; \
+            printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{\"sessionCapabilities\":{\"resume\":{}},\"mcpCapabilities\":{\"http\":true}}}}'; \
+            read -r resume; printf '%s' \"$resume\" > \"$CAPTURE\"; \
+            printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"sessionId\":\"provider-session-1\",\"configOptions\":[],\"modes\":{}}}'; \
+            sleep 5";
+        let mut client = AcpClient::spawn(
+            "bash",
+            &["-c".into(), script.into()],
+            &[("CAPTURE".into(), capture.display().to_string())],
+            false,
+        )
+        .await
+        .unwrap();
+        client.initialize().await.unwrap();
+        let response = client
+            .session_resume_full(
+                "provider-session-1",
+                "/workspace",
+                vec![McpServer::http(
+                    "buzz-trusted-session",
+                    "http://127.0.0.1:32123/mcp",
+                    vec![HttpHeader {
+                        name: "Authorization".into(),
+                        value: "Bearer fresh-capability".into(),
+                    }],
+                )],
+                Some(SystemPromptTransport::MetaAppend(
+                    "current Nemo instructions",
+                )),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.session_id, "provider-session-1");
+        let request: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(capture).unwrap()).unwrap();
+        assert_eq!(request["method"], "session/resume");
+        assert_eq!(request["params"]["sessionId"], "provider-session-1");
+        assert_eq!(request["params"]["cwd"], "/workspace");
+        assert_eq!(request["params"]["mcpServers"][0]["type"], "http");
+        assert_eq!(
+            request["params"]["mcpServers"][0]["headers"][0]["value"],
+            "Bearer fresh-capability"
+        );
+        assert_eq!(
+            request["params"]["_meta"]["systemPrompt"]["append"],
+            "current Nemo instructions"
+        );
     }
 
     /// Test 1a: an adapter advertising `_meta.steering.supported: true`

@@ -695,6 +695,7 @@ fn spawn_agent_child_inner(
     command.env("BUZZ_RELAY_URL", &effective_relay_url);
     command.env("BUZZ_ACP_LAZY_POOL", if lazy { "true" } else { "false" });
     command.env("BUZZ_ACP_IDLE_POOL_SLEEP", idle_pool_sleep_env(lazy));
+    command.env_remove("BUZZ_ACP_SESSION_RECOVERY_PATH");
     // Publish-first mention sends hand the harness the send timestamp as a
     // startup replay floor. Strip any ambient value here — before the
     // `descriptor.env` loop — so a floor from the parent environment can never
@@ -854,6 +855,13 @@ fn spawn_agent_child_inner(
     for (key, value) in &descriptor.env {
         command.env(key, value);
     }
+    // Desktop owns this pair-scoped path. It is deliberately set after every
+    // user-configurable environment tier and does not alter provider homes,
+    // authentication, or transcript storage.
+    command.env(
+        "BUZZ_ACP_SESSION_RECOVERY_PATH",
+        super::managed_agent_runtime_session_recovery_path(app, &runtime_key)?,
+    );
     // Workspace policy is owner-selected and stored in the OS credential
     // vault. Apply it after every user environment tier so a managed model
     // cannot shadow the reviewed Project or revision through persona, global,
@@ -1006,6 +1014,9 @@ pub fn start_managed_agent_process(
     replay_floor_unix: Option<u64>,
 ) -> Result<(), String> {
     let key = bound_runtime_key(record, workspace_relay)?;
+    // This path is reached only by the explicit legacy Start command. Clear a
+    // prior manual-stop marker before adopting or spawning the selected pair.
+    super::resume_managed_agent_runtime(app, &key)?;
     if let Some(runtime) = runtimes.get_mut(&key) {
         if runtime
             .child

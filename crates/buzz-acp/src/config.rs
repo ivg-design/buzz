@@ -384,6 +384,12 @@ pub struct CliArgs {
     )]
     pub session_policy: crate::scope::SessionPolicy,
 
+    /// Pair-scoped provider-session binding document. Desktop supplies this
+    /// path from its own application-data directory; standalone harnesses may
+    /// opt in explicitly. This never changes provider homes or credentials.
+    #[arg(long, env = "BUZZ_ACP_SESSION_RECOVERY_PATH", hide = true)]
+    pub session_recovery_path: Option<PathBuf>,
+
     /// Where ordinary replies to top-level channel events are posted.
     #[arg(
         long,
@@ -617,6 +623,8 @@ pub struct Config {
     pub dedup_mode: DedupMode,
     /// How ACP provider sessions are scoped in channels (channel vs thread).
     pub session_policy: crate::scope::SessionPolicy,
+    /// Optional pair-scoped durable provider-session binding document.
+    pub session_recovery_path: Option<PathBuf>,
     pub reply_placement: crate::reply_placement::ReplyPlacement,
     pub multiple_event_handling: MultipleEventHandling,
     pub ignore_self: bool,
@@ -1302,6 +1310,7 @@ impl Config {
             subscribe_mode: args.subscribe,
             dedup_mode: args.dedup,
             session_policy: args.session_policy,
+            session_recovery_path: args.session_recovery_path,
             reply_placement: args.reply_placement,
             multiple_event_handling: args.multiple_event_handling,
             ignore_self: !args.no_ignore_self,
@@ -1755,6 +1764,7 @@ mod tests {
             subscribe_mode: mode,
             dedup_mode: DedupMode::Queue,
             session_policy: crate::scope::SessionPolicy::Channel,
+            session_recovery_path: None,
             reply_placement: crate::reply_placement::ReplyPlacement::Thread,
             multiple_event_handling: MultipleEventHandling::Queue,
             ignore_self: true,

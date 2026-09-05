@@ -36,9 +36,13 @@ pub(crate) fn recoverable_batch_for(
     dedup_mode: DedupMode,
     scope: &SessionScope,
     batch: &FlushBatch,
+    durable_session_recovery: bool,
 ) -> Option<FlushBatch> {
     match dedup_mode {
-        DedupMode::Queue if !scope.is_job() => Some(batch.clone()),
+        // A panicked task cannot prove whether it crossed provider delivery.
+        // With durable provider-session recovery, retain the provider's exact
+        // turn marker and wait for a distinct follow-up instead of replaying.
+        DedupMode::Queue if !scope.is_job() && !durable_session_recovery => Some(batch.clone()),
         DedupMode::Queue | DedupMode::Drop => None,
     }
 }
@@ -158,10 +162,11 @@ mod tests {
         assert!(queue.push_job(queued_event(scope.clone())));
         let batch = queue.flush_next().expect("dispatch job batch");
 
-        assert!(recoverable_batch_for(DedupMode::Queue, &scope, &batch).is_none());
+        assert!(recoverable_batch_for(DedupMode::Queue, &scope, &batch, false).is_none());
 
         let chat_scope = SessionScope::Conversation { channel_id };
-        assert!(recoverable_batch_for(DedupMode::Queue, &chat_scope, &batch).is_some());
-        assert!(recoverable_batch_for(DedupMode::Drop, &chat_scope, &batch).is_none());
+        assert!(recoverable_batch_for(DedupMode::Queue, &chat_scope, &batch, false).is_some());
+        assert!(recoverable_batch_for(DedupMode::Queue, &chat_scope, &batch, true).is_none());
+        assert!(recoverable_batch_for(DedupMode::Drop, &chat_scope, &batch, false).is_none());
     }
 }

@@ -54,6 +54,61 @@ fn managed_agents_logs_dir(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+fn managed_agent_session_recovery_dir<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+) -> Result<PathBuf, String> {
+    let dir = managed_agents_base_dir(app)?.join("session-recovery");
+    fs::create_dir_all(&dir)
+        .map_err(|error| format!("failed to create session recovery dir: {error}"))?;
+    Ok(dir)
+}
+
+/// Pair-scoped provider-session bindings consumed only by `buzz-acp`.
+pub fn managed_agent_runtime_session_recovery_path<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    key: &ManagedAgentRuntimeKey,
+) -> Result<PathBuf, String> {
+    Ok(managed_agent_session_recovery_dir(app)?.join(format!("{}.json", key.runtime_id())))
+}
+
+/// Pair-scoped manual-stop intent. Its presence suppresses automatic restore;
+/// an explicit Start removes it before spawning.
+pub fn managed_agent_runtime_pause_path<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    key: &ManagedAgentRuntimeKey,
+) -> Result<PathBuf, String> {
+    Ok(managed_agent_session_recovery_dir(app)?.join(format!("{}.paused", key.runtime_id())))
+}
+
+pub fn managed_agent_runtime_is_paused<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    key: &ManagedAgentRuntimeKey,
+) -> Result<bool, String> {
+    Ok(managed_agent_runtime_pause_path(app, key)?.is_file())
+}
+
+pub fn pause_managed_agent_runtime<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    key: &ManagedAgentRuntimeKey,
+) -> Result<(), String> {
+    atomic_write_json_restricted(
+        &managed_agent_runtime_pause_path(app, key)?,
+        br#"{"version":1,"intent":"paused"}"#,
+    )
+}
+
+pub fn resume_managed_agent_runtime<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    key: &ManagedAgentRuntimeKey,
+) -> Result<(), String> {
+    let path = managed_agent_runtime_pause_path(app, key)?;
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("failed to remove {}: {error}", path.display())),
+    }
+}
+
 /// Install-log path for `runtime_id`, alongside the agent logs.
 pub fn install_log_path(app: &AppHandle, runtime_id: &str) -> Result<PathBuf, String> {
     Ok(managed_agents_logs_dir(app)?.join(install_log_filename(runtime_id)?))

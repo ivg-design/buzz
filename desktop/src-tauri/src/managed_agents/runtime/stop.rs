@@ -129,6 +129,7 @@ pub fn stop_managed_agent_workspace_pair(
     let state = app.state::<crate::app_state::AppState>();
     match super::workspace_pair_key(app, record) {
         Some(pair_key) if runtimes.contains_key(&pair_key) => {
+            super::super::pause_managed_agent_runtime(app, &pair_key)?;
             stop_managed_agent_pair(app, record, runtimes, &pair_key)?;
             state.clear_agent_session_cache(&pair_key);
             super::super::remove_agent_pid_file(app, &record.pubkey);
@@ -142,6 +143,7 @@ pub fn stop_managed_agent_workspace_pair(
         Some(pair_key) => {
             // No tracked pair here — a pubkey-wide cache clear would disturb
             // live pairs in other communities, so stay pair-scoped.
+            super::super::pause_managed_agent_runtime(app, &pair_key)?;
             stop_legacy_scalar_pid(app, record)?;
             state.clear_agent_session_cache(&pair_key);
         }

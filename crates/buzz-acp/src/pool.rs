@@ -50,8 +50,10 @@ use crate::trusted_mcp::{TrustedMcpFactory, TrustedMcpSession};
 /// the turn as "recently active" (eligible for requeue instead of dead-letter).
 const RECENT_ACTIVITY_WINDOW: Duration = Duration::from_secs(60);
 
-// FlushBatch and BatchEvent derive Clone (added in queue.rs) so we can store
-// a recoverable copy in TaskMeta for panic recovery in Queue mode.
+// FlushBatch and BatchEvent derive Clone (added in queue.rs) so legacy chat
+// harnesses can store a recoverable copy in TaskMeta for panic recovery. A
+// harness with durable provider-session recovery leaves this empty because a
+// task panic cannot prove the provider did not already act.
 
 /// Metadata stored per in-flight task for panic recovery.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -825,6 +827,9 @@ pub struct PromptContext {
     /// Creates the typed, signer-bearing MCP service after exact session scope
     /// is known. Static stdio MCP entries remain credential-free.
     pub trusted_mcp_factory: Option<TrustedMcpFactory>,
+    /// Pair-scoped provider-session bindings. Absent for standalone harnesses
+    /// that did not opt into durable recovery.
+    pub session_recovery: Option<crate::session_recovery::SessionRecoveryStore>,
     pub initial_message: Option<String>,
     pub idle_timeout: Duration,
     pub max_turn_duration: Duration,
@@ -1492,9 +1497,14 @@ async fn create_session_and_apply_model(
     agent_core: Option<&str>,
     channel: NewSessionChannelContext<'_>,
 ) -> Result<String, AcpError> {
-    create_session_and_apply_model_at(agent, ctx, &ctx.cwd, None, agent_core, channel).await
+    Ok(
+        resolve_provider_session_at(agent, ctx, &ctx.cwd, None, agent_core, channel)
+            .await?
+            .session_id,
+    )
 }
 
+#[cfg(test)]
 async fn create_session_and_apply_model_at(
     agent: &mut OwnedAgent,
     ctx: &PromptContext,
@@ -1503,6 +1513,31 @@ async fn create_session_and_apply_model_at(
     agent_core: Option<&str>,
     channel: NewSessionChannelContext<'_>,
 ) -> Result<String, AcpError> {
+    Ok(resolve_provider_session_at(
+        agent,
+        ctx,
+        working_directory,
+        project_instructions,
+        agent_core,
+        channel,
+    )
+    .await?
+    .session_id)
+}
+
+struct ProviderSessionResolution {
+    session_id: String,
+    resumed: bool,
+}
+
+async fn resolve_provider_session_at(
+    agent: &mut OwnedAgent,
+    ctx: &PromptContext,
+    working_directory: &str,
+    project_instructions: Option<&str>,
+    agent_core: Option<&str>,
+    channel: NewSessionChannelContext<'_>,
+) -> Result<ProviderSessionResolution, AcpError> {
     if ctx.workspace_project_channel.is_some()
         && agent.acp.is_codex_adapter()
         && !agent.acp.developer_instructions_append_supported()
@@ -1606,7 +1641,80 @@ async fn create_session_and_apply_model_at(
         agent.acp.developer_instructions_append_supported(),
         combined_system_prompt.as_deref(),
     );
-    let resp = if let Some(policy) = job_policy.as_ref() {
+    let recovery_binding = match (ctx.session_recovery.as_ref(), channel.scope) {
+        (Some(store), Some(scope)) if !scope.is_job() => store
+            .binding(scope, &agent.agent_name, working_directory)
+            .map_err(|error| {
+                AcpError::Protocol(format!(
+                    "failed to read provider-session recovery state: {error}"
+                ))
+            })?,
+        _ => None,
+    };
+    if recovery_binding.is_some() && !agent.acp.session_resume_supported() {
+        return Err(AcpError::Protocol(
+            "persisted provider session exists but adapter does not advertise session/resume"
+                .into(),
+        ));
+    }
+    let prior_recovery_phase = recovery_binding
+        .as_ref()
+        .map(|binding| binding.phase.clone());
+    let mut resumed = false;
+    let resp = if let Some(binding) = recovery_binding {
+        if matches!(
+            binding.phase,
+            crate::session_recovery::RecoveryPhase::TurnStarted { .. }
+        ) {
+            tracing::warn!(
+                target: "pool::session",
+                scope = %binding.scope.telemetry_label(),
+                session_id = %binding.provider_session_id,
+                "resuming provider context after an interrupted turn; the prior prompt will not be replayed"
+            );
+            agent.acp.observe(
+                "session_recovery_needs_reconciliation",
+                serde_json::json!({
+                    "sessionId": binding.provider_session_id,
+                    "scope": binding.scope.telemetry_label(),
+                }),
+            );
+        }
+        match agent
+            .acp
+            .session_resume_full(
+                &binding.provider_session_id,
+                working_directory,
+                mcp_servers.clone(),
+                system_prompt.clone(),
+            )
+            .await
+        {
+            Ok(response) => {
+                resumed = true;
+                response
+            }
+            Err(AcpError::AgentError { code, message }) => {
+                tracing::warn!(
+                    target: "pool::session",
+                    scope = %binding.scope.telemetry_label(),
+                    session_id = %binding.provider_session_id,
+                    code,
+                    "provider session could not be resumed ({message}); creating a fresh session"
+                );
+                agent
+                    .acp
+                    .session_new_full(
+                        working_directory,
+                        mcp_servers,
+                        system_prompt,
+                        session_title.as_deref(),
+                    )
+                    .await?
+            }
+            Err(error) => return Err(error),
+        }
+    } else if let Some(policy) = job_policy.as_ref() {
         agent
             .acp
             .session_new_job_full(
@@ -1865,7 +1973,38 @@ async fn create_session_and_apply_model_at(
         agent.state.trusted_mcp.insert(scope, session);
     }
 
-    Ok(resp.session_id)
+    if let (Some(store), Some(scope)) = (&ctx.session_recovery, channel.scope) {
+        if !scope.is_job() {
+            store
+                .record_binding(crate::session_recovery::PersistedSessionBinding {
+                    scope: scope.clone(),
+                    provider: agent.agent_name.clone(),
+                    provider_session_id: resp.session_id.clone(),
+                    cwd: working_directory.to_owned(),
+                    // Keep an interrupted boundary until the next distinct
+                    // prompt durably records its own boundary. If this process
+                    // dies between resume and prompt delivery, recovery still
+                    // reports the original ambiguous turn.
+                    phase: if resumed {
+                        prior_recovery_phase
+                            .clone()
+                            .unwrap_or(crate::session_recovery::RecoveryPhase::Idle)
+                    } else {
+                        crate::session_recovery::RecoveryPhase::Idle
+                    },
+                })
+                .map_err(|error| {
+                    AcpError::Protocol(format!(
+                        "failed to persist provider-session binding: {error}"
+                    ))
+                })?;
+        }
+    }
+
+    Ok(ProviderSessionResolution {
+        session_id: resp.session_id,
+        resumed,
+    })
 }
 
 fn mcp_servers_with_git_origin(
@@ -3039,7 +3178,7 @@ pub async fn run_prompt_task(
                 // The title includes channel and, for thread sessions, the
                 // canonical root prefix so sibling sessions are distinguishable.
                 // DMs, unresolved, and unnamed channels omit the channel name.
-                match create_session_and_apply_model_at(
+                match resolve_provider_session_at(
                     &mut agent,
                     &ctx,
                     session_working_directory,
@@ -3055,10 +3194,12 @@ pub async fn run_prompt_task(
                 )
                 .await
                 {
-                    Ok(sid) => {
+                    Ok(resolution) => {
+                        let sid = resolution.session_id;
                         tracing::info!(
                             target: "pool::session",
-                            "created session {sid} for channel {cid} (scope {})",
+                            resumed = resolution.resumed,
+                            "resolved session {sid} for channel {cid} (scope {})",
                             scope.telemetry_label()
                         );
                         agent.state.sessions.insert(scope.clone(), sid.clone());
@@ -3072,14 +3213,16 @@ pub async fn run_prompt_task(
                             .state
                             .deliveries
                             .insert(scope.clone(), ChannelDeliveryState::default());
-                        // Seed a zero usage baseline: buzz-acp spawned this session
-                        // so prior usage is zero by definition — first turn is reliable.
-                        agent.acp.notify_session_spawned(&sid);
+                        if !resolution.resumed {
+                            // New provider sessions start with a zero usage
+                            // baseline. Resumed sessions retain provider history.
+                            agent.acp.notify_session_spawned(&sid);
+                        }
                         // Commit canvas only after session creation succeeds (I3).
                         if let Some((pending_scope, section)) = pending_canvas.take() {
                             agent.state.canvas_sections.insert(pending_scope, section);
                         }
-                        (sid, true)
+                        (sid, !resolution.resumed)
                     }
                     Err(AcpError::AgentExited) => {
                         agent.state.invalidate_all();
@@ -3113,7 +3256,7 @@ pub async fn run_prompt_task(
             if let Some(sid) = &agent.state.heartbeat_session {
                 (sid.clone(), false)
             } else {
-                match create_session_and_apply_model_at(
+                match resolve_provider_session_at(
                     &mut agent,
                     &ctx,
                     session_working_directory,
@@ -3129,7 +3272,8 @@ pub async fn run_prompt_task(
                 )
                 .await
                 {
-                    Ok(sid) => {
+                    Ok(resolution) => {
+                        let sid = resolution.session_id;
                         tracing::info!(
                             target: "pool::session",
                             "created heartbeat session {sid} for agent {}",
@@ -3173,7 +3317,7 @@ pub async fn run_prompt_task(
         observer_channel_id,
         Some(session_id.clone()),
         turn_id.clone(),
-        turn_started_at,
+        turn_started_at.clone(),
     ));
     // Backfill liveness's shared session ID so ticks after this point carry
     // it too, matching every other observer frame for this turn.
@@ -3275,7 +3419,7 @@ pub async fn run_prompt_task(
                         agent,
                         source,
                         PromptOutcome::AgentExited,
-                        requeue_batch_if_queue(&ctx, batch),
+                        requeue_ambiguous_provider_batch(&ctx, batch),
                     );
                     return;
                 }
@@ -3329,7 +3473,7 @@ pub async fn run_prompt_task(
                         agent,
                         source,
                         PromptOutcome::Timeout(TimeoutKind::Idle),
-                        requeue_batch_if_queue(&ctx, batch),
+                        requeue_ambiguous_provider_batch(&ctx, batch),
                     );
                     return;
                 }
@@ -3556,6 +3700,31 @@ pub async fn run_prompt_task(
         }),
     );
 
+    // Commit the ambiguous-effect boundary before the provider sees the
+    // prompt. If the process exits before the matching idle write, the next
+    // process may resume the provider context but must not replay this event.
+    if let (PromptSource::Channel(scope), Some(store)) = (&source, &ctx.session_recovery) {
+        if let Err(error) = store.mark_turn_started(
+            scope,
+            &session_id,
+            &turn_id,
+            &triggering_event_ids,
+            &turn_started_at,
+        ) {
+            send_prompt_result(
+                &result_tx,
+                &turn_id,
+                agent,
+                source,
+                PromptOutcome::Error(AcpError::Protocol(format!(
+                    "failed to persist provider turn boundary: {error}"
+                ))),
+                requeue_batch_if_queue(&ctx, batch),
+            );
+            return;
+        }
+    }
+
     // Turn start, labelled exactly as `log_stop_reason` labels the end, so a
     // log reads as start/stop pairs. Purely observational: an unpaired start is
     // the only durable evidence that a turn was entered and never returned, and
@@ -3622,6 +3791,13 @@ pub async fn run_prompt_task(
                             Ok(stop_reason) => {
                                 log_stop_reason(&source, &stop_reason);
                                 agent.state.invalidate(&source);
+                                if let (PromptSource::Channel(scope), Some(store)) =
+                                    (&source, &ctx.session_recovery)
+                                {
+                                    if let Err(error) = store.remove(scope) {
+                                        tracing::error!(target: "pool::session", "failed to retire cancelled session binding: {error}");
+                                    }
+                                }
                                 let retry_batch =
                                     requeue_cancelled_batch(&ctx, control_signal, batch);
 
@@ -3720,6 +3896,11 @@ pub async fn run_prompt_task(
                                 standing_sent,
                                 &pending_delivered_event_ids,
                             );
+                            if let Some(store) = &ctx.session_recovery {
+                                if let Err(error) = store.mark_idle(scope, &session_id) {
+                                    tracing::error!(target: "pool::session", "failed to persist completed provider turn: {error}");
+                                }
+                            }
                         }
                         apply_completed_before_control_signal(
                             &mut agent.state,
@@ -3763,6 +3944,11 @@ pub async fn run_prompt_task(
                     standing_sent,
                     &pending_delivered_event_ids,
                 );
+                if let Some(store) = &ctx.session_recovery {
+                    if let Err(error) = store.mark_idle(scope, &session_id) {
+                        tracing::error!(target: "pool::session", "failed to persist completed provider turn: {error}");
+                    }
+                }
             } else if !agent.has_system_prompt_support() {
                 agent.state.heartbeat_standing_context_sent = true;
             }
@@ -3797,6 +3983,13 @@ pub async fn run_prompt_task(
                     "rotating session for {source:?} after {stop_reason:?}",
                 );
                 agent.state.invalidate(&source);
+                if let (PromptSource::Channel(scope), Some(store)) =
+                    (&source, &ctx.session_recovery)
+                {
+                    if let Err(error) = store.remove(scope) {
+                        tracing::error!(target: "pool::session", "failed to retire rotated session binding: {error}");
+                    }
+                }
             }
 
             let core_stop = acp_stop_to_core(&stop_reason);
@@ -3839,7 +4032,12 @@ pub async fn run_prompt_task(
                 agent,
                 source,
                 PromptOutcome::AgentExited,
-                requeue_batch_if_queue(&ctx, batch),
+                // The durable turn boundary is still `turn_started`. The
+                // provider may have committed tool effects or its answer
+                // before the transport died, so replaying this batch would be
+                // unsafe. A later, distinct Buzz event may explicitly continue
+                // the resumed provider session.
+                None,
             );
         }
         Err(AcpError::IdleTimeout(_)) => {
@@ -3873,7 +4071,7 @@ pub async fn run_prompt_task(
                         agent,
                         source,
                         PromptOutcome::Timeout(TimeoutKind::Idle),
-                        requeue_batch_if_queue(&ctx, batch),
+                        requeue_ambiguous_provider_batch(&ctx, batch),
                     );
                 }
                 Err(AcpError::AgentExited) => {
@@ -3899,7 +4097,7 @@ pub async fn run_prompt_task(
                         agent,
                         source,
                         PromptOutcome::AgentExited,
-                        requeue_batch_if_queue(&ctx, batch),
+                        requeue_ambiguous_provider_batch(&ctx, batch),
                     );
                 }
                 Err(e) => {
@@ -3924,7 +4122,7 @@ pub async fn run_prompt_task(
                         agent,
                         source,
                         PromptOutcome::Timeout(TimeoutKind::Idle),
-                        requeue_batch_if_queue(&ctx, batch),
+                        requeue_ambiguous_provider_batch(&ctx, batch),
                     );
                 }
             }
@@ -3953,7 +4151,7 @@ pub async fn run_prompt_task(
                 agent,
                 source,
                 PromptOutcome::Timeout(TimeoutKind::Hard { recently_active }),
-                requeue_batch_if_queue(&ctx, batch),
+                requeue_ambiguous_provider_batch(&ctx, batch),
             );
         }
         Err(e) => {
@@ -3961,7 +4159,8 @@ pub async fn run_prompt_task(
             // AgentError means the agent caught a problem before mutating
             // session state (e.g. bad LLM response). The session is healthy —
             // don't invalidate it. Other errors may have corrupted state.
-            if !matches!(e, AcpError::AgentError { .. }) {
+            let rejected_before_mutation = matches!(e, AcpError::AgentError { .. });
+            if !rejected_before_mutation {
                 agent.state.invalidate(&source);
             }
             let usage = agent.acp.take_turn_usage();
@@ -3980,7 +4179,11 @@ pub async fn run_prompt_task(
                 agent,
                 source,
                 PromptOutcome::Error(e),
-                requeue_batch_if_queue(&ctx, batch),
+                if rejected_before_mutation {
+                    requeue_batch_if_queue(&ctx, batch)
+                } else {
+                    requeue_ambiguous_provider_batch(&ctx, batch)
+                },
             );
         }
     }
@@ -5215,6 +5418,21 @@ fn requeue_batch_if_queue(ctx: &PromptContext, batch: Option<FlushBatch>) -> Opt
     }
 }
 
+/// Preserve legacy retry behavior for harnesses without durable session state.
+/// Once recovery is enabled, an error after the provider boundary is
+/// indeterminate and only a distinct follow-up may continue that session.
+#[inline]
+fn requeue_ambiguous_provider_batch(
+    ctx: &PromptContext,
+    batch: Option<FlushBatch>,
+) -> Option<FlushBatch> {
+    if ctx.session_recovery.is_some() {
+        None
+    } else {
+        requeue_batch_if_queue(ctx, batch)
+    }
+}
+
 /// Map a cancelling [`ControlSignal`] to the [`CancelReason`] that should frame
 /// the merged re-prompt, then requeue the batch (in `Queue` dedup mode) with
 /// that reason stamped onto [`FlushBatch::cancel_reason`]. `Cancel`/`Rotate`
@@ -5285,9 +5503,17 @@ fn classify_control_cancel_failure(
         ),
         other => (PromptOutcome::Error(other), false),
     };
+    let retry_batch = if invalidate_all || ctx.session_recovery.is_some() {
+        // The adapter died while a provider turn was active. Provider/tool
+        // effects are indeterminate, so even a pending steer must not replay
+        // the original trigger into a fresh session.
+        None
+    } else {
+        requeue_cancelled_batch(ctx, signal, batch)
+    };
     ControlCancelFailure {
         outcome,
-        retry_batch: requeue_cancelled_batch(ctx, signal, batch),
+        retry_batch,
         invalidate_all,
     }
 }
@@ -8673,6 +8899,30 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         }
     }
 
+    #[test]
+    fn durable_recovery_drops_ambiguous_provider_retry() {
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.dedup_mode = DedupMode::Queue;
+        let recovery_dir = tempfile::tempdir().unwrap();
+        ctx.session_recovery = Some(
+            crate::session_recovery::SessionRecoveryStore::open(
+                recovery_dir.path().join("sessions.json"),
+            )
+            .unwrap(),
+        );
+        let channel_id = Uuid::new_v4();
+        let batch = one_event_batch(channel_id);
+
+        assert!(requeue_ambiguous_provider_batch(&ctx, Some(batch.clone())).is_none());
+        let failure = classify_control_cancel_failure(
+            &ctx,
+            AcpError::CancelDrainTimeout(CONTROL_CANCEL_GRACE),
+            ControlSignal::Steer,
+            Some(batch),
+        );
+        assert!(failure.retry_batch.is_none());
+    }
+
     // ── classify_control_cancel_failure ─────────────────────────────────────
     // Table-driven pin of the single production seam used by the
     // `Err(error)` arm in `run_prompt_task`'s control-cancel branch. Crosses
@@ -8780,12 +9030,12 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
                 invalidate_all: false,
             },
             Case {
-                name: "AgentExited requests all-session invalidation and preserves via Steer",
+                name: "AgentExited requests all-session invalidation without replay",
                 error: || AcpError::AgentExited,
                 signal: ControlSignal::Steer,
                 expected_outcome: "AgentExited",
-                batch_preserved: true,
-                expected_reason: Some(CancelReason::Steer),
+                batch_preserved: false,
+                expected_reason: None,
                 invalidate_all: true,
             },
             Case {
@@ -9699,6 +9949,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         PromptContext {
             mcp_servers: vec![],
             trusted_mcp_factory: None,
+            session_recovery: None,
             initial_message: None,
             idle_timeout: Duration::from_secs(60),
             max_turn_duration: Duration::from_secs(120),
@@ -10818,6 +11069,34 @@ done"#;
         (acp, capture)
     }
 
+    async fn scripted_resume_agent() -> (AcpClient, std::path::PathBuf) {
+        let capture =
+            std::env::temp_dir().join(format!("buzz-acp-session-resume-{}.ndjson", Uuid::new_v4()));
+        let script = r#"count=0
+while IFS= read -r line; do
+  count=$((count + 1))
+  printf '%s\n' "$line" >> "$CAPTURE_FILE"
+  if [ "$count" -eq 1 ]; then
+    printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{"sessionCapabilities":{"resume":{}},"mcpCapabilities":{"http":true}},"agentInfo":{"name":"adapter-test","version":"1"}}}'
+  else
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"sessionId":"persisted-session","configOptions":[],"modes":{}}}'
+  fi
+done"#;
+        let mut acp = AcpClient::spawn(
+            "bash",
+            &["-c".into(), script.into()],
+            &[(
+                "CAPTURE_FILE".into(),
+                capture.to_string_lossy().into_owned(),
+            )],
+            false,
+        )
+        .await
+        .expect("spawn scripted resume ACP");
+        acp.initialize().await.expect("initialize resume ACP");
+        (acp, capture)
+    }
+
     fn owned(acp: AcpClient) -> OwnedAgent {
         OwnedAgent {
             index: 0,
@@ -11119,6 +11398,95 @@ done"#;
             assert!(agent.state.trusted_mcp.is_empty());
             agent.acp.shutdown().await;
         }
+    }
+
+    #[tokio::test]
+    async fn production_session_resolution_resumes_exact_binding_with_fresh_trusted_mcp() {
+        let keys = nostr::Keys::generate();
+        let (acp, capture) = scripted_resume_agent().await;
+        let mut agent = owned(acp);
+        let mut ctx = tests::make_prompt_context_no_owner();
+        ctx.cwd = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        ctx.trusted_mcp_factory = Some(factory(&keys));
+        let recovery_dir = tempfile::tempdir().unwrap();
+        let store = crate::session_recovery::SessionRecoveryStore::open(
+            recovery_dir.path().join("sessions.json"),
+        )
+        .unwrap();
+        let scope = SessionScope::Conversation {
+            channel_id: Uuid::new_v4(),
+        };
+        store
+            .record_binding(crate::session_recovery::PersistedSessionBinding {
+                scope: scope.clone(),
+                provider: "adapter-test".into(),
+                provider_session_id: "persisted-session".into(),
+                cwd: ctx.cwd.clone(),
+                phase: crate::session_recovery::RecoveryPhase::TurnStarted {
+                    turn_id: "interrupted-turn".into(),
+                    trigger_event_ids: vec!["event-1".into()],
+                    started_at: "2026-09-04T00:00:00Z".into(),
+                },
+            })
+            .unwrap();
+        ctx.session_recovery = Some(store);
+
+        let resolution = resolve_provider_session_at(
+            &mut agent,
+            &ctx,
+            &ctx.cwd,
+            None,
+            None,
+            NewSessionChannelContext {
+                huddle_instructions: None,
+                canvas: None,
+                name: None,
+                scope: Some(&scope),
+                channel_type: Some("dm"),
+            },
+        )
+        .await
+        .expect("resume persisted session");
+        assert!(resolution.resumed);
+        assert_eq!(resolution.session_id, "persisted-session");
+
+        let requests = std::fs::read_to_string(&capture).unwrap();
+        let requests = requests
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1]["method"], "session/resume");
+        assert_eq!(requests[1]["params"]["sessionId"], "persisted-session");
+        let trusted = requests[1]["params"]["mcpServers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|server| server["name"] == "buzz-trusted-session")
+            .expect("fresh trusted MCP on resume");
+        assert!(trusted["url"]
+            .as_str()
+            .is_some_and(|url| url.starts_with("http://127.0.0.1:")));
+        assert!(!requests
+            .iter()
+            .any(|request| request["method"] == "session/new"));
+        let persisted = ctx
+            .session_recovery
+            .as_ref()
+            .unwrap()
+            .binding(&scope, "adapter-test", &ctx.cwd)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            persisted.phase,
+            crate::session_recovery::RecoveryPhase::TurnStarted { .. }
+        ));
+        agent.state.invalidate_all();
+        agent.acp.shutdown().await;
+        let _ = std::fs::remove_file(capture);
     }
 
     #[tokio::test]

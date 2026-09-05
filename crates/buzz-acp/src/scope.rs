@@ -21,6 +21,7 @@
 //! channel-keyed behavior exactly.
 
 use nostr::Event;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::queue::parse_thread_tags;
@@ -67,7 +68,8 @@ impl std::fmt::Display for SessionPolicy {
 /// This is the canonical key for provider sessions, queue partitions, in-flight
 /// tracking, and context gathering. The channel remains the authorization and
 /// collaboration boundary; the scope is the default *execution* boundary.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
 pub enum SessionScope {
     /// The whole channel is one session. Used for DMs always, and for every
     /// channel event under [`SessionPolicy::Channel`].

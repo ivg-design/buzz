@@ -180,6 +180,10 @@ fn reserved_keys_include_desktop_acp_session_policy() {
     assert!(is_reserved_env_key("BUZZ_ACP_SESSION_POLICY"));
     let agent = map(&[("BUZZ_ACP_SESSION_POLICY", "thread")]);
     assert!(merged_user_env(&BTreeMap::new(), &agent).is_empty());
+
+    assert!(is_reserved_env_key("BUZZ_ACP_SESSION_RECOVERY_PATH"));
+    let agent = map(&[("BUZZ_ACP_SESSION_RECOVERY_PATH", "/tmp/foreign")]);
+    assert!(merged_user_env(&BTreeMap::new(), &agent).is_empty());
 }
 
 #[test]

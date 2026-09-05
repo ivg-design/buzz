@@ -45,6 +45,10 @@ import { formatTime } from "@/features/messages/lib/dateFormatters";
 // Pure overlay helper lives in a sibling .mjs so node:test (no TS loader)
 // can exercise the exact same source the renderer uses.
 import { applyEditTagOverlay } from "@/features/messages/lib/applyEditTagOverlay.mjs";
+import {
+  isJobConversationKind,
+  projectJobConversation,
+} from "@/features/messages/lib/jobConversationProjection.mjs";
 import { truncatePubkey } from "@/shared/lib/pubkey";
 
 const HEX_RE = /^[0-9a-f]+$/i;
@@ -106,8 +110,18 @@ export function countTopLevelTimelineRows(events: RelayEvent[]): number {
   }
 
   let count = 0;
+  const seenEventIds = new Set<string>();
   for (const event of events) {
-    if (!isTimelineContentEvent(event) || deletedEventIds.has(event.id)) {
+    if (
+      !isTimelineContentEvent(event) ||
+      deletedEventIds.has(event.id) ||
+      seenEventIds.has(event.id)
+    ) {
+      continue;
+    }
+    seenEventIds.add(event.id);
+    const jobProjection = projectJobConversation(event);
+    if (jobProjection?.requestEventId) {
       continue;
     }
     const { parentId } = getThreadReference(event.tags);
@@ -297,10 +311,24 @@ export function formatTimelineMessages(
     }
   }
 
-  const visibleEvents = events.filter(
-    (event) => isTimelineContentEvent(event) && !deletedEventIds.has(event.id),
-  );
+  const visibleEventIds = new Set<string>();
+  const visibleEvents = events.filter((event) => {
+    if (
+      !isTimelineContentEvent(event) ||
+      deletedEventIds.has(event.id) ||
+      visibleEventIds.has(event.id)
+    ) {
+      return false;
+    }
+    visibleEventIds.add(event.id);
+    return true;
+  });
   const eventsById = new Map(visibleEvents.map((event) => [event.id, event]));
+  const jobProjectionByEventId = new Map(
+    visibleEvents
+      .filter((event) => isJobConversationKind(event.kind))
+      .map((event) => [event.id, projectJobConversation(event)] as const),
+  );
   const reactionPresence = new Map<
     string,
     {
@@ -438,7 +466,11 @@ export function formatTimelineMessages(
       return 0;
     }
 
-    const thread = getThreadReference(event.tags);
+    const requestEventId =
+      jobProjectionByEventId.get(event.id)?.requestEventId ?? null;
+    const thread = requestEventId
+      ? { parentId: requestEventId, rootId: requestEventId }
+      : getThreadReference(event.tags);
     if (!thread.parentId) {
       depthByEventId.set(event.id, 0);
       return 0;
@@ -469,7 +501,13 @@ export function formatTimelineMessages(
         relaySelfPubkey,
         requireChannelTagForPTags: true,
       });
-    const thread = getThreadReference(event.tags);
+    const jobProjection = jobProjectionByEventId.get(event.id) ?? null;
+    const thread = jobProjection?.requestEventId
+      ? {
+          parentId: jobProjection.requestEventId,
+          rootId: jobProjection.requestEventId,
+        }
+      : getThreadReference(event.tags);
     const edit = editsByTargetId.get(event.id);
     const role = roleByPubkey.get(authorPubkey.toLowerCase());
     const authorProfile = profiles?.[authorPubkey.toLowerCase()];
@@ -503,7 +541,7 @@ export function formatTimelineMessages(
           ? respondToLookup?.get(authorPubkey.toLowerCase())
           : undefined,
       time: formatTime(event.created_at),
-      body: edit ? edit.content : event.content,
+      body: jobProjection?.body ?? (edit ? edit.content : event.content),
       parentId: thread.parentId,
       rootId: thread.rootId,
       depth: getDepth(event),

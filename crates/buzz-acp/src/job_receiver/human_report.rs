@@ -27,7 +27,13 @@ impl HumanJobReport {
                     .map(str::trim_end)
                     .filter(|text| !text.is_empty());
                 match render_terminal_candidate(candidate) {
-                    Some(rendered) => [prior, Some(rendered.as_str())]
+                    Some(rendered) => [
+                        prior,
+                        candidate.find("```").filter(|index| *index > 0)
+                            .map(|index| candidate[..index].trim())
+                            .filter(|prefix| !prefix.is_empty()),
+                        Some(rendered.as_str()),
+                    ]
                         .into_iter()
                         .flatten()
                         .collect::<Vec<_>>()

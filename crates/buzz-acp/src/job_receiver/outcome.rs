@@ -79,10 +79,18 @@ pub enum TerminalDisposition {
 /// duplicate-key validation. Multiple objects/fences remain invalid JSON.
 pub(super) fn terminal_json_text(text: &str) -> &str {
     let text = text.trim();
-    let unfenced = text
+    // Some adapters omit logical message IDs and concatenate the final
+    // explanation with one fenced envelope. Accept that final block only;
+    // do not scan arbitrary prose for objects or choose among multiple fences.
+    let fences: Vec<_> = text.match_indices("```").collect();
+    if fences.len() != 2 || fences[1].0 + 3 != text.len() {
+        return text;
+    }
+    let fenced = &text[fences[0].0..];
+    let unfenced = fenced
         .strip_prefix("```json\n")
-        .or_else(|| text.strip_prefix("```JSON\n"))
-        .or_else(|| text.strip_prefix("```\n"));
+        .or_else(|| fenced.strip_prefix("```JSON\n"))
+        .or_else(|| fenced.strip_prefix("```\n"));
     unfenced
         .and_then(|body| body.trim_end().strip_suffix("```"))
         .map(str::trim)
@@ -977,7 +985,7 @@ mod fenced_outcome_regression {
         let digest = "f082b8c67d0e9d3d943ab368579f4071609f1492a45d22748b0763c739e1a777";
         let report = "d".repeat(64);
         let value = serde_json::json!({"schema_version":OUTCOME_SCHEMA,"operation_id":operation,"request_event_id":request,"scope_digest":digest,"outcome":"success","summary":"R06 source review complete; local changes require reconciliation.","artifacts":[{"note":"Source inspection","file_refs":["src/native.rs"]},format!("git:{}","a".repeat(40))],"evidence":[format!("buzz:event:{}","b".repeat(64)),{"searches":["native isolation"]}]});
-        let text = format!("```json\n{value}\n```");
+        let text = format!("I inspected the source. An accidental local reset needs reconciliation.\n\n```json\n{value}\n```");
         assert!(matches!(
             parse_terminal_outcome_with_report(
                 Some(text.clone()),
@@ -1006,6 +1014,7 @@ mod fenced_outcome_regression {
             super::super::human_report::HumanJobReport::from_turn_output(Some(&text), Some(&text))
                 .unwrap();
         assert!(human.content().contains("Source inspection"));
+        assert!(human.content().contains("accidental local reset"));
         assert!(!human.content().contains("schema_version"));
         assert!(!human.content().contains("```"));
     }

@@ -3751,6 +3751,21 @@ mod postgres_tests {
     }
 
     #[test]
+    fn human_stream_replies_use_nip10_while_job_lifecycle_uses_job_thread_metadata() {
+        assert!(requires_nip10_thread_meta(KIND_STREAM_MESSAGE));
+        for kind in [
+            KIND_JOB_REQUEST,
+            KIND_JOB_ACCEPTED,
+            KIND_JOB_PROGRESS,
+            KIND_JOB_RESULT,
+            KIND_JOB_CANCEL,
+            KIND_JOB_ERROR,
+        ] {
+            assert!(!requires_nip10_thread_meta(kind));
+        }
+    }
+
+    #[test]
     fn nip29_admin_kinds_require_h_tags() {
         for kind in [
             KIND_NIP29_PUT_USER,

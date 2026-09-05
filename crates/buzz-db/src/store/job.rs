@@ -3,10 +3,20 @@
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
 
+use buzz_core::job::JobEvent;
 use buzz_core::{CommunityId, StoredEvent};
 use nostr::Event;
 
 use crate::{Db, EventQuery, Result};
+
+fn event_created_at(event: &Event) -> Result<chrono::DateTime<chrono::Utc>> {
+    let seconds = i64::try_from(event.created_at.as_secs()).map_err(|_| {
+        crate::DbError::InvalidData("validated job event timestamp exceeded i64".into())
+    })?;
+    chrono::DateTime::from_timestamp(seconds, 0).ok_or_else(|| {
+        crate::DbError::InvalidData("validated job event had an invalid timestamp".into())
+    })
+}
 
 /// Open transaction holding a community/operation-scoped advisory lock.
 ///
@@ -115,13 +125,66 @@ impl JobOperationLock {
         community: CommunityId,
         event: &Event,
         channel_id: Uuid,
+        job: &JobEvent,
     ) -> Result<(StoredEvent, bool)> {
+        let thread_root = match job.request_event_id() {
+            None => None,
+            Some(request_event_id) => {
+                let root_id = hex::decode(request_event_id).map_err(|_| {
+                    crate::DbError::InvalidData("validated job request event ID was not hex".into())
+                })?;
+                let mut query = EventQuery::for_community(community);
+                query.ids = Some(vec![root_id.clone()]);
+                query.limit = Some(2);
+                let mut roots =
+                    crate::event::query_events_on(self.transaction.as_mut(), &query).await?;
+                if roots.len() != 1 {
+                    return Err(crate::DbError::InvalidData(
+                        "validated job request root was not uniquely stored".into(),
+                    ));
+                }
+                let root = roots.pop().ok_or_else(|| {
+                    crate::DbError::InvalidData(
+                        "validated job request root disappeared during insert".into(),
+                    )
+                })?;
+                if root.event.kind.as_u16() as u32 != buzz_core::kind::KIND_JOB_REQUEST {
+                    return Err(crate::DbError::InvalidData(
+                        "validated job request root had the wrong kind".into(),
+                    ));
+                }
+                if root.channel_id != Some(channel_id) {
+                    return Err(crate::DbError::InvalidData(
+                        "validated job request root belonged to another channel".into(),
+                    ));
+                }
+                let root_created_at = event_created_at(&root.event)?;
+                Some((root_id, root_created_at))
+            }
+        };
+        let event_created_at = event_created_at(event)?;
+        let thread_meta = thread_root.as_ref().map(|(root_id, root_created_at)| {
+            crate::event::ThreadMetadataParams {
+                event_id: event.id.as_bytes(),
+                event_created_at,
+                channel_id,
+                // Job lifecycle predecessor tags preserve the protocol audit
+                // chain. Conversation rendering is intentionally flat: every
+                // lifecycle row is a direct child of the request event.
+                parent_event_id: Some(root_id),
+                parent_event_created_at: Some(*root_created_at),
+                root_event_id: Some(root_id),
+                root_event_created_at: Some(*root_created_at),
+                depth: 1,
+                broadcast: false,
+            }
+        });
         crate::event::insert_event_with_thread_metadata_tx(
             &mut self.transaction,
             community,
             event,
             Some(channel_id),
-            None,
+            thread_meta,
         )
         .await
     }

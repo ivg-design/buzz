@@ -42,7 +42,7 @@ pub enum JobAuthError {
 
 /// Validated job plus the cross-pod operation lock held through event insert.
 pub struct ValidatedJob {
-    _job: JobEvent,
+    job: JobEvent,
     lock: buzz_db::JobOperationLock,
     existing: Option<buzz_core::StoredEvent>,
 }
@@ -59,7 +59,7 @@ impl ValidatedJob {
             return Ok((existing, false));
         }
         self.lock
-            .insert_event(tenant.community(), event, channel_id)
+            .insert_event(tenant.community(), event, channel_id, &self.job)
             .await
             .map_err(|error| JobAuthError::Internal(format!("inserting fenced job event: {error}")))
     }
@@ -125,7 +125,7 @@ pub async fn validate_job_event(
             })?;
         if let Some(stored) = find_exact_event(&mut lock, tenant, &exact_id).await? {
             return Ok(ValidatedJob {
-                _job: job,
+                job,
                 lock,
                 existing: Some(stored),
             });
@@ -199,7 +199,7 @@ pub async fn validate_job_event(
         })?;
     if let Some(stored) = find_exact_event(&mut lock, tenant, &exact_id).await? {
         return Ok(ValidatedJob {
-            _job: job,
+            job,
             lock,
             existing: Some(stored),
         });
@@ -341,7 +341,7 @@ pub async fn validate_job_event(
     validate_operation_history(tenant, &mut lock, event, &job, channel_id).await?;
 
     Ok(ValidatedJob {
-        _job: job,
+        job,
         lock,
         existing: None,
     })

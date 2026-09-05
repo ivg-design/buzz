@@ -702,7 +702,7 @@ mod postgres_tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 44);
+        assert_eq!(migrations.len(), 45);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1287,6 +1287,15 @@ mod postgres_tests {
             desired_schema.contains("'rate_limit_violations'\n    ]::TEXT[])"),
             "schema.sql exclusion list must match the pre-0041 body after ledger removal"
         );
+
+        // Existing job events were stored atomically but without thread rows.
+        // The data-only migration repairs them into flat request-root threads.
+        assert_eq!(migrations[44].version, 45);
+        let job_threads = migrations[44].sql.as_str();
+        assert!(job_threads.contains("followup.kind BETWEEN 43002 AND 43006"));
+        assert!(job_threads.contains("root.kind = 43001"));
+        assert!(job_threads.contains("INSERT INTO thread_metadata"));
+        assert!(job_threads.contains("Recompute affected root summaries"));
     }
 
     #[test]
@@ -2757,5 +2766,114 @@ mod postgres_tests {
             .validate_catalog()
             .await
             .expect("deletion catalog validates after migration 0044");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn migration_0045_repairs_existing_job_events_into_one_flat_thread() {
+        use nostr::{EventBuilder, Keys, Kind, Tag};
+
+        let pool = connect_test_pool().await;
+        reset_public_schema(&pool).await;
+        MIGRATOR
+            .run_to(44, &pool)
+            .await
+            .expect("apply migrations through 0044");
+
+        let db = crate::Db::from_pool(pool.clone());
+        let community_uuid = uuid::Uuid::new_v4();
+        let community = buzz_core::CommunityId::from_uuid(community_uuid);
+        let channel_id = uuid::Uuid::new_v4();
+        let keys = Keys::generate();
+        sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+            .bind(community_uuid)
+            .bind(format!("job-migration-{}.example", community_uuid.simple()))
+            .execute(&pool)
+            .await
+            .expect("seed migration test community");
+        sqlx::query(
+            "INSERT INTO channels (id, community_id, name, created_by) VALUES ($1,$2,$3,$4)",
+        )
+        .bind(channel_id)
+        .bind(community_uuid)
+        .bind("legacy job thread")
+        .bind(keys.public_key().to_bytes().to_vec())
+        .execute(&pool)
+        .await
+        .expect("seed migration test channel");
+
+        let channel_tag = channel_id.to_string();
+        let root = EventBuilder::new(Kind::Custom(43_001), "legacy request")
+            .tags(vec![Tag::parse(["h", &channel_tag]).expect("channel tag")])
+            .sign_with_keys(&keys)
+            .expect("sign legacy request");
+        assert!(
+            db.insert_event(community, &root, Some(channel_id))
+                .await
+                .expect("insert legacy request")
+                .1
+        );
+        let root_id = root.id.to_hex();
+        let mut followup_ids = Vec::new();
+        for kind in 43_002..=43_006 {
+            let followup = EventBuilder::new(Kind::Custom(kind), format!("legacy kind {kind}"))
+                .tags(vec![
+                    Tag::parse(["h", &channel_tag]).expect("channel tag"),
+                    Tag::parse(["e", &root_id, "", "root"]).expect("job root tag"),
+                ])
+                .sign_with_keys(&keys)
+                .expect("sign legacy follow-up");
+            assert!(
+                db.insert_event(community, &followup, Some(channel_id))
+                    .await
+                    .expect("insert legacy follow-up")
+                    .1
+            );
+            followup_ids.push(followup.id);
+        }
+        assert_eq!(
+            db.get_channel_window(community, channel_id, 20, None, None)
+                .await
+                .expect("load pre-migration channel window")
+                .rows
+                .len(),
+            6,
+            "old job events have no conversational metadata"
+        );
+
+        MIGRATOR
+            .run_to(45, &pool)
+            .await
+            .expect("apply job thread metadata migration");
+
+        let window = db
+            .get_channel_window(community, channel_id, 20, None, None)
+            .await
+            .expect("load repaired channel window");
+        assert_eq!(window.rows.len(), 1);
+        assert_eq!(window.rows[0].stored_event.event.id, root.id);
+        let summary = window.rows[0]
+            .thread_summary
+            .as_ref()
+            .expect("repaired root summary");
+        assert_eq!(summary.reply_count, 5);
+        assert_eq!(summary.descendant_count, 5);
+
+        let replies = db
+            .get_thread_replies(community, root.id.as_bytes(), Some(64), 20, None)
+            .await
+            .expect("load repaired job thread");
+        assert_eq!(replies.len(), 5);
+        assert!(replies.iter().all(|reply| {
+            reply.parent_event_id.as_deref() == Some(root.id.as_bytes().as_slice())
+                && reply.root_event_id.as_deref() == Some(root.id.as_bytes().as_slice())
+                && reply.depth == 1
+                && !reply.broadcast
+        }));
+        assert!(followup_ids
+            .iter()
+            .all(|id| replies
+                .iter()
+                .any(|reply| reply.stored_event.event.id == *id)));
     }
 }

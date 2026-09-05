@@ -163,7 +163,10 @@ pub(crate) fn validate_repository(repo: &JobRepository) -> Result<(), JobValidat
     validate_hex("repository.base_sha", &repo.base_sha, &[40, 64])?;
     validate_branch(&repo.branch)?;
     validate_worktree_id(&repo.worktree_id)?;
-    validate_list("repository.paths", &repo.paths, true)?;
+    // An empty path set represents an information-only request. Receivers
+    // decide whether their local policy supports that request; non-empty
+    // entries remain exact repository-relative coordination scopes.
+    validate_list("repository.paths", &repo.paths, false)?;
     validate_list("repository.contracts", &repo.contracts, false)?;
     validate_inert_references("repository.contracts", &repo.contracts)?;
     if repo

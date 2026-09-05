@@ -90,7 +90,48 @@ async fn managed_nemo_dispatch_needs_no_github_login_and_uses_portable_worktree_
         let error = build_request(&relay, managed_dispatch_params(Some(invalid)))
             .await
             .expect_err("receiver-incompatible worktree id");
-        assert!(error.contains("outside the Nemo repository policy"));
+        assert!(error.contains("worktree_id"));
+    }
+}
+
+#[tokio::test]
+async fn managed_nemo_dispatch_accepts_information_only_scope_and_normalizes_issue_url() {
+    let (_harness, relay) = managed_nemo_relay_without_github_login();
+    let mut params = managed_dispatch_params(Some("status-check"));
+    params.capability = "consultation".into();
+    params.summary = "Report current kickoff status".into();
+    params.paths.clear();
+    params.github_issue = Some("https://github.com/mysteropodes/nemo/issues/895".into());
+
+    let request = build_request(&relay, params)
+        .await
+        .expect("information-only dispatch");
+    let JobEvent::Request(request) = request else {
+        panic!("expected request");
+    };
+    assert!(request.common.repository.paths.is_empty());
+    assert_eq!(
+        request.common.repository.github_issue.as_deref(),
+        Some("895")
+    );
+}
+
+#[tokio::test]
+async fn dispatch_rejects_mismatched_or_ambiguous_github_references() {
+    let (_harness, relay) = managed_nemo_relay_without_github_login();
+    for invalid in [
+        "https://github.com/other/repo/issues/895",
+        "https://github.com/mysteropodes/nemo/pull/895",
+        "https://github.com/mysteropodes/nemo/issues/895?view=1",
+        "0895",
+    ] {
+        let mut params = managed_dispatch_params(Some("status-check"));
+        params.paths.clear();
+        params.github_issue = Some(invalid.into());
+        let error = build_request(&relay, params)
+            .await
+            .expect_err("invalid issue reference");
+        assert!(error.contains("github_issue"), "{invalid}: {error}");
     }
 }
 

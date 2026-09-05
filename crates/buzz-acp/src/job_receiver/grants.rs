@@ -155,6 +155,9 @@ impl GrantSet {
 
     pub fn git_operations_for(&self, request: &JobRequest) -> Option<Vec<String>> {
         if self.nemo_workspace && static_nemo_request_allowed(request) {
+            if request.common.repository.paths.is_empty() {
+                return Some(Vec::new());
+            }
             return Some(vec!["commit".into(), "fetch".into(), "push".into()]);
         }
         Some(self.matching_grant(request)?.git_operations.clone())
@@ -227,6 +230,9 @@ impl GrantSet {
     }
 
     fn matching_grant(&self, request: &JobRequest) -> Option<&JobGrant> {
+        if request.common.repository.paths.is_empty() {
+            return None;
+        }
         let mut matches = self.grants.iter().filter(|grant| {
             grant.project_address == request.common.project.address
                 && grant.home_channel == request.common.project.home_channel
@@ -661,7 +667,6 @@ fn static_nemo_request_allowed(request: &JobRequest) -> bool {
         && valid_sha(&repository.base_sha)
         && buzz_core::nemo::valid_worktree_component(&repository.worktree_id)
         && repository.branch == format!("codex/{}", repository.worktree_id)
-        && !repository.paths.is_empty()
         && repository
             .paths
             .iter()
@@ -1496,6 +1501,37 @@ mod tests {
         candidate.common.repository.branch = "codex/a2a".into();
         candidate.common.repository.worktree_id = "other".into();
         assert!(grants.capabilities_for(&candidate).is_none());
+        candidate.common.repository.worktree_id = "a2a".into();
+        candidate.common.repository.paths.clear();
+        assert!(grants.capabilities_for(&candidate).is_none());
+        assert!(grants.git_operations_for(&candidate).is_none());
+    }
+
+    #[test]
+    fn managed_nemo_accepts_information_only_scope_without_git_operations() {
+        let mut candidate = request();
+        candidate.common.project.address = buzz_core::nemo::PROJECT_ADDRESS.into();
+        candidate.common.project.home_channel = buzz_core::nemo::HOME_CHANNEL.into();
+        candidate.common.repository.canonical = buzz_core::nemo::REPOSITORY.into();
+        candidate.common.repository.worktree_id = "consultation".into();
+        candidate.common.repository.branch = "codex/consultation".into();
+        candidate.common.repository.paths.clear();
+        candidate.common.sender_pubkey = nostr::Keys::generate().public_key().to_hex();
+        let grants = GrantSet {
+            grants: Vec::new(),
+            nemo_workspace: true,
+            nemo_checkout: None,
+        };
+
+        assert_eq!(
+            grants.capabilities_for(&candidate),
+            Some(vec![candidate.capability.clone()])
+        );
+        assert_eq!(grants.git_operations_for(&candidate), Some(Vec::new()));
+
+        candidate.common.repository.paths = vec!["../outside".into()];
+        assert!(grants.capabilities_for(&candidate).is_none());
+        assert!(grants.git_operations_for(&candidate).is_none());
     }
 
     #[test]

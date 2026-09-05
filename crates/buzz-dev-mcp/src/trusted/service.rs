@@ -80,7 +80,7 @@ impl TrustedSessionMcp {
 
     #[tool(
         name = "buzz_a2a_dispatch",
-        description = "Dispatch one signed A2A request within the exact local project, repository, peer, capability, path, branch, and worktree grant."
+        description = "Dispatch one signed A2A request within the exact local project, repository, peer, capability, branch, and worktree scope. Supply repository-relative paths to coordinate file ownership, or an empty paths list for an information-only request. GitHub references accept a positive number or canonical same-repository issue, pull, or Actions run URL."
     )]
     async fn buzz_a2a_dispatch(
         &self,

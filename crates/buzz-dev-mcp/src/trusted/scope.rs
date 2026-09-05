@@ -229,7 +229,8 @@ impl GrantSet {
         }
         let mut matches = Vec::new();
         for grant in &self.grants {
-            let statically_allowed = grant.requester_pubkeys.iter().any(|peer| peer == recipient)
+            let statically_allowed = !paths.is_empty()
+                && grant.requester_pubkeys.iter().any(|peer| peer == recipient)
                 && grant
                     .capabilities
                     .iter()
@@ -267,7 +268,8 @@ impl GrantSet {
             };
         }
         self.grants.iter().any(|grant| {
-            grant.project_address == common.project.address
+            !common.repository.paths.is_empty()
+                && grant.project_address == common.project.address
                 && grant.home_channel == common.project.home_channel
                 && grant.repository == common.repository.canonical
                 && grant.base_sha == common.repository.base_sha
@@ -320,7 +322,8 @@ impl GrantSet {
             return true;
         }
         self.grants.iter().any(|grant| {
-            grant.project_address == project.address
+            !repository.paths.is_empty()
+                && grant.project_address == project.address
                 && grant.home_channel == project.home_channel
                 && grant.repository == repository.canonical
                 && grant.requester_pubkeys.iter().any(|peer| peer == recipient)
@@ -366,7 +369,8 @@ impl GrantSet {
                 &common.project.address,
                 &common.project.home_channel,
                 &common.repository.canonical,
-            ) && valid_nemo_repository_scope(&common.repository)
+            ) && !common.repository.paths.is_empty()
+                && valid_nemo_repository_scope(&common.repository)
                 && matches!(operation.as_str(), "commit" | "fetch" | "push")
             {
                 return inspect_nemo_trusted_git_checkout(
@@ -378,7 +382,8 @@ impl GrantSet {
             }
         }
         let candidate_grants = self.grants.iter().filter(|grant| {
-            grant.home_channel == channel
+            !common.repository.paths.is_empty()
+                && grant.home_channel == channel
                 && grant.project_address == common.project.address
                 && grant.repository == common.repository.canonical
                 && grant.base_sha == common.repository.base_sha
@@ -465,14 +470,22 @@ fn validate_nemo_request_fields(
     paths: &[String],
     worktree_id: &str,
 ) -> Result<(), String> {
-    if !valid_pubkey(recipient)
-        || !valid_token(capability)
-        || paths.is_empty()
-        || paths.iter().any(|path| !valid_relative_path(path))
-        || !buzz_core::nemo::valid_worktree_component(worktree_id)
+    if !valid_pubkey(recipient) {
+        return Err("recipient_pubkey must be a canonical 64-character public key".into());
+    }
+    if !valid_token(capability) {
+        return Err("capability must be a non-empty portable token".into());
+    }
+    if paths.iter().any(|path| !valid_relative_path(path)) {
+        return Err(
+            "paths must be empty for an information-only request or contain normalized repository-relative paths"
+                .into(),
+        );
+    }
+    if !buzz_core::nemo::valid_worktree_component(worktree_id)
         || !valid_branch(&format!("codex/{worktree_id}"))
     {
-        return Err("A2A request fields are outside the Nemo repository policy".into());
+        return Err("worktree_id must be a portable Nemo worktree component".into());
     }
     Ok(())
 }
@@ -482,7 +495,6 @@ fn valid_nemo_repository_scope(repository: &buzz_core::job::JobRepository) -> bo
         && valid_sha(&repository.base_sha)
         && buzz_core::nemo::valid_worktree_component(&repository.worktree_id)
         && repository.branch == format!("codex/{}", repository.worktree_id)
-        && !repository.paths.is_empty()
         && repository
             .paths
             .iter()
@@ -958,6 +970,22 @@ mod tests {
     }
 
     #[test]
+    fn managed_nemo_allows_empty_information_scope_but_rejects_unsafe_paths() {
+        assert!(
+            validate_nemo_request_fields(&"a".repeat(64), "consultation", &[], "status-check")
+                .is_ok()
+        );
+        let error = validate_nemo_request_fields(
+            &"a".repeat(64),
+            "consultation",
+            &["../outside".into()],
+            "status-check",
+        )
+        .expect_err("unsafe path");
+        assert!(error.contains("paths"));
+    }
+
+    #[test]
     fn git_operations_are_explicit_bounded_and_deny_by_default() {
         let peer = "a".repeat(64);
         let checkout = tempfile::tempdir().expect("checkout");
@@ -1076,6 +1104,10 @@ mod tests {
             .outbound(&"a".repeat(64), "rust", &["crates/buzz-acp".into()], "a2a")
             .await
             .is_ok());
+        assert!(grants
+            .outbound(&"a".repeat(64), "rust", &[], "a2a")
+            .await
+            .is_err());
 
         run(&["checkout", "-b", "other"]);
         assert!(grants

@@ -67,6 +67,31 @@ fn request_round_trips_strict_canonical_json() {
 }
 
 #[test]
+fn information_only_request_round_trips_with_no_repository_paths() {
+    let sender = Keys::generate();
+    let recipient = Keys::generate();
+    let mut request_common = common(&sender, &recipient);
+    request_common.repository.paths.clear();
+    let job = JobEvent::Request(JobRequest {
+        common: request_common,
+        capability: "consultation".into(),
+        summary: "Report current implementation status".into(),
+        acceptance: vec!["Return a concise status report".into()],
+        supersedes_event_id: None,
+    });
+    let event = EventBuilder::new(
+        Kind::Custom(KIND_JOB_REQUEST as u16),
+        job.canonical_json().expect("json"),
+    )
+    .tags(build_job_tags(&job).expect("tags"))
+    .sign_with_keys(&sender)
+    .expect("sign");
+
+    let parsed = JobEvent::parse(&event).expect("information-only request");
+    assert!(parsed.common().repository.paths.is_empty());
+}
+
+#[test]
 fn body_author_and_duplicate_route_tags_are_rejected() {
     let sender = Keys::generate();
     let recipient = Keys::generate();

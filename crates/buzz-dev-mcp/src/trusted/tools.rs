@@ -27,14 +27,19 @@ pub struct A2aDispatchParams {
     /// operation ID when omitted and binds the signed request to it.
     #[serde(default)]
     pub worktree_id: Option<String>,
+    /// Repository-relative ownership coordinates. Use an empty list for an
+    /// information-only consultation with no file effects requested.
     pub paths: Vec<String>,
     #[serde(default)]
     pub contracts: Vec<String>,
     #[serde(default)]
+    /// Positive issue number or canonical same-repository GitHub issue URL.
     pub github_issue: Option<String>,
     #[serde(default)]
+    /// Positive pull-request number or canonical same-repository GitHub pull URL.
     pub github_pr: Option<String>,
     #[serde(default)]
+    /// Positive Actions run number or canonical same-repository GitHub run URL.
     pub github_run: Option<String>,
     /// Exact kind-43005 handoff event when continuing an existing operation.
     #[serde(default)]
@@ -289,7 +294,7 @@ async fn build_request(
         None => return Err("outbound A2A requires BUZZ_ACP_OWNER_GITHUB_LOGIN".into()),
     };
     let request = JobRequest {
-        common: common_from(grant, relay, &params, github_login),
+        common: common_from(grant, relay, &params, github_login)?,
         capability: params.capability,
         summary: params.summary,
         acceptance: params.acceptance,
@@ -333,6 +338,7 @@ async fn build_superseding_request(
         return Err("handoff actors or scope do not match the original request".into());
     }
     let old = &chain.request;
+    let references = normalize_github_references(&old.common.repository.canonical, &params)?;
     let expected_epoch = old
         .common
         .coordinator_epoch
@@ -350,9 +356,9 @@ async fn build_superseding_request(
             .is_some_and(|value| value != old.common.repository.worktree_id)
         || params.paths != old.common.repository.paths
         || params.contracts != old.common.repository.contracts
-        || params.github_issue != old.common.repository.github_issue
-        || params.github_pr != old.common.repository.github_pr
-        || params.github_run != old.common.repository.github_run
+        || references.issue != old.common.repository.github_issue
+        || references.pull_request != old.common.repository.github_pr
+        || references.run != old.common.repository.github_run
     {
         return Err("superseding dispatch must exactly match the old scope and next epoch".into());
     }
@@ -386,8 +392,9 @@ fn common_from(
     relay: &TrustedRelay,
     params: &A2aDispatchParams,
     github_login: String,
-) -> JobCommon {
-    JobCommon {
+) -> Result<JobCommon, String> {
+    let references = normalize_github_references(&grant.repository, params)?;
+    Ok(JobCommon {
         schema_version: JOB_SCHEMA_VERSION.into(),
         operation_id: params.operation_id.clone(),
         idempotency_key: params.idempotency_key.clone(),
@@ -398,9 +405,9 @@ fn common_from(
         },
         repository: JobRepository {
             canonical: grant.repository,
-            github_issue: params.github_issue.clone(),
-            github_pr: params.github_pr.clone(),
-            github_run: params.github_run.clone(),
+            github_issue: references.issue,
+            github_pr: references.pull_request,
+            github_run: references.run,
             base_sha: grant.base_sha,
             branch: grant.branch,
             worktree_id: grant.worktree_id,
@@ -415,7 +422,62 @@ fn common_from(
         },
         expires_at: (Utc::now() + Duration::seconds(i64::from(params.ttl_seconds)))
             .to_rfc3339_opts(SecondsFormat::Secs, true),
+    })
+}
+
+struct GithubReferences {
+    issue: Option<String>,
+    pull_request: Option<String>,
+    run: Option<String>,
+}
+
+fn normalize_github_references(
+    repository: &str,
+    params: &A2aDispatchParams,
+) -> Result<GithubReferences, String> {
+    Ok(GithubReferences {
+        issue: normalize_github_reference(
+            "github_issue",
+            repository,
+            "issues",
+            params.github_issue.as_deref(),
+        )?,
+        pull_request: normalize_github_reference(
+            "github_pr",
+            repository,
+            "pull",
+            params.github_pr.as_deref(),
+        )?,
+        run: normalize_github_reference(
+            "github_run",
+            repository,
+            "actions/runs",
+            params.github_run.as_deref(),
+        )?,
+    })
+}
+
+fn normalize_github_reference(
+    field: &str,
+    repository: &str,
+    kind_path: &str,
+    value: Option<&str>,
+) -> Result<Option<String>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let url_prefix = format!("{repository}/{kind_path}/");
+    let identifier = value.strip_prefix(&url_prefix).unwrap_or(value);
+    if identifier.is_empty()
+        || identifier.len() > 20
+        || identifier.starts_with('0')
+        || !identifier.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(format!(
+            "{field} must be a canonical positive decimal identifier or {url_prefix}<id>"
+        ));
     }
+    Ok(Some(identifier.to_owned()))
 }
 
 fn requested_worktree_id(params: &A2aDispatchParams) -> Result<String, String> {

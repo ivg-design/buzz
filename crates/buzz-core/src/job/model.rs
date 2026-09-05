@@ -32,7 +32,7 @@ pub struct JobRepository {
     pub branch: String,
     /// Opaque portable worktree identifier (never a host path).
     pub worktree_id: String,
-    /// Repository-relative paths in scope.
+    /// Repository-relative ownership coordinates; empty for an information-only request.
     pub paths: Vec<String>,
     /// Inert `contract:<portable-id>` coordinates resolved by trusted local policy.
     pub contracts: Vec<String>,

@@ -61,13 +61,15 @@ const NEMO_AGENT_SKILL_MD: &str = concat!(
 );
 
 /// Template content version for AGENTS.md static content (above managed markers).
-/// Bump this when changing `nest_agents.md` to trigger refresh on existing installs.
+/// Bump this when changing `nest_agents.md` or the shared Nemo instructions to
+/// trigger refresh on existing installs.
 /// Version 1 is implicitly "before this mechanism existed" (no version file).
-const NEST_AGENTS_VERSION: u32 = 7;
+const NEST_AGENTS_VERSION: u32 = 8;
 
 /// Template content version for SKILL.md.
-/// Bump this when changing `nest_skill.md` to trigger refresh on existing installs.
-const NEST_SKILL_VERSION: u32 = 7;
+/// Bump this when changing `nest_skill.md` or the shared Nemo instructions to
+/// trigger refresh on existing installs.
+const NEST_SKILL_VERSION: u32 = 8;
 
 const BEGIN_MARKER: &str = "<!-- BEGIN BUZZ MANAGED";
 const END_MARKER: &str = "<!-- END BUZZ MANAGED -->";

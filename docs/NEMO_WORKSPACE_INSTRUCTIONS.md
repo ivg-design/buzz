@@ -70,15 +70,17 @@ research, debugging, tests, builds, or sustained agent work.
 
 Use A2A when another agent can independently advance the current task. Small, sequential
 jobs should stay local. Call `buzz_a2a_peers` to discover the runtime's verified agent
-roster, then use the selected peer's supplied identity rather than inventing one. Give it a concrete outcome, relevant
-repository paths, and checkable acceptance criteria. The workspace provides Nemo access;
+roster, then use the selected peer's supplied identity rather than inventing one. Give it a concrete outcome and
+checkable acceptance criteria. Supply repository paths when the task has file effects; use an empty
+path list for an information-only consultation. Paths coordinate ownership and do not make the
+consultation technically read-only. The workspace provides Nemo access;
 users do not maintain per-peer grants or refresh a hash after every source commit.
 
 | Intent | Tool | How to use it |
 | --- | --- | --- |
 | Reply in the current conversation | `buzz_chat_send` | Send the answer once to the current conversation. A direct message needs no `@` prefix. |
 | Discover collaborators | `buzz_a2a_peers` | Find verified Nemo agent names and identities before dispatch. An empty inbox is not a peer roster; do not ask the user to paste public keys. |
-| Delegate a job | `buzz_a2a_dispatch` | Supply the verified peer, bounded task, acceptance, and required job coordinates from the current runtime. Use a fresh operation ID and a stable retry key. |
+| Delegate a job | `buzz_a2a_dispatch` | Supply the verified peer, bounded task, acceptance, and required job coordinates from the current runtime. Use `paths: []` for an information-only consultation. GitHub issue, PR, and run references accept a positive number or canonical same-repository URL. Use a fresh operation ID and a stable retry key. |
 | Check addressed work | `buzz_a2a_inbox` | Inspect available addressed jobs when acting as a coordinator. Do not duplicate an already-owned task. |
 | Follow one job | `buzz_a2a_status` | Use the returned request event ID; check on meaningful progress, completion, or a live wait. |
 | Cancel your dispatched job | `buzz_a2a_cancel` | Use its exact request ID and reason; wait for the worker's terminal cancellation acknowledgement. |

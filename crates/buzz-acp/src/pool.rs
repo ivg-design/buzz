@@ -32,8 +32,8 @@ use uuid::Uuid;
 
 use crate::acp::{
     extract_model_config_options, extract_model_state, extract_thought_level_config_id,
-    model_in_catalog, resolve_model_switch_method, AcpClient, AcpError, EnvVar, JobSessionPolicy,
-    McpServer, ModelSwitchMethod, StopReason, SystemPromptTransport,
+    model_in_catalog, resolve_model_switch_method, AcpClient, AcpError, EnvVar, McpServer,
+    ModelSwitchMethod, StopReason, SystemPromptTransport,
 };
 use crate::config::{compose_scoped_session_title, DedupMode, PermissionMode};
 use crate::observer;
@@ -1597,21 +1597,11 @@ async fn resolve_provider_session_at(
             channel.scope.and_then(SessionScope::root_event_id),
         )
     });
-    let job_policy = channel
-        .scope
-        .filter(|scope| scope.is_job())
-        .map(JobSessionPolicy::for_scope)
-        .transpose()?;
-    if job_policy.is_some() && !agent.acp.job_policy_supported() {
-        return Err(AcpError::Protocol(format!(
-            "agent '{}' is chat-only: no checksum-qualified native-tool-off JobPolicyV1 executor is available",
-            agent.agent_name
-        )));
-    }
-    // A Job receives no ambient or generic stdio MCP. Its one allowed server
-    // is appended below only after the signer-bound scope starts a fresh,
-    // ephemeral trusted HTTP capability.
-    let mut mcp_servers = mcp_servers_for_scope(
+    // Job coordination adds a signer-bound trusted MCP to the same configured
+    // MCP inventory available to an ordinary provider session. Repository and
+    // side-effect authorization comes from the admitted request and the
+    // provider's normal host identity; the trusted MCP owns Buzz lifecycle.
+    let mut mcp_servers = mcp_servers_with_git_origin(
         &ctx.mcp_servers,
         channel.scope,
         channel.channel_type,
@@ -1725,17 +1715,6 @@ async fn resolve_provider_session_at(
             }
             Err(error) => return Err(error),
         }
-    } else if let Some(policy) = job_policy.as_ref() {
-        agent
-            .acp
-            .session_new_job_full(
-                working_directory,
-                mcp_servers,
-                system_prompt,
-                session_title.as_deref(),
-                policy,
-            )
-            .await?
     } else {
         agent
             .acp
@@ -1902,17 +1881,13 @@ async fn resolve_provider_session_at(
 
     // Resolve the saved autonomy preference to an adapter-native ACP mode.
     // Claude calls unrestricted execution `bypassPermissions`; Codex calls
-    // the equivalent mode `agent-full-access`. Immutable JobPolicyV1 sessions
-    // already enforce native-tools-off, one explicit trusted MCP, and denied
-    // permission requests. Mutating their provider mode afterward would
-    // conflict with that acknowledged policy (and Claude deliberately rejects
-    // bypassPermissions because dangerous permission skipping is disabled).
+    // the equivalent mode `agent-full-access`. Jobs use this same provider
+    // configuration path so their native host tools match ordinary sessions.
     let applied_permission_mode = apply_configured_permission_mode(
         &mut agent.acp,
         &resp.session_id,
         &ctx.permission_mode,
         &resp.raw,
-        job_policy.as_ref(),
     )
     .await?;
 
@@ -2052,19 +2027,6 @@ fn mcp_servers_with_git_origin(
     servers
 }
 
-fn mcp_servers_for_scope(
-    servers: &[McpServer],
-    scope: Option<&SessionScope>,
-    channel_type: Option<&str>,
-    agent_name: Option<&str>,
-) -> Vec<McpServer> {
-    if scope.is_some_and(SessionScope::is_job) {
-        Vec::new()
-    } else {
-        mcp_servers_with_git_origin(servers, scope, channel_type, agent_name)
-    }
-}
-
 fn resolve_permission_mode(
     permission_mode: &PermissionMode,
     session_new: &serde_json::Value,
@@ -2096,11 +2058,7 @@ async fn apply_configured_permission_mode(
     session_id: &str,
     permission_mode: &PermissionMode,
     session_new: &serde_json::Value,
-    job_policy: Option<&JobSessionPolicy>,
 ) -> Result<Option<(&'static str, PermissionModeApplication)>, AcpError> {
-    if job_policy.is_some() {
-        return Ok(None);
-    }
     match resolve_permission_mode(permission_mode, session_new)? {
         Some(wire) => Ok(Some((
             wire,
@@ -6372,7 +6330,6 @@ while IFS= read -r _line; do :; done"#
             "sess-1",
             &PermissionMode::BypassPermissions,
             &session_new,
-            None,
         )
         .await
         .expect("matching effective mode must be accepted")
@@ -6392,8 +6349,8 @@ while IFS= read -r _line; do :; done"#
     }
 
     #[tokio::test]
-    async fn immutable_job_policy_skips_configured_permission_mode_rpc() {
-        let reply = r#""error":{"code":-32603,"message":"Internal error"}"#;
+    async fn full_host_job_applies_claude_bypass_permission_mode_rpc() {
+        let reply = r#""result":{"configOptions":[{"id":"mode","category":"mode","currentValue":"bypassPermissions"}]}"#;
         let mut acp = spawn_permission_mode_acp(reply).await;
         let observer = observer::ObserverHandle::in_process();
         acp.set_observer(Some(observer.clone()), 0);
@@ -6403,26 +6360,27 @@ while IFS= read -r _line; do :; done"#
                 "currentModeId": "default"
             }
         });
-        let job_policy = JobSessionPolicy::new("a".repeat(64)).unwrap();
-
-        let applied = apply_configured_permission_mode(
+        let (wire, applied) = apply_configured_permission_mode(
             &mut acp,
             "job-session",
             &PermissionMode::BypassPermissions,
             &session_new,
-            Some(&job_policy),
         )
         .await
-        .expect("the acknowledged immutable policy owns job permissions");
+        .expect("full-host job mode must be accepted")
+        .expect("full-host job must apply its configured provider mode");
 
-        assert!(applied.is_none());
-        assert!(
-            !observer
-                .snapshot()
-                .iter()
-                .any(|event| event.kind == "acp_write"),
-            "a JobPolicyV1 session must not receive a post-creation mode mutation"
-        );
+        assert_eq!(wire, "bypassPermissions");
+        assert!(applied.independently_verified);
+        let request = observer
+            .snapshot()
+            .into_iter()
+            .find(|event| {
+                event.kind == "acp_write" && event.payload["method"] == "session/set_config_option"
+            })
+            .expect("job mode request was sent");
+        assert_eq!(request.payload["params"]["configId"], "mode");
+        assert_eq!(request.payload["params"]["value"], "bypassPermissions");
         acp.shutdown().await;
     }
 
@@ -6504,18 +6462,19 @@ while IFS= read -r _line; do :; done"#
     }
 
     #[test]
-    fn job_scope_is_not_exposed_to_generic_stdio_mcp() {
+    fn job_scope_inherits_configured_stdio_mcp_with_channel_origin() {
         let scope = SessionScope::Job {
             channel_id: Uuid::new_v4(),
             operation_id: Uuid::new_v4().to_string(),
             request_event_id: "a".repeat(64),
         };
         let servers =
-            mcp_servers_for_scope(&[test_mcp_server()], Some(&scope), Some("stream"), None);
-        assert!(
-            servers.is_empty(),
-            "a Job must not inherit generic stdio or ambient MCP servers"
-        );
+            mcp_servers_with_git_origin(&[test_mcp_server()], Some(&scope), Some("stream"), None);
+        assert_eq!(servers.len(), 1);
+        assert!(servers[0].stdio_env().iter().any(|entry| {
+            entry.name == "BUZZ_GIT_ORIGIN_CHANNEL_ID"
+                && entry.value == scope.channel_id().to_string()
+        }));
     }
 
     // These pin the initial_message dispatch path (run_prompt_task, ~line 855):
@@ -11701,41 +11660,6 @@ done"#;
         assert!(startup.contains("buzz_a2a_handoff"));
         assert!(startup.contains("END-NEMO-SKILL"));
         relay_server.abort();
-    }
-
-    #[tokio::test]
-    async fn job_session_never_reaches_unqualified_provider() {
-        let (acp, capture) = scripted_agent(Some(true)).await;
-        let mut agent = owned(acp);
-        let ctx = tests::make_prompt_context_no_owner();
-        let scope = SessionScope::Job {
-            channel_id: Uuid::new_v4(),
-            operation_id: Uuid::new_v4().to_string(),
-            request_event_id: "a".repeat(64),
-        };
-        let verified = "/tmp/buzz-receiver-verified-checkout";
-        let error = create_session_and_apply_model_at(
-            &mut agent,
-            &ctx,
-            verified,
-            None,
-            None,
-            NewSessionChannelContext {
-                huddle_instructions: None,
-                canvas: None,
-                name: None,
-                scope: Some(&scope),
-                channel_type: Some("stream"),
-            },
-        )
-        .await
-        .expect_err("unqualified provider must remain chat-only");
-        assert!(error.to_string().contains("chat-only"));
-        assert!(
-            !capture.exists(),
-            "an unqualified provider must receive neither session/new nor session/prompt"
-        );
-        agent.acp.shutdown().await;
     }
 
     #[tokio::test]

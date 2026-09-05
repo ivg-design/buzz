@@ -1136,11 +1136,18 @@ async fn stored_cancel_revokes_active_lease_before_lifecycle_advance() {
         .terminal
         .publish(&cancel.emitter)
         .await
-        .expect("worker cancellation acknowledgement");
-    let terminal = admitted.published.recv().await.expect("Cancelled terminal");
+        .expect("worker cancellation reconciliation terminal");
+    let terminal = admitted
+        .published
+        .recv()
+        .await
+        .expect("indeterminate terminal");
     assert!(matches!(
         JobEvent::parse(&terminal).expect("valid terminal"),
-        JobEvent::Control(control) if control.action == JobControlAction::Cancelled
+        JobEvent::Error(error)
+            if error.outcome == buzz_core::job::JobErrorOutcome::Indeterminate
+                && error.code == "cancelled_full_host_turn"
+                && !error.retryable
     ));
     assert!(gate
         .begin(
@@ -1212,7 +1219,7 @@ async fn stored_cancel_after_applied_git_receipt_is_indeterminate() {
     assert!(matches!(
         cancel.terminal.clone().resolve(),
         CancellationTerminal::Indeterminate { code, .. }
-            if code == "cancel_after_applied_git_operation"
+            if code == "cancelled_full_host_turn"
     ));
     cancel
         .terminal
@@ -1224,7 +1231,7 @@ async fn stored_cancel_after_applied_git_receipt_is_indeterminate() {
         JobEvent::parse(&terminal).expect("valid terminal"),
         JobEvent::Error(error)
             if error.outcome == buzz_core::job::JobErrorOutcome::Indeterminate
-                && error.code == "cancel_after_applied_git_operation"
+                && error.code == "cancelled_full_host_turn"
                 && !error.retryable
     ));
 }
@@ -1278,7 +1285,7 @@ async fn missing_git_receipt_makes_stored_cancel_indeterminate() {
     assert!(matches!(
         cancel.terminal.resolve(),
         CancellationTerminal::Indeterminate { ref code, .. }
-            if code == "cancel_during_ambiguous_git_operation"
+            if code == "cancelled_full_host_turn"
     ));
 }
 

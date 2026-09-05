@@ -11,7 +11,6 @@
 use std::collections::HashMap;
 
 use futures_util::StreamExt;
-use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
@@ -60,83 +59,6 @@ pub struct McpServerHttp {
 pub struct HttpHeader {
     pub name: String,
     pub value: String,
-}
-
-/// Immutable harness policy for one admitted agent-job session.
-///
-/// The digest commits to the signed request event and fixed execution policy.
-/// Adapters must advertise support and echo the exact digest before Buzz sends
-/// any job prompt.
-#[derive(Clone)]
-pub(crate) struct JobSessionPolicy {
-    digest: String,
-}
-
-impl JobSessionPolicy {
-    pub(crate) fn new(digest: String) -> Result<Self, AcpError> {
-        if digest.len() != 64
-            || !digest
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
-            return Err(AcpError::Protocol(
-                "job session policy digest must be lowercase SHA-256".into(),
-            ));
-        }
-        Ok(Self { digest })
-    }
-
-    /// Bind the immutable execution policy to the signed request event that
-    /// produced this admitted Job scope. The request event id commits to the
-    /// signed grant body; the remaining scope fields prevent cross-channel or
-    /// cross-operation replay of an otherwise valid acknowledgement.
-    pub(crate) fn for_scope(scope: &crate::scope::SessionScope) -> Result<Self, AcpError> {
-        let crate::scope::SessionScope::Job {
-            channel_id,
-            operation_id,
-            request_event_id,
-        } = scope
-        else {
-            return Err(AcpError::Protocol(
-                "job session policy requires an admitted Job scope".into(),
-            ));
-        };
-
-        let mut digest = Sha256::new();
-        digest.update(b"buzz-job-session-policy-v1\0");
-        digest.update(channel_id.as_bytes());
-        update_digest_field(&mut digest, operation_id.as_bytes());
-        update_digest_field(&mut digest, request_event_id.as_bytes());
-        digest.update(b"native-tools=disabled\0");
-        digest.update(b"ambient-mcp=disabled\0");
-        digest.update(b"permission-requests=deny\0");
-        digest.update(b"mcp=buzz-trusted-session\0");
-        Self::new(hex::encode(digest.finalize()))
-    }
-
-    fn wire(&self) -> serde_json::Value {
-        serde_json::json!({
-            "version": 1,
-            "digest": self.digest,
-            "nativeTools": "disabled",
-            "ambientMcp": "disabled",
-            "permissionRequests": "deny",
-        })
-    }
-
-    fn acknowledged_by(&self, result: &serde_json::Value) -> bool {
-        let Some(ack) = result.pointer("/_meta/buzz/jobPolicy") else {
-            return false;
-        };
-        ack.get("version").and_then(serde_json::Value::as_u64) == Some(1)
-            && ack.get("applied").and_then(serde_json::Value::as_bool) == Some(true)
-            && ack.get("digest").and_then(serde_json::Value::as_str) == Some(self.digest.as_str())
-    }
-}
-
-fn update_digest_field(digest: &mut Sha256, value: &[u8]) {
-    digest.update((value.len() as u64).to_be_bytes());
-    digest.update(value);
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -344,65 +266,6 @@ fn build_initialize_params() -> serde_json::Value {
     })
 }
 
-fn advertises_job_policy(result: &serde_json::Value) -> bool {
-    let Some(policy) = result.pointer("/_meta/buzz/jobPolicy") else {
-        return false;
-    };
-    policy.get("version").and_then(serde_json::Value::as_u64) == Some(1)
-        && policy
-            .get("nativeTools")
-            .and_then(serde_json::Value::as_str)
-            == Some("disabled")
-        && policy.get("mcp").and_then(serde_json::Value::as_str) == Some("explicitOnly")
-        && policy
-            .get("permissionRequests")
-            .and_then(serde_json::Value::as_str)
-            == Some("deny")
-        && policy
-            .get("methods")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|methods| methods.iter().any(|method| method == "session/new"))
-}
-
-fn exact_trusted_job_mcp(servers: &[McpServer]) -> bool {
-    let [McpServer::Http(server)] = servers else {
-        return false;
-    };
-    if server.server_type != "http" || server.name != crate::trusted_mcp::SERVER_NAME {
-        return false;
-    }
-    let Ok(url) = url::Url::parse(&server.url) else {
-        return false;
-    };
-    let loopback = match url.host() {
-        Some(url::Host::Ipv4(address)) => address.is_loopback(),
-        Some(url::Host::Ipv6(address)) => address.is_loopback(),
-        _ => false,
-    };
-    if url.scheme() != "http"
-        || !loopback
-        || url.port().is_none()
-        || url.path() != "/mcp"
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        return false;
-    }
-    let [header] = server.headers.as_slice() else {
-        return false;
-    };
-    let Some(token) = header.value.strip_prefix("Bearer ") else {
-        return false;
-    };
-    header.name == "Authorization"
-        && token.len() == 64
-        && token
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
 /// ACP client that owns an agent subprocess and communicates over its stdio.
 ///
 /// One `AcpClient` per agent process. Multiple sessions can be created on the
@@ -479,15 +342,6 @@ pub struct AcpClient {
     /// Whether the adapter explicitly advertises the ACP v1 append-only system
     /// prompt extension targeting Codex `developerInstructions` on session/new.
     developer_instructions_append_supported: bool,
-    /// True only for the recognized Claude adapter when it advertises the
-    /// exact immutable Buzz job-policy extension. Codex and unknown adapters
-    /// remain chat-only because they cannot disable ambient native reads.
-    job_policy_supported: bool,
-    /// Harness-owned qualification for an immutable, checksum-pinned adapter.
-    /// No production spawn path enables this yet: Desktop must first bundle and
-    /// verify the patched Claude adapter. Adapter self-reporting alone is never
-    /// an authority signal.
-    job_policy_adapter_qualified: bool,
     /// Permission behavior is bound to the harness-created session ID. Unknown
     /// IDs deny by default; an active Job turn also denies regardless of what
     /// session ID an adapter places in its callback.
@@ -517,7 +371,6 @@ pub struct AcpClient {
 }
 
 const MAX_CAPTURED_TURN_TEXT_BYTES: usize = 128 * 1024;
-const CLAUDE_JOB_POLICY_ADAPTER_NAME: &str = "@agentclientprotocol/claude-agent-acp";
 const HARNESS_ONLY_ENV: &[&str] = &[
     "BUZZ_PRIVATE_KEY",
     "BUZZ_ACP_PRIVATE_KEY",
@@ -557,7 +410,6 @@ pub(crate) fn is_harness_only_env(name: &str) -> bool {
     if HARNESS_ONLY_ENV.contains(&name.as_str())
         || name.starts_with("BUZZ_MCP_")
         || name.starts_with("BUZZ_ACP_JOB_")
-        || name.starts_with("GIT_CONFIG_")
     {
         return true;
     }
@@ -612,20 +464,18 @@ fn deep_merge(
 ///
 /// # Merge contract (when `has_generated_codex_config` is true)
 ///
-/// 1. **Persona base** — the first `CODEX_CONFIG` value in `extra_env` is taken as
-///    the base object (all keys preserved, recursively).  When there is no persona entry,
-///    the generated entry serves as the base.
-/// 2. **Generated overlay** — all subsequent `CODEX_CONFIG` entries are deep-merged into
-///    the base so unrelated nested persona keys survive.
-/// 3. **Parent-env precedence** — if `parent_codex_config` is `Some`, its keys are
-///    deep-merged into the result (parent wins on colliding keys at every nesting level;
-///    unrelated keys from either side survive).
+/// 1. **Host base** — `parent_codex_config`, when present, supplies inherited defaults.
+/// 2. **Explicit agent overlay** — ordered `CODEX_CONFIG` entries from `extra_env` are
+///    deep-merged over the host base, so a per-agent setting wins on collisions while
+///    unrelated host and agent keys survive.
+/// 3. **Generated overlay** — Buzz's generated entry follows the persona entry and
+///    supplies runtime requirements without erasing unrelated nested keys.
 /// 4. **Forced overlay** — `sandbox_workspace_write.network_access = true` is applied
-///    last so relay access is guaranteed regardless of operator / persona config.
+///    last so relay access is guaranteed regardless of host or agent config.
 ///
 /// When `has_generated_codex_config` is false, the function returns `None` and the
-/// caller handles any persona-supplied `CODEX_CONFIG` with ordinary operator-wins
-/// semantics (no merging, no sandbox widening).
+/// caller handles any persona-supplied `CODEX_CONFIG` with explicit-agent precedence
+/// (no merging, no sandbox widening).
 ///
 /// # Errors
 ///
@@ -638,7 +488,7 @@ pub(crate) fn build_codex_config_env(
     has_generated_codex_config: bool,
 ) -> Result<Option<String>, AcpError> {
     // Without an explicit Buzz-generated overlay signal, skip the merge entirely.
-    // Any persona CODEX_CONFIG is handled by the caller with operator-wins semantics.
+    // Any persona CODEX_CONFIG is handled by the caller with explicit-agent precedence.
     if !has_generated_codex_config {
         return Ok(None);
     }
@@ -677,18 +527,11 @@ pub(crate) fn build_codex_config_env(
         }
     }
 
-    // Start from first entry, deep-merge remaining entries.
-    let mut base = parsed_entries.remove(0);
-    for overlay in parsed_entries {
-        deep_merge(&mut base, overlay);
-    }
-
-    // Deep-merge parent env (parent wins on colliding keys at every nesting level).
-    if let Some(parent_raw) = parent_codex_config {
+    // Start from inherited host defaults, then apply explicit per-agent entries
+    // in their declared order so they win every collision.
+    let mut base = if let Some(parent_raw) = parent_codex_config {
         match serde_json::from_str::<serde_json::Value>(parent_raw) {
-            Ok(serde_json::Value::Object(parent_obj)) => {
-                deep_merge(&mut base, parent_obj);
-            }
+            Ok(serde_json::Value::Object(parent_obj)) => parent_obj,
             Ok(_) => {
                 return Err(AcpError::Protocol(
                     "CODEX_CONFIG in parent environment is valid JSON but not an object".into(),
@@ -700,6 +543,11 @@ pub(crate) fn build_codex_config_env(
                 )));
             }
         }
+    } else {
+        serde_json::Map::new()
+    };
+    for overlay in parsed_entries {
+        deep_merge(&mut base, overlay);
     }
 
     // Force sandbox_workspace_write.network_access = true (our invariant, always wins).
@@ -866,23 +714,16 @@ impl AcpClient {
                 cmd.env_remove(name);
             }
         }
-        if checksum_qualified_claude {
-            // These variables can inject code or alter module resolution before
-            // the reviewed adapter starts. A qualified Job executor must use
-            // only the dependency closure whose bytes were hashed above.
-            cmd.env_remove("NODE_OPTIONS");
-            cmd.env_remove("NODE_PATH");
-        }
-
-        // Per-persona env vars (e.g., GOOSE_PROVIDER, BUZZ_AGENT_PROVIDER).
-        // For most keys, operator precedence wins: skip injection if already set
-        // in the parent environment.
+        // Per-agent env vars (e.g., provider routing and effort controls) are
+        // explicit session configuration and therefore override inherited host
+        // defaults. Unconfigured host credentials and tool environment remain
+        // inherited normally.
         //
         // CODEX_CONFIG is handled specially via build_codex_config_env:
         //   • has_generated_codex_config=true: merge all CODEX_CONFIG entries + parent
         //     recursively and force network_access=true.
         //   • has_generated_codex_config=false: return None; any persona-supplied
-        //     CODEX_CONFIG falls through to the normal operator-wins loop below.
+        //     CODEX_CONFIG falls through to the explicit per-agent override below.
         let has_codex_config = extra_env.iter().any(|(k, _)| k == "CODEX_CONFIG");
         let parent_codex_config = if has_generated_codex_config && has_codex_config {
             std::env::var("CODEX_CONFIG").ok()
@@ -895,13 +736,12 @@ impl AcpClient {
             has_generated_codex_config,
         )?;
         // When the merge path was not taken (None returned), any persona CODEX_CONFIG
-        // entry falls through to the standard operator-wins treatment below.
+        // entry falls through to the standard per-agent override below.
         let codex_merge_active = codex_config_value.is_some();
 
         // Per-runtime environment defaults (e.g. Hermes MCP-startup isolation).
-        // Applied first so both persona `extra_env` (below, via `Command::env`
-        // key replacement) and inherited parent env (via the parent-presence
-        // check) override them.
+        // The host remains authoritative over a runtime default; explicit
+        // per-agent `extra_env` below can replace either one.
         for &(key, value) in crate::config::default_agent_env(command) {
             if std::env::var_os(key).is_none() {
                 cmd.env(key, value);
@@ -917,9 +757,7 @@ impl AcpClient {
                 // Handled by build_codex_config_env; skip here to avoid double-setting.
                 continue;
             }
-            if std::env::var_os(key).is_none() {
-                cmd.env(key, value);
-            }
+            cmd.env(key, value);
         }
         if let Some(merged) = codex_config_value {
             cmd.env("CODEX_CONFIG", merged);
@@ -974,8 +812,6 @@ impl AcpClient {
             http_mcp_supported: false,
             session_resume_supported: false,
             developer_instructions_append_supported: false,
-            job_policy_supported: false,
-            job_policy_adapter_qualified: checksum_qualified_claude,
             session_permission_policies: HashMap::new(),
             active_prompt_session_id: None,
             prompt_attempted_turn_id: None,
@@ -1055,24 +891,8 @@ impl AcpClient {
             .is_some_and(serde_json::Value::is_object);
         self.developer_instructions_append_supported =
             supports_developer_instructions_append(&result);
-        self.job_policy_supported = self.job_policy_adapter_qualified
-            && self.standard_adapter == Some(StandardAdapterKind::Claude)
-            && result
-                .pointer("/agentInfo/name")
-                .and_then(serde_json::Value::as_str)
-                == Some(CLAUDE_JOB_POLICY_ADAPTER_NAME)
-            && advertises_job_policy(&result);
         tracing::debug!(target: "acp::init", "initialize response: {result}");
         Ok(result)
-    }
-
-    /// Qualify a fake adapter for protocol-level tests. Production callers
-    /// cannot enable this; Desktop's checksum-pinned resolver will provide the
-    /// first real qualification path in a separate reviewed change.
-    #[cfg(test)]
-    pub(crate) fn qualify_claude_job_policy_adapter_for_test(&mut self) {
-        self.job_policy_adapter_qualified = true;
-        self.standard_adapter = Some(StandardAdapterKind::Claude);
     }
 
     /// Send the ACP `authenticate` request for an adapter-advertised method.
@@ -1109,7 +929,7 @@ impl AcpClient {
         system_prompt: Option<SystemPromptTransport<'_>>,
         session_title: Option<&str>,
     ) -> Result<SessionNewResponse, AcpError> {
-        self.session_new_full_with_policy(cwd, mcp_servers, system_prompt, session_title, None)
+        self.session_new_full_inner(cwd, mcp_servers, system_prompt, session_title)
             .await
     }
 
@@ -1159,50 +979,12 @@ impl AcpClient {
         })
     }
 
-    /// Create an immutable job session. The adapter must have advertised the
-    /// exact JobPolicyV1 extension, must acknowledge this policy digest, and
-    /// receives only the one ephemeral trusted HTTP MCP.
-    pub(crate) async fn session_new_job_full(
+    async fn session_new_full_inner(
         &mut self,
         cwd: &str,
         mcp_servers: Vec<McpServer>,
         system_prompt: Option<SystemPromptTransport<'_>>,
         session_title: Option<&str>,
-        policy: &JobSessionPolicy,
-    ) -> Result<SessionNewResponse, AcpError> {
-        if !self.job_policy_supported {
-            let message = match self.standard_adapter {
-                Some(StandardAdapterKind::Codex) => {
-                    "Codex A2A execution is disabled: its adapter cannot enforce signed-path native-tool isolation"
-                }
-                _ => {
-                    "A2A execution is disabled for this adapter: immutable native-tool-off JobPolicyV1 was not advertised"
-                }
-            };
-            return Err(AcpError::Protocol(message.into()));
-        }
-        if !exact_trusted_job_mcp(&mcp_servers) {
-            return Err(AcpError::Protocol(
-                "job sessions require exactly one loopback buzz-trusted-session HTTP MCP".into(),
-            ));
-        }
-        self.session_new_full_with_policy(
-            cwd,
-            mcp_servers,
-            system_prompt,
-            session_title,
-            Some(policy),
-        )
-        .await
-    }
-
-    async fn session_new_full_with_policy(
-        &mut self,
-        cwd: &str,
-        mcp_servers: Vec<McpServer>,
-        system_prompt: Option<SystemPromptTransport<'_>>,
-        session_title: Option<&str>,
-        job_policy: Option<&JobSessionPolicy>,
     ) -> Result<SessionNewResponse, AcpError> {
         let mut params = serde_json::json!({
             "cwd": cwd,
@@ -1222,50 +1004,13 @@ impl AcpClient {
             // Merge — _meta may already carry systemPrompt from MetaAppend above.
             params["_meta"]["sessionTitle"] = serde_json::Value::String(title.to_owned());
         }
-        if let Some(policy) = job_policy {
-            params["_meta"]["buzz"]["jobPolicy"] = policy.wire();
-            // These fields are hard overrides for the recognized Claude ACP
-            // adapter. The adapter's attestation is still required because a
-            // client-supplied `_meta` object is not itself an enforcement
-            // boundary.
-            params["_meta"]["claudeCode"]["options"] = serde_json::json!({
-                "tools": [],
-                "disallowedTools": [
-                    "Bash", "Read", "Edit", "Write", "Glob", "Grep",
-                    "WebFetch", "WebSearch", "Task", "Agent", "Skill",
-                    "NotebookEdit", "TodoWrite", "AskUserQuestion",
-                    "EnterPlanMode", "ExitPlanMode", "KillShell", "TaskOutput"
-                ],
-                "settingSources": [],
-                "strictMcpConfig": true,
-                "permissionMode": "dontAsk",
-                "allowDangerouslySkipPermissions": false,
-                "agents": {},
-                "plugins": [],
-                "skills": [],
-                "hooks": {}
-            });
-        }
         let result = self.send_request("session/new", params).await?;
-        if let Some(policy) = job_policy {
-            if !policy.acknowledged_by(&result) {
-                return Err(AcpError::Protocol(
-                    "adapter did not acknowledge the exact immutable job policy digest".into(),
-                ));
-            }
-        }
         let session_id = result["sessionId"]
             .as_str()
             .ok_or_else(|| AcpError::Protocol("session/new response missing sessionId".into()))?
             .to_owned();
-        self.session_permission_policies.insert(
-            session_id.clone(),
-            if job_policy.is_some() {
-                SessionPermissionPolicy::Deny
-            } else {
-                SessionPermissionPolicy::Interactive
-            },
-        );
+        self.session_permission_policies
+            .insert(session_id.clone(), SessionPermissionPolicy::Interactive);
         tracing::info!(target: "acp::session", "session created: {session_id}");
         Ok(SessionNewResponse {
             session_id,
@@ -1503,12 +1248,6 @@ impl AcpClient {
     /// resume during initialization.
     pub fn session_resume_supported(&self) -> bool {
         self.session_resume_supported
-    }
-
-    /// Whether this exact initialized adapter positively advertises the
-    /// native-tool-off JobPolicyV1 contract. This never returns true for Codex.
-    pub(crate) fn job_policy_supported(&self) -> bool {
-        self.job_policy_supported
     }
 
     /// Consume per-turn usage for NIP-AM publishing. Goose/buzz-agent is an
@@ -2640,7 +2379,7 @@ impl AcpClient {
                 );
             tracing::warn!(
                 target: "acp::permission",
-                "denying permission id={id} under job-or-unknown session policy"
+                "denying permission id={id} under denied-or-unknown session policy"
             );
             self.write_ndjson(&response).await?;
             self.permission_responded = true;
@@ -3301,7 +3040,6 @@ mod tests {
                 "BUZZ_MCP_SESSION_CHANNEL_ID",
                 "BUZZ_ACP_JOB_FUTURE_SECRET",
                 "NOSTR_AUTHORIZATION_LEGACY",
-                "GIT_CONFIG_VALUE_0",
             ])
             .collect::<Vec<_>>();
         let inherited_probe_names = [
@@ -3309,7 +3047,6 @@ mod tests {
             "BUZZ_MCP_SESSION_CHANNEL_ID",
             "BUZZ_ACP_JOB_FUTURE_SECRET",
             "NOSTR_AUTHORIZATION_LEGACY",
-            "GIT_CONFIG_VALUE_0",
         ];
         let prior_values = inherited_probe_names
             .iter()
@@ -3362,6 +3099,43 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn explicit_agent_env_overrides_inherited_host_default() {
+        const NAME: &str = "BUZZ_ACP_TEST_AGENT_EFFORT_OVERRIDE";
+        let prior = std::env::var_os(NAME);
+        std::env::set_var(NAME, "host-default");
+        #[cfg(unix)]
+        let (command, args) = (
+            "/bin/sh",
+            vec!["-c".into(), format!("test \"${{{NAME}}}\" = agent-setting")],
+        );
+        #[cfg(windows)]
+        let (command, args) = (
+            "cmd",
+            vec![
+                "/C".into(),
+                format!("if not \"%{NAME}%\"==\"agent-setting\" exit /b 97"),
+            ],
+        );
+        let mut client = AcpClient::spawn(
+            command,
+            &args,
+            &[(NAME.into(), "agent-setting".into())],
+            false,
+        )
+        .await
+        .expect("spawn agent environment precedence probe");
+        match prior {
+            Some(value) => std::env::set_var(NAME, value),
+            None => std::env::remove_var(NAME),
+        }
+        let status = client.child.wait().await.expect("wait for probe");
+        assert!(
+            status.success(),
+            "agent setting did not override host default"
+        );
+    }
+
     #[test]
     fn harness_only_env_classifier_covers_current_and_future_secret_aliases() {
         for name in HARNESS_ONLY_ENV {
@@ -3372,12 +3146,27 @@ mod tests {
             "BUZZ_ACP_JOB_FUTURE_SECRET",
             "BUZZ_FUTURE_PRIVATE_KEY_FILE",
             "NOSTR_LEGACY_AUTHZ",
-            "GIT_CONFIG_VALUE_99",
         ] {
             assert!(is_harness_only_env(name), "missing secret family {name}");
         }
         assert!(!is_harness_only_env("BUZZ_AGENT_PROVIDER"));
         assert!(!is_harness_only_env("CODEX_CONFIG"));
+        for host_env in [
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "SSH_AUTH_SOCK",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_KEY_0",
+            "GIT_CONFIG_VALUE_0",
+            "NODE_OPTIONS",
+            "NODE_PATH",
+            "CLAUDE_CODE_EFFORT_LEVEL",
+        ] {
+            assert!(
+                !is_harness_only_env(host_env),
+                "ordinary host environment must reach full-host providers: {host_env}"
+            );
+        }
     }
 
     #[test]
@@ -3899,253 +3688,8 @@ mod tests {
         assert!(client.prompt_not_attempted_for_turn("another-turn"));
     }
 
-    fn job_policy_capability_result() -> serde_json::Value {
-        serde_json::json!({
-            "protocolVersion": 2,
-            "agentCapabilities": {"mcpCapabilities": {"http": true}},
-            "agentInfo": {
-                "name": CLAUDE_JOB_POLICY_ADAPTER_NAME,
-                "version": "test"
-            },
-            "_meta": {"buzz": {"jobPolicy": {
-                "version": 1,
-                "methods": ["session/new"],
-                "nativeTools": "disabled",
-                "mcp": "explicitOnly",
-                "permissionRequests": "deny"
-            }}}
-        })
-    }
-
-    fn trusted_job_server() -> McpServer {
-        McpServer::http(
-            crate::trusted_mcp::SERVER_NAME,
-            "http://127.0.0.1:32123/mcp",
-            vec![HttpHeader {
-                name: "Authorization".into(),
-                value: format!("Bearer {}", "b".repeat(64)),
-            }],
-        )
-    }
-
-    #[test]
-    fn job_policy_digest_is_scope_bound_and_stable() {
-        let channel_id = uuid::Uuid::parse_str("28dc2bc3-30d6-4ab2-b845-c1d9a42ba065").unwrap();
-        let first = crate::scope::SessionScope::Job {
-            channel_id,
-            operation_id: "operation-one".into(),
-            request_event_id: "a".repeat(64),
-        };
-        let same = first.clone();
-        let second = crate::scope::SessionScope::Job {
-            channel_id,
-            operation_id: "operation-two".into(),
-            request_event_id: "a".repeat(64),
-        };
-        let first = JobSessionPolicy::for_scope(&first).unwrap();
-        let same = JobSessionPolicy::for_scope(&same).unwrap();
-        let second = JobSessionPolicy::for_scope(&second).unwrap();
-        assert_eq!(first.digest, same.digest);
-        assert_ne!(first.digest, second.digest);
-    }
-
-    #[test]
-    fn job_mcp_validator_accepts_only_exact_loopback_capability() {
-        assert!(exact_trusted_job_mcp(&[trusted_job_server()]));
-
-        let invalid = [
-            McpServer::stdio("buzz-trusted-session", "server", vec![], vec![]),
-            McpServer::http(
-                "buzz-trusted-session",
-                "https://127.0.0.1:32123/mcp",
-                vec![HttpHeader {
-                    name: "Authorization".into(),
-                    value: format!("Bearer {}", "b".repeat(64)),
-                }],
-            ),
-            McpServer::http(
-                "buzz-trusted-session",
-                "http://example.test:32123/mcp",
-                vec![HttpHeader {
-                    name: "Authorization".into(),
-                    value: format!("Bearer {}", "b".repeat(64)),
-                }],
-            ),
-            McpServer::http(
-                "buzz-trusted-session",
-                "http://127.0.0.1:32123/mcp?escape=1",
-                vec![HttpHeader {
-                    name: "Authorization".into(),
-                    value: format!("Bearer {}", "b".repeat(64)),
-                }],
-            ),
-        ];
-        for server in invalid {
-            assert!(!exact_trusted_job_mcp(&[server]));
-        }
-        assert!(!exact_trusted_job_mcp(&[
-            trusted_job_server(),
-            trusted_job_server()
-        ]));
-    }
-
-    #[cfg(unix)]
     #[tokio::test]
-    async fn qualified_claude_job_session_sends_locked_policy_and_exact_mcp() {
-        let capture =
-            std::env::temp_dir().join(format!("buzz-acp-job-policy-{}.json", uuid::Uuid::new_v4()));
-        let policy = JobSessionPolicy::new("a".repeat(64)).unwrap();
-        let init = job_policy_capability_result();
-        let script = format!(
-            r#"read -r _init
-printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{init}}}'
-read -r session_new
-printf '%s' "$session_new" > {capture:?}
-printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"sessionId":"job-session","_meta":{{"buzz":{{"jobPolicy":{{"version":1,"applied":true,"digest":"{digest}"}}}}}}}}}}'
-sleep 10"#,
-            init = init,
-            capture = capture,
-            digest = policy.digest,
-        );
-        let (mut client, dir) = spawn_named_script("claude-agent-acp", &script).await;
-        client.qualify_claude_job_policy_adapter_for_test();
-        client.initialize().await.unwrap();
-        assert!(client.job_policy_supported());
-        let response = client
-            .session_new_job_full(
-                "/tmp/verified-checkout",
-                vec![trusted_job_server()],
-                Some(SystemPromptTransport::MetaAppend("job instructions")),
-                Some("job"),
-                &policy,
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.session_id, "job-session");
-
-        let wire: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&capture).unwrap()).unwrap();
-        assert_eq!(wire["method"], "session/new");
-        assert_eq!(wire["params"]["mcpServers"].as_array().unwrap().len(), 1);
-        assert_eq!(
-            wire["params"]["mcpServers"][0]["name"],
-            crate::trusted_mcp::SERVER_NAME
-        );
-        assert_eq!(
-            wire["params"]["_meta"]["buzz"]["jobPolicy"]["digest"],
-            policy.digest
-        );
-        let options = &wire["params"]["_meta"]["claudeCode"]["options"];
-        assert_eq!(options["tools"], serde_json::json!([]));
-        assert_eq!(options["settingSources"], serde_json::json!([]));
-        assert_eq!(options["strictMcpConfig"], true);
-        assert_eq!(options["permissionMode"], "dontAsk");
-        assert_eq!(options["allowDangerouslySkipPermissions"], false);
-        for tool in ["Bash", "Read", "Edit", "Write", "WebFetch", "Task", "Agent"] {
-            assert!(options["disallowedTools"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|entry| entry == tool));
-        }
-        client.shutdown().await;
-        let _ = std::fs::remove_file(capture);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn adapter_self_report_without_harness_qualification_cannot_receive_job_session() {
-        let init = job_policy_capability_result();
-        let script = format!(
-            "read -r _init; printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{init}}}'; sleep 10"
-        );
-        let (mut client, dir) = spawn_named_script("claude-agent-acp", &script).await;
-        client.initialize().await.unwrap();
-        assert!(!client.job_policy_supported());
-        let before = client.next_id;
-        let error = client
-            .session_new_job_full(
-                "/tmp/verified-checkout",
-                vec![trusted_job_server()],
-                None,
-                None,
-                &JobSessionPolicy::new("a".repeat(64)).unwrap(),
-            )
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("JobPolicyV1"));
-        assert_eq!(client.next_id, before, "session/new must stay off the wire");
-        client.shutdown().await;
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn codex_cannot_claim_job_policy_support() {
-        let init = job_policy_capability_result();
-        let script = format!(
-            "read -r _init; printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{init}}}'; sleep 10"
-        );
-        let (mut client, dir) = spawn_named_script("codex-acp", &script).await;
-        client.job_policy_adapter_qualified = true;
-        client.initialize().await.unwrap();
-        assert!(!client.job_policy_supported());
-        let before = client.next_id;
-        let error = client
-            .session_new_job_full(
-                "/tmp/verified-checkout",
-                vec![trusted_job_server()],
-                None,
-                None,
-                &JobSessionPolicy::new("a".repeat(64)).unwrap(),
-            )
-            .await
-            .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("Codex A2A execution is disabled"));
-        assert_eq!(client.next_id, before, "session/new must stay off the wire");
-        client.shutdown().await;
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn wrong_job_policy_ack_stops_before_prompt() {
-        let init = job_policy_capability_result();
-        let script = format!(
-            r#"read -r _init
-printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{init}}}'
-read -r _session_new
-printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"sessionId":"job-session","_meta":{{"buzz":{{"jobPolicy":{{"version":1,"applied":true,"digest":"{wrong}"}}}}}}}}}}'
-sleep 10"#,
-            wrong = "f".repeat(64),
-        );
-        let (mut client, dir) = spawn_named_script("claude-agent-acp", &script).await;
-        client.qualify_claude_job_policy_adapter_for_test();
-        client.initialize().await.unwrap();
-        let error = client
-            .session_new_job_full(
-                "/tmp/verified-checkout",
-                vec![trusted_job_server()],
-                None,
-                None,
-                &JobSessionPolicy::new("a".repeat(64)).unwrap(),
-            )
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("did not acknowledge"));
-        assert_eq!(
-            client.next_id, 2,
-            "a rejected session must never advance to session/prompt"
-        );
-        client.shutdown().await;
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[tokio::test]
-    async fn job_permission_denial_cannot_leak_into_or_be_bypassed_by_chat() {
+    async fn denied_session_permission_cannot_leak_into_or_be_bypassed_by_interactive_session() {
         let capture = std::env::temp_dir().join(format!(
             "buzz-acp-permission-policy-{}.ndjson",
             uuid::Uuid::new_v4()
@@ -4307,8 +3851,9 @@ sleep 10"#,
     async fn spawn_applies_runtime_env_defaults_with_extra_env_precedence() {
         const VAR: &str = "HERMES_ACP_SKIP_CONFIGURED_MCP";
         if std::env::var_os(VAR).is_some() {
-            // Inherited parent values win over both layers; the default and
-            // override behavior below is unobservable in such an environment.
+            // An inherited host value shadows only the runtime default, making
+            // that half of the behavior below unobservable in this environment.
+            // Explicit per-agent precedence has its own spawn regression above.
             return;
         }
 
@@ -6304,9 +5849,9 @@ sleep 10"#,
     }
 
     #[test]
-    fn build_codex_config_env_parent_env_wins_on_collisions_persona_keys_survive() {
+    fn build_codex_config_env_explicit_agent_wins_on_collisions_host_keys_survive() {
         // Parent env has CODEX_CONFIG with some keys; persona has different keys.
-        // Parent wins on collision; unrelated persona keys survive.
+        // Explicit agent config wins on collision; unrelated host keys survive.
         // network_access is always forced true.
         let persona_cfg = r#"{"persona_key":"persona_val","shared_key":"persona_version"}"#;
         // Config::from_args appends generated AFTER persona env vars.
@@ -6326,10 +5871,10 @@ sleep 10"#,
             v["persona_key"], "persona_val",
             "unrelated persona key must survive"
         );
-        // Collision: parent wins
+        // Collision: explicit per-agent config wins.
         assert_eq!(
-            v["shared_key"], "parent_version",
-            "parent must win on colliding key"
+            v["shared_key"], "persona_version",
+            "explicit agent config must win on colliding key"
         );
         // network_access always true (forced last)
         assert_eq!(v["sandbox_workspace_write"]["network_access"], true);
@@ -6383,23 +5928,16 @@ sleep 10"#,
     }
 
     #[test]
-    fn build_codex_config_env_errors_on_non_object_sandbox_workspace_write() {
-        // sandbox_workspace_write must be an object for network_access forcing.
-        // If the parent env sets it to a non-object scalar, deep_merge replaces
-        // our object with the scalar, and the force step must fail clearly.
+    fn build_codex_config_env_agent_overlay_repairs_non_object_host_sandbox() {
+        // An incompatible inherited host default must not shadow the explicit
+        // generated agent overlay.
         let persona = r#"{}"#;
         let extra = env(&[("CODEX_CONFIG", persona), ("CODEX_CONFIG", GENERATED)]);
-        // Parent replaces the object with a scalar — deep_merge: scalar overlay wins.
         let parent = r#"{"sandbox_workspace_write": 42}"#;
-        let result = build_codex_config_env(&extra, Some(parent), true);
-        assert!(
-            result.is_err(),
-            "non-object sandbox_workspace_write must return Err"
-        );
-        let msg = format!("{}", result.unwrap_err());
-        assert!(
-            msg.contains("sandbox_workspace_write"),
-            "error must mention sandbox_workspace_write"
-        );
+        let merged = build_codex_config_env(&extra, Some(parent), true)
+            .expect("explicit agent overlay replaces incompatible host default")
+            .expect("generated Codex config");
+        let value: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        assert_eq!(value["sandbox_workspace_write"]["network_access"], true);
     }
 }

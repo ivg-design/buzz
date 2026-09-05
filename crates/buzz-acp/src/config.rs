@@ -668,7 +668,7 @@ pub struct Config {
     /// `persona_env_vars`.  When true, `AcpClient::spawn` merges all `CODEX_CONFIG` entries
     /// and forces `sandbox_workspace_write.network_access = true` via `build_codex_config_env`.
     /// When false (non-Codex agents or rejected relay URL), the helper returns None and
-    /// any persona-supplied `CODEX_CONFIG` is handled with ordinary operator-wins semantics.
+    /// any persona-supplied `CODEX_CONFIG` is handled with ordinary explicit-agent precedence.
     pub has_generated_codex_config: bool,
     /// Whether to publish encrypted observer frames through the relay.
     pub relay_observer: bool,

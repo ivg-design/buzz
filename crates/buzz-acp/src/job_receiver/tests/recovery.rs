@@ -81,6 +81,15 @@ fn applied_summary() -> git_receipt_journal::GitEffectSummary {
     }
 }
 
+fn not_applied_summary() -> git_receipt_journal::GitEffectSummary {
+    git_receipt_journal::GitEffectSummary {
+        effect: GitEffect::NotApplied,
+        operation_count: 0,
+        applied_count: 0,
+        ambiguous_count: 0,
+    }
+}
+
 #[test]
 fn applied_git_effect_never_preserves_a_retryable_failure() {
     let guarded = guard_terminal_with_git_effect(
@@ -117,6 +126,20 @@ fn applied_git_effect_preserves_success_and_nonretryable_failure() {
     assert_eq!(
         guard_terminal_with_git_effect(failure.clone(), Ok(applied_summary())),
         failure
+    );
+}
+
+#[test]
+fn native_git_success_does_not_require_a_typed_git_receipt() {
+    let success = TerminalDisposition::Success {
+        summary: "Completed requested work with native host tools".into(),
+        candidate_sha: Some("1".repeat(40)),
+        artifacts: vec!["git:1111111111111111111111111111111111111111".into()],
+        evidence: vec!["native Git and GitHub evidence reported by the worker".into()],
+    };
+    assert_eq!(
+        guard_terminal_with_git_effect(success.clone(), Ok(not_applied_summary())),
+        success
     );
 }
 
@@ -410,119 +433,10 @@ async fn accepted_job_reaches_provider_with_conversation_recovery_enabled() {
         keys: worker.clone(),
         auth_tag_json: None,
     };
-    let identity = buzz_dev_mcp::HarnessTrustedIdentity::new(
-        &dispatch.checkout_root,
-        rest.base_url.clone(),
-        worker.clone(),
-        None,
-        Some(worker_sponsor.github_login.clone()),
-        None,
-        None,
-        true,
-    )
-    .expect("harness-owned identity");
-    let factory = crate::trusted_mcp::TrustedMcpFactory::with_job_privileges(
-        identity,
-        Duration::from_secs(60),
-        registry.clone(),
-    )
-    .expect("trusted factory with admitted job registry");
     let recovery_path = ledger_root.join("conversation-sessions.json");
     let recovery = crate::session_recovery::SessionRecoveryStore::open(recovery_path.clone())
         .expect("conversation recovery enabled");
-    let capture = ledger_root.join("qualified-job-wire.ndjson");
-    // Echo the observed immutable policy digest; an incorrect acknowledgement
-    // must still be rejected by the production session/new policy check.
-    let script = r#"while IFS= read -r line; do
-  printf '%s\n' "$line" >> "$CAPTURE_FILE"
-  [[ "$line" =~ \"id\":([0-9]+) ]] || continue
-  id=${BASH_REMATCH[1]}
-  case "$line" in
-    *'"method":"initialize"'*)
-      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"protocolVersion\":2,\"agentCapabilities\":{\"mcpCapabilities\":{\"http\":true}},\"agentInfo\":{\"name\":\"@agentclientprotocol/claude-agent-acp\",\"version\":\"test\"},\"_meta\":{\"buzz\":{\"jobPolicy\":{\"version\":1,\"methods\":[\"session/new\"],\"nativeTools\":\"disabled\",\"mcp\":\"explicitOnly\",\"permissionRequests\":\"deny\"}}}}}"
-      ;;
-    *'"method":"session/new"'*)
-      [[ "$line" =~ \"digest\":\"([0-9a-f]{64})\" ]] || exit 1
-      digest=${BASH_REMATCH[1]}
-      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"sessionId\":\"qualified-job-session\",\"_meta\":{\"buzz\":{\"jobPolicy\":{\"version\":1,\"applied\":true,\"digest\":\"$digest\"}}}}}"
-      ;;
-    *'"method":"session/prompt"'*)
-      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"stopReason\":\"end_turn\"}}"
-      ;;
-  esac
-done"#;
-    let mut acp = AcpClient::spawn(
-        "bash",
-        &["-c".into(), script.into()],
-        &[(
-            "CAPTURE_FILE".into(),
-            capture.to_string_lossy().into_owned(),
-        )],
-        false,
-    )
-    .await
-    .expect("spawn scripted qualified adapter");
-    acp.qualify_claude_job_policy_adapter_for_test();
-    acp.initialize()
-        .await
-        .expect("initialize qualified Claude adapter");
-    assert!(acp.job_policy_supported());
-    let agent = OwnedAgent {
-        index: 0,
-        acp,
-        state: SessionState::default(),
-        model_capabilities: None,
-        desired_model: None,
-        model_overridden: false,
-        desired_model_request_id: None,
-        desired_model_pending_ack: false,
-        startup_effort: None,
-        agent_name: "@agentclientprotocol/claude-agent-acp".into(),
-        goose_system_prompt_supported: None,
-        protocol_version: 2,
-    };
     let cwd = dispatch.checkout_root.to_string_lossy().into_owned();
-    let ctx = Arc::new(PromptContext {
-        mcp_servers: vec![],
-        trusted_mcp_factory: Some(factory),
-        session_recovery: Some(recovery.clone()),
-        initial_message: None,
-        idle_timeout: Duration::from_secs(5),
-        max_turn_duration: Duration::from_secs(10),
-        turn_liveness_interval: Duration::ZERO,
-        dedup_mode: crate::config::DedupMode::Queue,
-        reply_placement: crate::reply_placement::ReplyPlacement::Thread,
-        system_prompt: None,
-        session_title: None,
-        team_instructions: None,
-        workspace_project_channel: None,
-        workspace_project_address: None,
-        workspace_project_repository: None,
-        workspace_project_revision: None,
-        heartbeat_prompt: None,
-        base_prompt: None,
-        cwd: cwd.clone(),
-        rest_client: context_rest.clone(),
-        channel_info: ChannelInfoResolver::new(
-            std::collections::HashMap::from([(
-                channel,
-                crate::relay::ChannelInfo {
-                    name: "job-test".into(),
-                    channel_type: "stream".into(),
-                    description: None,
-                },
-            )]),
-            context_rest,
-        ),
-        context_message_limit: 0,
-        max_turns_per_session: 0,
-        permission_mode: crate::config::PermissionMode::Default,
-        agent_keys: worker.clone(),
-        agent_owner_pubkey: None,
-        memory_enabled: false,
-        harness_name: "claude-agent-acp".into(),
-        relay_url: context_url,
-    });
     let batch = crate::queue::FlushBatch {
         channel_id: channel,
         scope: dispatch.scope.clone(),
@@ -534,65 +448,201 @@ done"#;
         cancelled_events: vec![],
         cancel_reason: None,
     };
-    let (result_tx, mut result_rx) = tokio::sync::mpsc::unbounded_channel();
-    tokio::time::timeout(
-        Duration::from_secs(15),
-        run_prompt_task(
-            agent,
-            Some(batch),
-            None,
-            ctx,
-            result_tx,
-            None,
-            PromptExecution::new(Some(cwd.clone()), "job-with-recovery-turn".into()),
-        ),
-    )
-    .await
-    .expect("job prompt task completes");
-    let mut result = result_rx.recv().await.expect("job prompt result");
-    match &result.outcome {
-        crate::PromptOutcome::Ok(StopReason::EndTurn) => {}
-        crate::PromptOutcome::Error(error) => {
-            panic!("accepted job must reach session/prompt with conversation recovery enabled: {error}")
-        }
-        _ => panic!("accepted job did not complete its provider turn"),
-    }
-    assert!(result.batch.is_none(), "completed job must not be requeued");
-    result.agent.state.invalidate_scope(&dispatch.scope);
-    result.agent.acp.shutdown().await;
-    let wire: Vec<serde_json::Value> = std::fs::read_to_string(&capture)
-        .expect("read actual ACP wire")
-        .lines()
-        .map(|line| serde_json::from_str(line).expect("ACP request JSON"))
-        .collect();
-    assert_eq!(
-        wire.iter()
-            .filter(|event| event["method"] == "session/prompt")
-            .count(),
-        1,
-        "the accepted job must execute exactly one provider prompt"
-    );
-    let session = wire
-        .iter()
-        .find(|event| event["method"] == "session/new")
-        .expect("new qualified job session");
-    let servers = session["params"]["mcpServers"]
-        .as_array()
-        .expect("MCP servers");
-    assert_eq!(servers.len(), 1);
-    assert_eq!(servers[0]["name"], crate::trusted_mcp::SERVER_NAME);
-    assert_eq!(
-        session["params"]["_meta"]["claudeCode"]["options"]["tools"],
-        serde_json::json!([])
-    );
-    assert!(recovery
-        .binding(
-            &dispatch.scope,
+
+    for (provider, full_mode, capture_name) in [
+        (
             "@agentclientprotocol/claude-agent-acp",
-            &cwd
+            "bypassPermissions",
+            "claude-full-host-job-wire.ndjson",
+        ),
+        (
+            "@agentclientprotocol/codex-acp",
+            "agent-full-access",
+            "codex-full-host-job-wire.ndjson",
+        ),
+    ] {
+        let identity = buzz_dev_mcp::HarnessTrustedIdentity::new(
+            &dispatch.checkout_root,
+            rest.base_url.clone(),
+            worker.clone(),
+            None,
+            Some(worker_sponsor.github_login.clone()),
+            None,
+            None,
+            true,
         )
-        .expect("Job is outside conversation recovery")
-        .is_none());
+        .expect("harness-owned identity");
+        let factory = crate::trusted_mcp::TrustedMcpFactory::with_job_privileges(
+            identity,
+            Duration::from_secs(60),
+            registry.clone(),
+        )
+        .expect("trusted factory with admitted job registry");
+        let capture = ledger_root.join(capture_name);
+        let script = r#"while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$CAPTURE_FILE"
+  [[ "$line" =~ \"id\":([0-9]+) ]] || continue
+  id=${BASH_REMATCH[1]}
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"protocolVersion":2,"agentCapabilities":{"mcpCapabilities":{"http":true}},"agentInfo":{"name":"__PROVIDER__","version":"test"}}}'
+      ;;
+    *'"method":"session/new"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"sessionId":"full-host-job-session","configOptions":[{"id":"mode","category":"mode","currentValue":"default","options":[{"value":"default"},{"value":"__MODE__"}]}],"modes":{"availableModes":[{"id":"default"},{"id":"__MODE__"}],"currentModeId":"default"}}}'
+      ;;
+    *'"method":"session/set_config_option"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"configOptions":[{"id":"mode","category":"mode","currentValue":"__MODE__"}],"modes":{"availableModes":[{"id":"default"},{"id":"__MODE__"}],"currentModeId":"__MODE__"}}}'
+      ;;
+    *'"method":"session/prompt"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"stopReason":"end_turn"}}'
+      ;;
+  esac
+done"#
+            .replace("__PROVIDER__", provider)
+            .replace("__MODE__", full_mode);
+        let mut acp = AcpClient::spawn(
+            "bash",
+            &["-c".into(), script],
+            &[(
+                "CAPTURE_FILE".into(),
+                capture.to_string_lossy().into_owned(),
+            )],
+            false,
+        )
+        .await
+        .expect("spawn scripted full-host adapter");
+        acp.initialize()
+            .await
+            .expect("initialize full-host adapter");
+        let agent = OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            desired_model_request_id: None,
+            desired_model_pending_ack: false,
+            startup_effort: None,
+            agent_name: provider.into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        };
+        let ctx = Arc::new(PromptContext {
+            mcp_servers: vec![crate::acp::McpServer::stdio(
+                "configured-host-mcp",
+                "host-mcp",
+                vec![],
+                vec![],
+            )],
+            trusted_mcp_factory: Some(factory),
+            session_recovery: Some(recovery.clone()),
+            initial_message: None,
+            idle_timeout: Duration::from_secs(5),
+            max_turn_duration: Duration::from_secs(10),
+            turn_liveness_interval: Duration::ZERO,
+            dedup_mode: crate::config::DedupMode::Queue,
+            reply_placement: crate::reply_placement::ReplyPlacement::Thread,
+            system_prompt: None,
+            session_title: None,
+            team_instructions: None,
+            workspace_project_channel: None,
+            workspace_project_address: None,
+            workspace_project_repository: None,
+            workspace_project_revision: None,
+            heartbeat_prompt: None,
+            base_prompt: None,
+            cwd: cwd.clone(),
+            rest_client: context_rest.clone(),
+            channel_info: ChannelInfoResolver::new(
+                std::collections::HashMap::from([(
+                    channel,
+                    crate::relay::ChannelInfo {
+                        name: "job-test".into(),
+                        channel_type: "stream".into(),
+                        description: None,
+                    },
+                )]),
+                context_rest.clone(),
+            ),
+            context_message_limit: 0,
+            max_turns_per_session: 0,
+            permission_mode: crate::config::PermissionMode::BypassPermissions,
+            agent_keys: worker.clone(),
+            agent_owner_pubkey: None,
+            memory_enabled: false,
+            harness_name: provider.into(),
+            relay_url: context_url.clone(),
+        });
+        let (result_tx, mut result_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            run_prompt_task(
+                agent,
+                Some(batch.clone()),
+                None,
+                ctx,
+                result_tx,
+                None,
+                PromptExecution::new(
+                    Some(cwd.clone()),
+                    format!("{provider}-job-with-recovery-turn"),
+                ),
+            ),
+        )
+        .await
+        .expect("job prompt task completes");
+        let mut result = result_rx.recv().await.expect("job prompt result");
+        match &result.outcome {
+            crate::PromptOutcome::Ok(StopReason::EndTurn) => {}
+            crate::PromptOutcome::Error(error) => {
+                panic!("accepted job must reach {provider} session/prompt: {error}")
+            }
+            _ => panic!("accepted job did not complete its {provider} turn"),
+        }
+        assert!(result.batch.is_none(), "completed job must not be requeued");
+        result.agent.state.invalidate_scope(&dispatch.scope);
+        result.agent.acp.shutdown().await;
+
+        let wire: Vec<serde_json::Value> = std::fs::read_to_string(&capture)
+            .expect("read actual ACP wire")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("ACP request JSON"))
+            .collect();
+        assert_eq!(
+            wire.iter()
+                .filter(|event| event["method"] == "session/prompt")
+                .count(),
+            1,
+            "the accepted job must execute exactly one provider prompt"
+        );
+        let session = wire
+            .iter()
+            .find(|event| event["method"] == "session/new")
+            .expect("new full-host job session");
+        let servers = session["params"]["mcpServers"]
+            .as_array()
+            .expect("MCP servers");
+        assert_eq!(servers.len(), 2);
+        assert!(servers
+            .iter()
+            .any(|server| server["name"] == "configured-host-mcp"));
+        assert!(servers
+            .iter()
+            .any(|server| server["name"] == crate::trusted_mcp::SERVER_NAME));
+        assert!(session["params"]["_meta"]["buzz"]["jobPolicy"].is_null());
+        assert!(session["params"]["_meta"]["claudeCode"].is_null());
+        let mode = wire
+            .iter()
+            .find(|event| event["method"] == "session/set_config_option")
+            .expect("full-host job permission mode");
+        assert_eq!(mode["params"]["configId"], "mode");
+        assert_eq!(mode["params"]["value"], full_mode);
+        assert!(recovery
+            .binding(&dispatch.scope, provider, &cwd)
+            .expect("Job is outside conversation recovery")
+            .is_none());
+    }
     assert!(
         !recovery_path.exists(),
         "Job must not create a conversation recovery document"

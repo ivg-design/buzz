@@ -630,12 +630,16 @@ impl JobReceiver {
                     durable_common.sponsor.clone(),
                 );
                 if pending_cancel {
-                    cancel::terminal_for_lifecycle(
-                        &lifecycle,
-                        &self.tenant.community_id,
-                        &self.agent_pubkey,
-                        &claim,
-                    )
+                    (if prompt_started {
+                        cancel::CancellationTerminal::interrupted_full_host_turn()
+                    } else {
+                        cancel::terminal_for_lifecycle(
+                            &lifecycle,
+                            &self.tenant.community_id,
+                            &self.agent_pubkey,
+                            &claim,
+                        )
+                    })
                     .publish(&emitter)
                     .await
                     .map_err(|error| ReceiverError::Receipt(error.to_string()))?;

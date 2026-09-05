@@ -182,12 +182,23 @@ fn job_terminal_disposition(
     scope_digest: &str,
 ) -> job_receiver::TerminalDisposition {
     match outcome {
-        PromptOutcome::Ok(_) => job_receiver::parse_terminal_outcome(
-            captured_text,
-            operation_id,
-            request_event_id,
-            scope_digest,
-        ),
+        PromptOutcome::Ok(_) => {
+            let disposition = job_receiver::parse_terminal_outcome(
+                captured_text,
+                operation_id,
+                request_event_id,
+                scope_digest,
+            );
+            match disposition {
+                job_receiver::TerminalDisposition::Failed {
+                    retryable: true, ..
+                } => job_receiver::TerminalDisposition::Indeterminate {
+                    code: "retryable_failure_after_full_host_turn".into(),
+                    message: "Worker requested a retry after a full-host turn; native host side effects cannot be proven absent, so automatic replay is unsafe".into(),
+                },
+                disposition => disposition,
+            }
+        }
         // Only an exact pre-prompt boundary proves a setup failure. A generic
         // ACP error after delivery cannot rule out non-Git side effects. The
         // finisher also reconciles any applied/ambiguous durable Git effects.
@@ -241,6 +252,35 @@ mod job_terminal_disposition_tests {
             ),
             job_receiver::TerminalDisposition::Indeterminate { ref code, .. }
                 if code == "worker_turn_interrupted"
+        ));
+    }
+
+    #[test]
+    fn retryable_worker_failure_after_full_host_prompt_is_indeterminate() {
+        let operation_id = "9064f66a-a18a-4f04-b85e-5c39b2b2a1ea";
+        let request_event_id = "4".repeat(64);
+        let scope_digest = "5".repeat(64);
+        let terminal = serde_json::json!({
+            "schema_version": "buzz.job-outcome.v1",
+            "operation_id": operation_id,
+            "request_event_id": request_event_id,
+            "scope_digest": scope_digest,
+            "outcome": "failed",
+            "code": "tool_unavailable",
+            "reason": "required host tool was unavailable",
+            "retryable": true
+        });
+        assert!(matches!(
+            job_terminal_disposition(
+                &PromptOutcome::Ok(acp::StopReason::EndTurn),
+                false,
+                Some(terminal.to_string()),
+                operation_id,
+                &request_event_id,
+                &scope_digest,
+            ),
+            job_receiver::TerminalDisposition::Indeterminate { ref code, .. }
+                if code == "retryable_failure_after_full_host_turn"
         ));
     }
 }
@@ -4086,15 +4126,15 @@ async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
                                             } else {
                                                 job_emitters.remove(&scope);
                                                 queue.clear_job_working_directory(&scope);
+                                                spawn_job_terminal_finisher(
+                                                    job_privileges.clone(),
+                                                    scope,
+                                                    Some((
+                                                        emitter,
+                                                        DeferredJobTerminal::Cancellation(Box::new(terminal)),
+                                                    )),
+                                                );
                                             }
-                                            spawn_job_terminal_finisher(
-                                                job_privileges.clone(),
-                                                scope,
-                                                Some((
-                                                    emitter,
-                                                    DeferredJobTerminal::Cancellation(Box::new(terminal)),
-                                                )),
-                                            );
                                         }
                                         Ok(job_receiver::CancelOutcome::Consumed) => {}
                                         Err(error) => tracing::warn!(
@@ -4570,17 +4610,24 @@ async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
                     };
                     let cancellation = job_cancellations.remove(scope);
                     let emitter = job_emitters.remove(scope)?;
+                    let prompt_not_attempted = result
+                        .agent
+                        .acp
+                        .prompt_not_attempted_for_turn(&result.turn_id);
                     let terminal = match cancellation {
-                        Some(cancellation) => {
+                        Some(cancellation) if prompt_not_attempted => {
                             DeferredJobTerminal::Cancellation(Box::new(cancellation))
                         }
+                        Some(_) => DeferredJobTerminal::Outcome(
+                            job_receiver::TerminalDisposition::Indeterminate {
+                                code: "cancelled_full_host_turn".into(),
+                                message: "Worker cancellation interrupted a full-host turn after prompt delivery; native host side effects cannot be proven absent and require reconciliation".into(),
+                            },
+                        ),
                         None => {
                             let disposition = job_terminal_disposition(
                                 &result.outcome,
-                                result
-                                    .agent
-                                    .acp
-                                    .prompt_not_attempted_for_turn(&result.turn_id),
+                                prompt_not_attempted,
                                 captured_job_text.flatten(),
                                 operation_id,
                                 request_event_id,
@@ -4711,9 +4758,12 @@ async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
                     let cancellation = job_cancellations.remove(scope);
                     job_emitters.remove(scope).map(|emitter| {
                         let terminal = match cancellation {
-                            Some(cancellation) => {
-                                DeferredJobTerminal::Cancellation(Box::new(cancellation))
-                            }
+                            Some(_) => DeferredJobTerminal::Outcome(
+                                job_receiver::TerminalDisposition::Indeterminate {
+                                    code: "cancelled_full_host_turn_panicked".into(),
+                                    message: "Worker process panicked while cancelling a full-host turn; native host side effects cannot be proven absent and require reconciliation".into(),
+                                },
+                            ),
                             None => DeferredJobTerminal::Outcome(
                                 job_receiver::TerminalDisposition::Indeterminate {
                                     code: "worker_panicked".into(),

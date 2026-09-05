@@ -622,7 +622,7 @@ async fn requester_cancel_fences_claim_and_worker_acknowledges_once() {
 }
 
 #[tokio::test]
-async fn restart_after_cancel_fence_emits_cancelled_instead_of_indeterminate() {
+async fn restart_after_full_host_cancel_fence_emits_indeterminate() {
     let sender = Keys::generate();
     let worker = Keys::generate();
     let channel = Uuid::new_v4();
@@ -697,10 +697,13 @@ async fn restart_after_cancel_fence_emits_cancelled_instead_of_indeterminate() {
         .recover_lifecycle()
         .await
         .expect("recover pending cancellation");
-    let terminal = published.recv().await.expect("cancelled terminal");
+    let terminal = published.recv().await.expect("indeterminate terminal");
     assert!(matches!(
         JobEvent::parse(&terminal).expect("valid terminal"),
-        JobEvent::Control(control) if control.action == JobControlAction::Cancelled
+        JobEvent::Error(error)
+            if error.outcome == buzz_core::job::JobErrorOutcome::Indeterminate
+                && error.code == "cancelled_full_host_turn"
+                && !error.retryable
     ));
     assert!(
         published.try_recv().is_err(),

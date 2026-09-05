@@ -97,12 +97,16 @@ pub(super) async fn terminate_channel(
             receiver.sponsor.clone(),
         );
         let result = if pending_cancel {
-            super::cancel::terminal_for_lifecycle(
-                &lifecycle,
-                &receiver.tenant.community_id,
-                &receiver.agent_pubkey,
-                &claim,
-            )
+            (if prompt_started {
+                super::cancel::CancellationTerminal::interrupted_full_host_turn()
+            } else {
+                super::cancel::terminal_for_lifecycle(
+                    &lifecycle,
+                    &receiver.tenant.community_id,
+                    &receiver.agent_pubkey,
+                    &claim,
+                )
+            })
             .publish(&emitter)
             .await
         } else {

@@ -21,6 +21,7 @@ pub(crate) enum CancellationTerminal {
         community_id: String,
         worker_pubkey: String,
         claim: Box<super::ledger::StoredClaim>,
+        prompt_started: bool,
     },
     Cancelled,
     Indeterminate {
@@ -30,6 +31,13 @@ pub(crate) enum CancellationTerminal {
 }
 
 impl CancellationTerminal {
+    pub(super) fn interrupted_full_host_turn() -> Self {
+        Self::Indeterminate {
+            code: "cancelled_full_host_turn".into(),
+            message: "Cancellation interrupted a full-host turn; native host side effects cannot be proven absent and require reconciliation".into(),
+        }
+    }
+
     pub(crate) fn resolve(self) -> Self {
         match self {
             Self::Deferred {
@@ -37,7 +45,14 @@ impl CancellationTerminal {
                 community_id,
                 worker_pubkey,
                 claim,
-            } => terminal_for_lifecycle(&lifecycle, &community_id, &worker_pubkey, &claim),
+                prompt_started,
+            } => {
+                if prompt_started {
+                    Self::interrupted_full_host_turn()
+                } else {
+                    terminal_for_lifecycle(&lifecycle, &community_id, &worker_pubkey, &claim)
+                }
+            }
             terminal => terminal,
         }
     }
@@ -168,7 +183,8 @@ pub(super) async fn handle(
     if !is_replay && snapshot.head_event_id != prior_event_id && !pending_is_predecessor {
         return Ok(CancelOutcome::Consumed);
     }
-    if !receiver.ledger.prompt_started(&claim).await? {
+    let prompt_started = receiver.ledger.prompt_started(&claim).await?;
+    if !prompt_started {
         super::git_receipt_journal::initialize_for_unstarted_lifecycle(
             &lifecycle,
             &receiver.tenant.community_id,
@@ -213,6 +229,7 @@ pub(super) async fn handle(
             community_id: receiver.tenant.community_id.clone(),
             worker_pubkey: receiver.agent_pubkey.clone(),
             claim: Box::new(claim),
+            prompt_started,
         },
     })))
 }

@@ -55,6 +55,7 @@ let QueryClient;
 let QueryClientProvider;
 let ThemeProvider;
 let AgentInstanceEditDialog;
+let AgentDefinitionDialog;
 
 // Records every Tauri command invocation the mounted dialog issues; unmocked
 // commands reject so a new IPC dependency surfaces as a loud failure.
@@ -146,6 +147,8 @@ function rawRuntime(id, overrides = {}) {
     binary_path: `/usr/local/bin/${id}`,
     default_args: [],
     mcp_command: null,
+    thinking_env_var: null,
+    effort_canonical_values: null,
     install_hint: "",
     install_instructions_url: "",
     can_auto_install: false,
@@ -187,7 +190,13 @@ function configSurface() {
 function installIpc() {
   const set = (cmd, handler) => ipcHandlers.set(cmd, handler);
   set("discover_acp_providers", () =>
-    Promise.resolve([rawRuntime("claude"), rawRuntime("goose")]),
+    Promise.resolve([
+      rawRuntime("claude", {
+        thinking_env_var: "CLAUDE_CODE_EFFORT_LEVEL",
+        effort_canonical_values: ["low", "medium", "high", "xhigh", "max"],
+      }),
+      rawRuntime("goose"),
+    ]),
   );
   set("list_personas", () => Promise.resolve([rawPersona()]));
   set("get_agent_config_surface", () => Promise.resolve(configSurface()));
@@ -273,7 +282,7 @@ function installEffortIpc({ deferUpdate = false, failUpdate = false } = {}) {
   };
 }
 
-function renderDialog(onOpenChange) {
+function renderDialog(onOpenChange, agentOverrides = {}) {
   const client = new QueryClient({
     defaultOptions: {
       mutations: { gcTime: 0 },
@@ -289,10 +298,90 @@ function renderDialog(onOpenChange) {
         QueryClientProvider,
         { client },
         createElement(AgentInstanceEditDialog, {
-          agent: { ...toCamelAgent(rawAgent()) },
+          agent: { ...toCamelAgent(rawAgent(agentOverrides)) },
           open: true,
           onOpenChange,
           onUpdated: () => {},
+        }),
+      ),
+    ),
+  );
+}
+
+function claudeAgent(overrides = {}) {
+  return {
+    persona_id: null,
+    runtime: "claude",
+    agent_command: "claude",
+    agent_command_override: null,
+    ...overrides,
+  };
+}
+
+function claudeCatalogRuntime() {
+  return {
+    id: "claude",
+    label: "Claude Code",
+    avatarUrl: "",
+    availability: "available",
+    command: "claude",
+    binaryPath: "/usr/local/bin/claude",
+    defaultArgs: [],
+    mcpCommand: null,
+    modelEnvVar: null,
+    providerEnvVar: null,
+    thinkingEnvVar: "CLAUDE_CODE_EFFORT_LEVEL",
+    effortCanonicalValues: ["low", "medium", "high", "xhigh", "max"],
+    maxTokensEnvVar: null,
+    contextLimitEnvVar: null,
+    maxRoundsEnvVar: null,
+    installHint: "",
+    installInstructionsUrl: "",
+    canAutoInstall: false,
+    requiresExternalCli: true,
+    underlyingCliPath: "/usr/local/bin/claude",
+    nodeRequired: false,
+    authStatus: { status: "logged_in" },
+    loginHint: null,
+    source: "builtin",
+    definitionEnv: {},
+  };
+}
+
+function renderDefinition(onSubmit, initialOverrides = {}) {
+  const client = new QueryClient({
+    defaultOptions: {
+      mutations: { gcTime: 0 },
+      queries: { gcTime: 0, retry: false },
+    },
+  });
+  clients.push(client);
+  return render(
+    createElement(
+      ThemeProvider,
+      { defaultTheme: "buzz" },
+      createElement(
+        QueryClientProvider,
+        { client },
+        createElement(AgentDefinitionDialog, {
+          description: "Create a test agent.",
+          embedded: true,
+          error: null,
+          initialValues: {
+            displayName: "Scribe",
+            envVars: { KEEP_ME: "yes" },
+            runtime: "claude",
+            systemPrompt: "Be useful.",
+            ...initialOverrides,
+          },
+          isPending: false,
+          onOpenChange: () => {},
+          onSubmit,
+          open: true,
+          runtimeCatalogStatus: "ready",
+          runtimes: [claudeCatalogRuntime()],
+          submitLabel: "Create agent",
+          title: "Create agent",
         }),
       ),
     ),
@@ -431,6 +520,7 @@ before(async () => {
   ));
   ({ ThemeProvider } = await import("@/shared/theme/ThemeProvider"));
   ({ AgentInstanceEditDialog } = await import("./AgentInstanceEditDialog.tsx"));
+  ({ AgentDefinitionDialog } = await import("./AgentDefinitionDialog.tsx"));
 });
 
 afterEach(() => {
@@ -491,6 +581,183 @@ test("inherit toggle then Save dispatches the agentCommand:'' inherit sentinel",
     "",
     "Save on the pin→inherit transition must carry the empty-command sentinel the backend clears the column on",
   );
+});
+
+test("Claude effort create selection is submitted through the definition env map", async () => {
+  installIpc();
+  const submissions = [];
+  await act(async () => {
+    renderDefinition(async (input) => submissions.push(input));
+  });
+
+  const effort = await screen.findByTestId("claude-effort-level");
+  assert.equal(effort.value, "", "new definitions start on Claude's default");
+  await act(async () => {
+    fireEvent.change(effort, { target: { value: "xhigh" } });
+  });
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: "Create agent" }));
+  });
+
+  assert.equal(submissions.length, 1, "create submits exactly once");
+  assert.deepEqual(submissions[0].envVars, {
+    KEEP_ME: "yes",
+    CLAUDE_CODE_EFFORT_LEVEL: "xhigh",
+  });
+});
+
+test("Claude effort keeps an unknown saved env value until the user changes it", async () => {
+  installIpc();
+  const submissions = [];
+  await act(async () => {
+    renderDefinition(async (input) => submissions.push(input), {
+      envVars: {
+        KEEP_ME: "yes",
+        CLAUDE_CODE_EFFORT_LEVEL: "future-tier",
+      },
+    });
+  });
+
+  const effort = await screen.findByTestId("claude-effort-level");
+  assert.equal(effort.value, "future-tier");
+  assert.match(effort.selectedOptions[0].textContent, /preserved/);
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: "Create agent" }));
+  });
+
+  assert.equal(submissions.length, 1);
+  assert.deepEqual(submissions[0].envVars, {
+    KEEP_ME: "yes",
+    CLAUDE_CODE_EFFORT_LEVEL: "future-tier",
+  });
+});
+
+test("Claude effort edit persists in envVars and replaces the session-only picker", async () => {
+  installIpc();
+  ipcHandlers.set("get_agent_config_surface", () =>
+    Promise.resolve({
+      ...configSurface(),
+      normalized: {
+        ...configSurface().normalized,
+        thinkingEffort: { value: "high", source: "persisted" },
+      },
+    }),
+  );
+  await act(async () => {
+    renderDialog(
+      () => {},
+      claudeAgent({
+        env_vars: {
+          KEEP_ME: "yes",
+          BUZZ_AGENT_THINKING_EFFORT: "high",
+          CLAUDE_CODE_EFFORT_LEVEL: "medium",
+        },
+      }),
+    );
+  });
+
+  const effort = await screen.findByTestId("claude-effort-level");
+  assert.equal(effort.value, "medium");
+  assert.equal(
+    dom.window.document.getElementById("edit-agent-effort"),
+    null,
+    "Claude must not render the live-session effort picker beside the env field",
+  );
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: /Advanced/ }));
+  });
+  assert.ok(
+    screen.getByText("Environment variables"),
+    "the generic advanced env editor remains available",
+  );
+  const advancedInputValues = [
+    ...dom.window.document.querySelectorAll("input"),
+  ].map((input) => input.value);
+  assert.ok(advancedInputValues.includes("KEEP_ME"));
+  assert.ok(
+    !advancedInputValues.includes("CLAUDE_CODE_EFFORT_LEVEL"),
+    "the first-class Claude key must not render as a duplicate generic row",
+  );
+  await act(async () => {
+    fireEvent.change(effort, { target: { value: "max" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+  });
+
+  const updates = ipcCalls.filter(
+    (call) => call.cmd === "update_managed_agent",
+  );
+  assert.equal(updates.length, 1, "edit submits exactly one locked update");
+  assert.deepEqual(updates[0].args.input.envVars, {
+    KEEP_ME: "yes",
+    CLAUDE_CODE_EFFORT_LEVEL: "max",
+  });
+  assert.equal(
+    updates[0].args.input.effortLevel,
+    null,
+    "Claude env effort must clear the stale structured session effort in the same update",
+  );
+});
+
+test("Claude effort edit is discarded by Cancel", async () => {
+  installIpc();
+  let openChange;
+  await act(async () => {
+    renderDialog(
+      (next) => {
+        openChange = next;
+      },
+      claudeAgent({
+        env_vars: { CLAUDE_CODE_EFFORT_LEVEL: "medium" },
+      }),
+    );
+  });
+
+  const effort = await screen.findByTestId("claude-effort-level");
+  await act(async () => {
+    fireEvent.change(effort, { target: { value: "high" } });
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  });
+
+  assert.equal(openChange, false);
+  assert.equal(
+    ipcCalls.filter((call) => call.cmd === "update_managed_agent").length,
+    0,
+    "Cancel must discard the pending Claude env effort change",
+  );
+});
+
+test("Claude effort default clears the native env key and stale structured effort", async () => {
+  installIpc();
+  ipcHandlers.set("get_agent_config_surface", () =>
+    Promise.resolve({
+      ...configSurface(),
+      normalized: {
+        ...configSurface().normalized,
+        thinkingEffort: { value: "high", source: "persisted" },
+      },
+    }),
+  );
+  await act(async () => {
+    renderDialog(
+      () => {},
+      claudeAgent({
+        env_vars: {
+          KEEP_ME: "yes",
+          CLAUDE_CODE_EFFORT_LEVEL: "medium",
+        },
+      }),
+    );
+  });
+
+  const effort = await screen.findByTestId("claude-effort-level");
+  await act(async () => {
+    fireEvent.change(effort, { target: { value: "" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+  });
+
+  const update = ipcCalls.find((call) => call.cmd === "update_managed_agent");
+  assert.deepEqual(update?.args.input.envVars, { KEEP_ME: "yes" });
+  assert.equal(update?.args.input.effortLevel, null);
 });
 
 // ── Effort write is Save-gated: real dialog wiring, controlled deferred IPC ────

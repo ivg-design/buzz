@@ -27,7 +27,10 @@ import { ChooserDialogContent } from "@/shared/ui/chooser-dialog-content";
 import { Dialog } from "@/shared/ui/dialog";
 import { Input } from "@/shared/ui/input";
 import { setManagedAgentAutoRestart } from "@/shared/api/tauriManagedAgents";
-import { EffortPickerField } from "./EffortPickerField";
+import {
+  AgentInstanceEffortField,
+  claudeEffortHiddenEnvKeys,
+} from "./ClaudeEffortEnvField";
 import { EditAgentAdvancedFields } from "./EditAgentAdvancedFields";
 import {
   ADVANCED_FIELDS_MOTION_TRANSITION,
@@ -1071,7 +1074,6 @@ export function AgentInstanceEditDialog({
                 </div>
               </div>
             ) : null}
-            {/* LLM provider + provider API key + model */}
             <EditAgentProviderModelFields
               disabled={isSaving}
               llmProviderFieldVisible={llmProviderFieldVisible}
@@ -1105,22 +1107,19 @@ export function AgentInstanceEditDialog({
               modelStatusMessage={modelStatusMessage}
             />
 
-            <EffortPickerField
+            <AgentInstanceEffortField
               agent={agent}
               config={
                 runtimeTouched.current ? undefined : configSurfaceQuery.data
               }
               disabled={isSaving}
-              value={
-                effortTouched.current
-                  ? effortLevel
-                  : (configSurfaceQuery.data?.normalized.thinkingEffort
-                      ?.value ?? null)
-              }
-              onChange={(level) => {
-                effortTouched.current = true;
-                setEffortLevel(level);
-              }}
+              effortLevel={effortLevel}
+              effortTouched={effortTouched}
+              envVars={envVars}
+              inheritedEnvVars={inheritedEnvVarsForAdvanced}
+              runtime={prospectiveRuntime}
+              setEffortLevel={setEffortLevel}
+              setEnvVars={setEnvVars}
             />
 
             <AgentAiDefaultsNotice
@@ -1179,9 +1178,10 @@ export function AgentInstanceEditDialog({
                       disabled={isSaving}
                       envVars={envVars}
                       fileSatisfiedEnvKeys={fileSatisfiedEnvKeys}
-                      hiddenEnvKeys={
-                        topLevelSecretEnvVar ? [topLevelSecretEnvVar] : []
-                      }
+                      hiddenEnvKeys={claudeEffortHiddenEnvKeys(
+                        topLevelSecretEnvVar,
+                        prospectiveRuntime,
+                      )}
                       focusKey={
                         initialFocus?.type === "env_key"
                           ? initialFocus.key

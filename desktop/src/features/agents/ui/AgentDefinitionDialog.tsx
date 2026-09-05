@@ -14,6 +14,10 @@ import { AgentCreationPreview } from "./AgentCreationPreview";
 import { AgentIdentityFields } from "./AgentDescriptionField";
 import { PersonaDropdownField } from "./PersonaDropdownField";
 import type { EnvVarsValue } from "./EnvVarsEditor";
+import {
+  claudeEffortEnvDescriptor,
+  ClaudeEffortEnvField,
+} from "./ClaudeEffortEnvField";
 import { PersonaAdvancedFields } from "./PersonaAdvancedFields";
 import { PersonaModelField } from "./PersonaModelField";
 import { runtimeAvailabilityWarning } from "./runtimeAvailabilityWarning";
@@ -398,6 +402,7 @@ export function AgentDefinitionDialog({
   }
 
   const selectedRuntime = runtimes.find((p) => p.id === runtime);
+  const claudeEffortDescriptor = claudeEffortEnvDescriptor(selectedRuntime);
   const blankRuntimeModelProviderEditable =
     initialModelProviderEditableWithoutRuntime && runtime.trim().length === 0;
   const runtimeCanChooseLlmProvider =
@@ -901,6 +906,17 @@ export function AgentDefinitionDialog({
             ) : null}
           </AnimatePresence>
 
+          <ClaudeEffortEnvField
+            disabled={isPending}
+            envVars={envVars}
+            inheritedEnvVars={inheritedEnvVarsForAdvanced}
+            onEnvVarsChange={(nextEnvVars) => {
+              setHasUserChanges(true);
+              setEnvVars(nextEnvVars);
+            }}
+            runtime={selectedRuntime}
+          />
+
           {aiConfigurationMode === "defaults" ? (
             <AgentCreateAiDefaultsSummary
               canChooseProvider={runtimeCanChooseLlmProvider}
@@ -970,9 +986,12 @@ export function AgentDefinitionDialog({
                   disabled={isPending}
                   envVars={envVars}
                   fileSatisfiedEnvKeys={localModeGate.fileSatisfiedEnvKeys}
-                  hiddenEnvKeys={
-                    topLevelSecretEnvVar ? [topLevelSecretEnvVar] : []
-                  }
+                  hiddenEnvKeys={[
+                    ...(topLevelSecretEnvVar ? [topLevelSecretEnvVar] : []),
+                    ...(claudeEffortDescriptor
+                      ? [claudeEffortDescriptor.envVar]
+                      : []),
+                  ]}
                   inheritedEnvVars={inheritedEnvVarsForAdvanced}
                   model={model}
                   modelTuningRuntimeId={runtime}

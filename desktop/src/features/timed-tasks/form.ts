@@ -3,6 +3,7 @@ import type { TimedTaskInput, TimedTaskRepetition } from "./types";
 export type TimedTaskDraft = {
   instruction: string;
   channelId: string;
+  destination: string;
   intervalValue: string;
   intervalUnit: TimedTaskInput["interval"]["unit"];
   repeatMode: TimedTaskRepetition["mode"];
@@ -17,6 +18,7 @@ export function draftForTimedTask(
   return {
     instruction: task?.instruction ?? "",
     channelId: task?.channelId ?? channelId,
+    destination: task ? task.threadRootId ?? (task.postToChannel ? "channel" : "new_thread") : "channel",
     intervalValue: String(task?.interval.value ?? 1),
     intervalUnit: task?.interval.unit ?? "hours",
     repeatMode: task?.repetition.mode ?? "forever",
@@ -107,6 +109,8 @@ export function timedTaskInput(
   }
   return {
     recipientPubkey,
+    threadRootId: /^[0-9a-f]{64}$/.test(draft.destination) ? draft.destination : null,
+    postToChannel: draft.destination === "channel",
     originEventId,
     channelId: draft.channelId,
     instruction: draft.instruction,

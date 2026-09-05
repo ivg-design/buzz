@@ -15,6 +15,7 @@ import {
 } from "@/shared/ui/dialog";
 import { listTimedTasks, saveTimedTask, setTimedTaskStatus } from "./api";
 import { draftForTimedTask, timedTaskInput } from "./form";
+import { useTimedTaskDestinations } from "./useTimedTaskDestinations";
 import { TimedTaskForm } from "./TimedTaskForm";
 import { TimedTaskList } from "./TimedTaskList";
 import type { TimedTask, TimedTaskScope } from "./types";
@@ -68,10 +69,11 @@ export function TimedTaskDialog({
   const availableChannels = (channelsQuery.data ?? []).filter(
     (channel) => channel.isMember && !channel.archivedAt,
   );
+  const { dmChannelLabels, threads } = useTimedTaskDestinations(availableChannels, draft.channelId, scope.expectedSignerPubkey, scope.expectedRelayUrl);
   const channelNames = Object.fromEntries(
     availableChannels.map((channel) => [
       channel.id,
-      channel.channelType === "dm" ? channel.name : `#${channel.name}`,
+      channel.channelType === "dm" ? dmChannelLabels[channel.id] ?? channel.name : `#${channel.name}`,
     ]),
   );
   const channelOptions = [
@@ -112,11 +114,12 @@ export function TimedTaskDialog({
       const input = timedTaskInput(
         draft,
         recipientPubkey,
-        editing?.originEventId ??
+        editing ? (draft.channelId === editing.channelId ? editing.originEventId : null) :
           (draft.channelId === channelId ? (originEventId ?? null) : null),
         Date.now(),
         editing ?? undefined,
       );
+      input.recipientName = recipientName;
       if (input.channelId === DM_CHOICE)
         input.channelId = (
           await openDm({ pubkeys: [recipientPubkey], ...scope })
@@ -177,6 +180,7 @@ export function TimedTaskDialog({
                 setError(null);
               }}
               channels={channelOptions}
+              threads={threads}
               timeZone={timeZone}
               pending={mutation.isPending}
               editing={Boolean(editing)}

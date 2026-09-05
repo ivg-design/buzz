@@ -63,13 +63,17 @@ pub async fn timed_tasks_create(
     }
     let id = uuid::Uuid::new_v4().to_string();
     let root_event = events::root(&id, &input, &keys, &relay)?;
+    let thread_id = input
+        .thread_root_id
+        .clone()
+        .unwrap_or_else(|| root_event.id.to_hex());
     let task = TimedTask {
         next_run_at: Some(now + input.interval.millis()?),
         id,
         input,
         owner_pubkey: keys.public_key().to_hex(),
         relay_url: relay,
-        thread_id: root_event.id.to_hex(),
+        thread_id,
         root_event,
         root_published: false,
         status: TaskStatus::Active,
@@ -107,6 +111,21 @@ pub async fn timed_tasks_update(
     )?;
     let mut task = scheduler.with_store(|store| store.get(&id))?;
     task.authorize(&keys.public_key().to_hex(), &relay)?;
+    super::runtime::authorize_destination(&state, &keys, &relay, &input).await?;
+    let destination_changed = input.channel_id != task.input.channel_id
+        || input.thread_root_id != task.input.thread_root_id
+        || input.post_to_channel != task.input.post_to_channel;
+    if destination_changed && task.in_flight.is_some() {
+        return Err("Wait for the pending delivery before changing its destination".into());
+    }
+    if destination_changed {
+        task.root_event = events::root(&task.id, &input, &keys, &relay)?;
+        task.thread_id = input
+            .thread_root_id
+            .clone()
+            .unwrap_or_else(|| task.root_event.id.to_hex());
+        task.root_published = false;
+    }
     engine::update(&mut task, input, chrono::Utc::now().timestamp_millis())?;
     scheduler.save(&task)?;
     Ok(task)

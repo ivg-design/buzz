@@ -70,12 +70,16 @@ pub(super) async fn authorize_destination(
             );
         }
     }
-    if let Some(origin) = &input.origin_event_id {
+    for origin in input
+        .origin_event_id
+        .iter()
+        .chain(input.thread_root_id.iter())
+    {
         let events = relay::query_relay_at_with_keys(
             state,
             relay,
             &[serde_json::json!({
-                "ids": [origin], "kinds": [9, 1, 11, 45001, 45002], "#h": [&input.channel_id], "limit": 1,
+                "ids": [origin], "kinds": [9, 1, 11, 40002, 45001, 45002], "#h": [&input.channel_id], "limit": 1,
             })],
             keys,
             None,
@@ -264,7 +268,7 @@ async fn ensure_root(
             state,
             &task.relay_url,
             &[serde_json::json!({
-                "ids": [&task.thread_id], "kinds": [9], "#h": [&task.input.channel_id], "limit": 1,
+                "ids": [task.root_event.id.to_hex()], "kinds": [9], "#h": [&task.input.channel_id], "limit": 1,
             })],
             keys,
             None,

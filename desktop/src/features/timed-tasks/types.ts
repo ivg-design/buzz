@@ -16,6 +16,9 @@ export type TimedTaskRepetition =
 
 export type TimedTaskInput = {
   recipientPubkey: string;
+  recipientName?: string;
+  threadRootId?: string | null;
+  postToChannel?: boolean;
   channelId: string;
   originEventId: string | null;
   instruction: string;

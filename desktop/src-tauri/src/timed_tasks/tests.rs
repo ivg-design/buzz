@@ -13,6 +13,9 @@ pub(super) fn fixture() -> (TimedTask, Keys, Keys) {
     let agent = Keys::generate();
     let input = TaskInput {
         recipient_pubkey: agent.public_key().to_hex(),
+        recipient_name: None,
+        thread_root_id: None,
+        post_to_channel: false,
         channel_id: uuid::Uuid::new_v4().to_string(),
         origin_event_id: None,
         instruction: "  Exact instruction\nwith newlines.  ".into(),
@@ -310,4 +313,41 @@ fn repeated_delivery_failure_has_bounded_backoff_and_remains_visible() {
     assert!(task.retry_at <= START + 900_000);
     assert_eq!(task.delivered_count, 0);
     assert!(task.last_error.is_some());
+}
+
+#[test]
+fn saved_destination_and_mentions_retain_prompt_and_timing_without_setup_delivery() {
+    let (mut task, owner, _) = fixture();
+    let next = task.next_run_at;
+    let mut input = task.input.clone();
+    input.recipient_name = Some("Codexitron".into());
+    input.thread_root_id = Some("a".repeat(64));
+    engine::update(&mut task, input, START + 10_000).unwrap();
+    assert_eq!(task.next_run_at, next);
+    task.thread_id = task.input.thread_root_id.clone().unwrap();
+    task.root_event = events::root(&task.id, &task.input, &owner, &task.relay_url).unwrap();
+    assert!(task.root_event.content.contains("@Codexitron"));
+    assert!(!task.root_event.tags.iter().any(|t| t.as_slice()[0] == "p"));
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("destinations.sqlite3");
+    Store::open(&path).unwrap().save(&task).unwrap();
+    let mut restored = Store::open(&path).unwrap().get(&task.id).unwrap();
+    assert_eq!(restored.input, task.input);
+    let event = events::occurrence(&restored, "first", &owner).unwrap();
+    assert_eq!(
+        event.content,
+        format!("@Codexitron\n{}", task.input.instruction)
+    );
+    assert!(event
+        .tags
+        .iter()
+        .any(|t| t.as_slice() == ["p", &task.input.recipient_pubkey]));
+    assert!(event
+        .tags
+        .iter()
+        .any(|t| t.as_slice() == ["e", &task.thread_id, "", "root"]));
+    restored.input.post_to_channel = true;
+    restored.input.thread_root_id = None;
+    let channel_event = events::occurrence(&restored, "second", &owner).unwrap();
+    assert!(!channel_event.tags.iter().any(|t| t.as_slice()[0] == "e"));
 }

@@ -14,6 +14,7 @@ export function TimedTaskForm({
   onSubmit,
   onCancel,
   channels,
+  threads = [],
   timeZone,
   pending,
   editing,
@@ -24,6 +25,7 @@ export function TimedTaskForm({
   onSubmit: () => void;
   onCancel: () => void;
   channels: { id: string; name: string }[];
+  threads?: { id: string; name: string }[];
   timeZone: string;
   pending: boolean;
   editing: boolean;
@@ -64,9 +66,8 @@ export function TimedTaskForm({
           <select
             id={`${id}-channel`}
             value={draft.channelId}
-            onChange={(event) => set("channelId", event.target.value)}
+            onChange={(event) => onChange({ ...draft, channelId: event.target.value, destination: "channel" })}
             className={selectClass}
-            disabled={editing}
             required
           >
             <option value="" disabled>
@@ -78,9 +79,12 @@ export function TimedTaskForm({
               </option>
             ))}
           </select>
-          <p className="text-xs text-muted-foreground">
-            Instructions and replies stay together in one task thread.
-          </p>
+          <label className="text-sm font-medium" htmlFor={`${id}-destination`}>Post in</label>
+          <select id={`${id}-destination`} className={selectClass} value={draft.destination} onChange={(event) => set("destination", event.target.value)}>
+            <option value="channel">Conversation timeline</option>
+            <option value="new_thread">New task thread</option>
+            {threads.map((thread) => <option key={thread.id} value={thread.id}>{thread.name}</option>)}
+          </select>
         </div>
         <div className="grid gap-1.5">
           <label className="text-sm font-medium" htmlFor={`${id}-interval`}>

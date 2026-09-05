@@ -88,6 +88,12 @@ impl Repetition {
 #[serde(rename_all = "camelCase")]
 pub struct TaskInput {
     pub recipient_pubkey: String,
+    #[serde(default)]
+    pub recipient_name: Option<String>,
+    #[serde(default)]
+    pub thread_root_id: Option<String>,
+    #[serde(default)]
+    pub post_to_channel: bool,
     pub channel_id: String,
     pub origin_event_id: Option<String>,
     pub instruction: String,
@@ -99,6 +105,12 @@ impl TaskInput {
     pub fn validate(&self, now: i64) -> Result<(), String> {
         nostr::PublicKey::from_hex(&self.recipient_pubkey).map_err(|_| "invalid agent identity")?;
         uuid::Uuid::parse_str(&self.channel_id).map_err(|_| "invalid channel identity")?;
+        if let Some(root) = &self.thread_root_id {
+            nostr::EventId::from_hex(root).map_err(|_| "invalid thread root")?;
+            if self.post_to_channel {
+                return Err("choose either channel or thread delivery".into());
+            }
+        }
         if let Some(origin) = &self.origin_event_id {
             nostr::EventId::from_hex(origin).map_err(|_| "invalid origin event")?;
         }

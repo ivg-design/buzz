@@ -139,17 +139,16 @@ pub fn update(task: &mut TimedTask, input: TaskInput, now: i64) -> Result<(), St
     if task.status == TaskStatus::Cancelled {
         return Err("cancelled task cannot be edited".into());
     }
-    if input.channel_id != task.input.channel_id
-        || input.recipient_pubkey != task.input.recipient_pubkey
-        || input.origin_event_id != task.input.origin_event_id
-    {
-        return Err("recipient and initiating conversation cannot be changed".into());
+    if input.recipient_pubkey != task.input.recipient_pubkey {
+        return Err("recipient cannot be changed in this agent's schedule".into());
     }
+    let timing_changed =
+        input.interval != task.input.interval || input.repetition != task.input.repetition;
     task.input = input;
     task.updated_at = now;
     task.retry_at = 0;
     task.consecutive_failures = 0;
-    if task.status == TaskStatus::Active {
+    if task.status == TaskStatus::Active && timing_changed {
         task.next_run_at = Some(
             now.checked_add(task.input.interval.millis()?)
                 .ok_or("schedule overflow")?,

@@ -6,10 +6,10 @@ use super::agent_env::idle_pool_sleep_env;
 
 use crate::{
     managed_agents::{
-        append_log_marker, known_acp_runtime, login_shell_path, managed_agent_log_path,
-        missing_command_message, normalize_agent_args, open_log_file, resolve_command,
-        spawn_key_refusal, KnownAcpRuntime, ManagedAgentPairRuntime, ManagedAgentRecord,
-        ManagedAgentRuntimeKey, ManagedAgentSummary,
+        append_log_marker, known_acp_runtime, login_shell_environment, login_shell_path,
+        managed_agent_log_path, missing_command_message, normalize_agent_args, open_log_file,
+        resolve_command, spawn_key_refusal, KnownAcpRuntime, ManagedAgentPairRuntime,
+        ManagedAgentRecord, ManagedAgentRuntimeKey, ManagedAgentSummary,
     },
     util::now_iso,
 };
@@ -89,6 +89,23 @@ fn resolved_standard_agent_command(
     Ok(resolved_adapter
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| effective_command.to_string()))
+}
+
+/// Apply the environment exported by the user's host shell as the launch
+/// floor. Buzz-owned identity, control, and signing variables are excluded;
+/// the caller applies explicit agent and Desktop policy values afterwards.
+fn apply_host_shell_environment(
+    command: &mut std::process::Command,
+    host_environment: Option<std::collections::BTreeMap<String, String>>,
+) {
+    let Some(host_environment) = host_environment else {
+        return;
+    };
+    for (key, value) in host_environment {
+        if !super::env_vars::is_reserved_env_key(&key) {
+            command.env(key, value);
+        }
+    }
 }
 
 /// Classify an agent's persona against the live catalog for the Agents-menu
@@ -422,8 +439,6 @@ pub(crate) fn configure_runtime_cli(
     if runtime.id != "claude" {
         return Ok(());
     }
-    command.env_remove("NODE_OPTIONS");
-    command.env_remove("NODE_PATH");
     if let Some(cli_path) = runtime.underlying_cli.and_then(resolve_command) {
         // On Windows, `.cmd` and `.bat` files are batch shims — they cannot be
         // passed directly to `CreateProcess` and cause EINVAL when the Claude
@@ -682,6 +697,13 @@ fn spawn_agent_child_inner(
     );
 
     let mut command = std::process::Command::new(&resolved_acp_command);
+    // A desktop app launched by Finder does not inherit the exported variables
+    // that an ordinary interactive host CLI sees. Restore that environment as
+    // the lowest-precedence layer so native agent tools retain the user's CLI
+    // config, MCP discovery, credential-agent sockets, and tool settings. Buzz
+    // control/signing keys are never copied from the shell; the dedicated
+    // Desktop policy and record layers below remain authoritative.
+    apply_host_shell_environment(&mut command, login_shell_environment());
     if let Some(home) = super::default_agent_workdir() {
         command.current_dir(home);
     }
@@ -840,14 +862,8 @@ fn spawn_agent_child_inner(
 
     command.env("BUZZ_ACP_RELAY_OBSERVER", "true");
 
-    // Raw Nostr signing material never enters the harness environment. Relay
-    // git auth must use a separately scoped, non-exportable credential flow.
+    // Raw Nostr signing material never enters the harness environment.
     command.env_remove("NOSTR_PRIVATE_KEY");
-    command.env_remove("GIT_CONFIG_COUNT");
-    command.env_remove("GIT_CONFIG_KEY_0");
-    command.env_remove("GIT_CONFIG_VALUE_0");
-    command.env_remove("GIT_CONFIG_KEY_1");
-    command.env_remove("GIT_CONFIG_VALUE_1");
 
     // User env (descriptor.env): fully-layered floor→runtime→definition→global→persona→agent,
     // reserved-key filtered. This is the last generic user tier; dedicated

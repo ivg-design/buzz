@@ -628,6 +628,129 @@ fn codex_spawn_without_verified_bundle_fails_and_strips_ambient_cli_paths() {
         .any(|(key, _)| key == "CLAUDE_CODE_EXECUTABLE"));
 }
 
+#[test]
+fn host_shell_environment_preserves_normal_cli_configuration_and_filters_buzz_control_keys() {
+    #[cfg(unix)]
+    let mut command = std::process::Command::new("/bin/sh");
+    #[cfg(not(unix))]
+    let mut command = std::process::Command::new("cmd");
+    command.env_clear();
+    let host_environment = std::collections::BTreeMap::from([
+        (
+            "BUZZ_HOST_PARITY_SENTINEL".to_string(),
+            "present".to_string(),
+        ),
+        (
+            "SSH_AGENT_SOCK".to_string(),
+            "/sentinel/ssh-agent".to_string(),
+        ),
+        ("NODE_OPTIONS".to_string(), "--sentinel-option".to_string()),
+        ("CLAUDE_CODE_EFFORT_LEVEL".to_string(), "low".to_string()),
+        ("BUZZ_ACP_EFFORT_LEVEL".to_string(), "high".to_string()),
+        ("CODEX_HOME".to_string(), "/sentinel/codex".to_string()),
+        (
+            "CLAUDE_CONFIG_DIR".to_string(),
+            "/sentinel/claude".to_string(),
+        ),
+        ("GIT_CONFIG_COUNT".to_string(), "1".to_string()),
+        (
+            "GIT_CONFIG_KEY_0".to_string(),
+            "credential.helper".to_string(),
+        ),
+        (
+            "GIT_CONFIG_VALUE_0".to_string(),
+            "sentinel-helper".to_string(),
+        ),
+        (
+            "BUZZ_ACP_PRIVATE_KEY".to_string(),
+            "must-not-cross".to_string(),
+        ),
+        (
+            "NOSTR_PRIVATE_KEY".to_string(),
+            "must-not-cross".to_string(),
+        ),
+        (
+            "BUZZ_RELAY_URL".to_string(),
+            "wss://wrong.invalid".to_string(),
+        ),
+    ]);
+
+    super::apply_host_shell_environment(&mut command, Some(host_environment));
+
+    let environment: std::collections::BTreeMap<_, _> = command
+        .get_envs()
+        .filter_map(|(key, value)| Some((key.to_str()?, value?.to_str()?)))
+        .collect();
+    for key in [
+        "BUZZ_HOST_PARITY_SENTINEL",
+        "SSH_AGENT_SOCK",
+        "NODE_OPTIONS",
+        "CLAUDE_CODE_EFFORT_LEVEL",
+        "CODEX_HOME",
+        "CLAUDE_CONFIG_DIR",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_KEY_0",
+        "GIT_CONFIG_VALUE_0",
+    ] {
+        assert!(environment.contains_key(key), "missing host variable {key}");
+    }
+    for key in [
+        "BUZZ_ACP_PRIVATE_KEY",
+        "NOSTR_PRIVATE_KEY",
+        "BUZZ_RELAY_URL",
+    ] {
+        assert!(
+            !environment.contains_key(key),
+            "copied reserved variable {key}"
+        );
+    }
+
+    // The production effort projector removes stale host effort authorities
+    // and emits the explicit per-agent Claude choice after the host floor.
+    let mut record = fixture(RespondTo::OwnerOnly, vec![], Some("tag".into()));
+    record.effort_level = Some("high".into());
+    record
+        .env_vars
+        .insert("CLAUDE_CODE_EFFORT_LEVEL".into(), "max".into());
+    let _effort = super::apply_effort_to_spawn_command(
+        &mut command,
+        &record,
+        known_acp_runtime("claude-agent-acp"),
+        &[],
+        None,
+        &std::collections::BTreeMap::new(),
+        &std::collections::BTreeMap::new(),
+    );
+
+    // Explicit record/Desktop policy remains the last-writer authority.
+    command.env("CODEX_HOME", "/explicit/codex");
+    command.env("BUZZ_RELAY_URL", "wss://selected.example");
+    let environment: std::collections::BTreeMap<_, _> = command
+        .get_envs()
+        .filter_map(|(key, value)| Some((key.to_str()?, value?.to_str()?)))
+        .collect();
+    assert_eq!(environment.get("CODEX_HOME"), Some(&"/explicit/codex"));
+    assert_eq!(environment.get("CLAUDE_CODE_EFFORT_LEVEL"), Some(&"max"));
+    assert_eq!(environment.get("BUZZ_ACP_EFFORT_LEVEL"), Some(&"max"));
+    assert_eq!(
+        environment.get("BUZZ_RELAY_URL"),
+        Some(&"wss://selected.example")
+    );
+
+    // Exercise the assembled environment across an actual child-process
+    // boundary without printing it. This proves the stale ACP transport value
+    // is replaced by the explicit native Claude value used for both consumers.
+    #[cfg(unix)]
+    {
+        let status = command
+            .arg("-c")
+            .arg(r#"test "$CLAUDE_CODE_EFFORT_LEVEL" = max && test "$BUZZ_ACP_EFFORT_LEVEL" = max"#)
+            .status()
+            .expect("sentinel child must launch");
+        assert!(status.success(), "sentinel child observed wrong effort env");
+    }
+}
+
 /// On Windows, `.cmd` and `.bat` batch shims must NOT be assigned to
 /// `CLAUDE_CODE_EXECUTABLE` — `CreateProcess` cannot exec them directly and
 /// returns EINVAL (issue #2397). The adapter must fall back to its own PATH

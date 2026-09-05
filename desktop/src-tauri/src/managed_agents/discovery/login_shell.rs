@@ -39,7 +39,7 @@ pub(crate) fn login_shell_candidates() -> Vec<PathBuf> {
 }
 
 /// Run a command in a login shell (tries zsh then bash on Unix, Git Bash on Windows).
-/// Returns trimmed stdout if the command succeeds with non-empty output.
+/// Returns raw stdout bytes if the command succeeds with non-empty output.
 ///
 /// Each candidate shell is bounded by [`LOGIN_SHELL_TIMEOUT`]: a shell whose
 /// startup blocks (an interactive prompt in `.zshrc`, a stalled network mount,
@@ -47,7 +47,7 @@ pub(crate) fn login_shell_candidates() -> Vec<PathBuf> {
 /// loop falls through to the next candidate rather than hanging the whole
 /// discovery. Without this bound a single slow login shell froze the forced
 /// pipeline indefinitely, which is what left "Check again" spinning forever.
-fn run_in_login_shell(args: &[&str]) -> Option<String> {
+pub(super) fn run_bytes_in_login_shell(args: &[&str]) -> Option<Vec<u8>> {
     #[cfg(test)]
     login_shell_spawn_probe::record();
     for shell in login_shell_candidates() {
@@ -64,12 +64,17 @@ fn run_in_login_shell(args: &[&str]) -> Option<String> {
         if !output.status.success() {
             continue;
         }
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !stdout.is_empty() {
-            return Some(stdout);
+        if !output.stdout.is_empty() {
+            return Some(output.stdout);
         }
     }
     None
+}
+
+fn run_in_login_shell(args: &[&str]) -> Option<String> {
+    let stdout = run_bytes_in_login_shell(args)?;
+    let stdout = String::from_utf8_lossy(&stdout).trim().to_string();
+    (!stdout.is_empty()).then_some(stdout)
 }
 
 pub(crate) fn find_via_login_shell(command: &str) -> Option<PathBuf> {
@@ -235,6 +240,9 @@ pub(crate) fn refresh_login_shell_path() {
     let mut guard = path_cache().lock().unwrap_or_else(|e| e.into_inner());
     guard.generation = guard.generation.wrapping_add(1);
     guard.state = LoginShellPath::Uninit;
+    drop(guard);
+
+    super::host_environment::refresh_host_environment();
 }
 
 #[cfg(test)]

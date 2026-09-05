@@ -17,18 +17,20 @@
 //! neither a running session nor the on-disk harness file.)
 //!
 //! The **tier-reading** native key is the runtime's real `thinking_env_var`
-//! (`None` for Claude/Codex — those have no native key, so the column is the
-//! sole authority and a user-supplied `BUZZ_ACP_EFFORT_LEVEL` is transport, not
-//! a tier). The **emission** key ([`EffortLaunch::key`]) is
+//! (`None` for Codex — it has no native key, so the column is the sole
+//! authority and a user-supplied `BUZZ_ACP_EFFORT_LEVEL` is transport, not a
+//! tier). The **emission** key ([`EffortLaunch::key`]) is
 //! `thinking_env_var.unwrap_or(BUZZ_ACP_EFFORT_LEVEL)`: Goose emits
 //! `GOOSE_THINKING_EFFORT`, buzz-agent emits `BUZZ_AGENT_THINKING_EFFORT`,
-//! Claude/Codex/keyless-ACP and any unknown/custom runtime emit the retained
-//! ACP-startup sentinel `BUZZ_ACP_EFFORT_LEVEL`.
+//! Claude emits `CLAUDE_CODE_EFFORT_LEVEL` for its host CLI and mirrors the
+//! resolved value to `BUZZ_ACP_EFFORT_LEVEL` for the adapter's post-session
+//! configuration. Codex/keyless-ACP and unknown/custom runtimes emit only the
+//! ACP sentinel.
 //!
 //! [`EffortLaunch::suppress`] lists every known native/legacy effort key plus
-//! the sentinel; every consumer strips them all first, then emits at most the
-//! one `key`. This is what guarantees a launched process, a remote payload, and
-//! a restart snapshot can never carry two effort authorities.
+//! the sentinel; every consumer strips them all first, then emits the one
+//! effective value. Claude carries that value under two consumer-specific keys,
+//! while a remote payload and restart snapshot retain one canonical authority.
 
 use std::collections::BTreeMap;
 
@@ -37,11 +39,11 @@ use crate::managed_agents::custom_harnesses::HarnessDefinition;
 use crate::managed_agents::discovery::{EffortNormalization, KnownAcpRuntime};
 use crate::managed_agents::types::{AgentDefinition, ManagedAgentRecord};
 
-/// The retained ACP-startup transport key. Claude, Codex, keyless ACP adapters,
-/// and any unknown/custom runtime route the effective effort through this key
-/// (the harness reads it into `PoolStartup.startup_effort`). It is *transport*,
-/// never a value-authority tier: a user-supplied entry is suppressed and
-/// overwritten by the projected effective value.
+/// The retained ACP-startup transport key. Claude mirrors its native value here;
+/// Codex, keyless ACP adapters, and unknown/custom runtimes route their effective
+/// effort through it (the harness reads it into `PoolStartup.startup_effort`).
+/// It is *transport*, never a value-authority tier: a user-supplied entry is
+/// suppressed and overwritten by the projected effective value.
 pub(crate) const ACP_STARTUP_EFFORT_KEY: &str = "BUZZ_ACP_EFFORT_LEVEL";
 
 /// The resolved launch effort for one runtime: the single fact every spawn
@@ -54,6 +56,9 @@ pub(crate) struct EffortLaunch {
     pub value: Option<String>,
     /// The destination env key the value is emitted under.
     pub key: &'static str,
+    /// Mirror the resolved value to the ACP startup sentinel for runtimes whose
+    /// native CLI and adapter each consume their own key (currently Claude).
+    pub mirror_to_acp_transport: bool,
     /// Every effort key to strip from the launch env before emitting `key`.
     /// Always includes the sentinel and all known native/legacy effort keys, so
     /// no foreign or transport effort key can shadow the projected authority.
@@ -69,8 +74,8 @@ pub(crate) struct EffortLaunch {
 
 impl EffortLaunch {
     /// Apply the projection to a launch env map: strip every `suppress` key,
-    /// then emit `key = value` when a value is present. After this call the map
-    /// holds at most one effort key (`key`), carrying the effective value.
+    /// then emit `key = value` when a value is present. Claude also mirrors the
+    /// same value to the adapter transport key.
     ///
     /// Suppression is ASCII-case-insensitive: Windows `Command` case-folds env
     /// names, so a hand-set `goose_thinking_effort` would otherwise evade an
@@ -104,6 +109,9 @@ impl EffortLaunch {
         });
         if let Some(v) = self.value.as_ref().or(carried.as_ref()) {
             env.insert(self.key.to_string(), v.clone());
+            if self.mirror_to_acp_transport && self.key != ACP_STARTUP_EFFORT_KEY {
+                env.insert(ACP_STARTUP_EFFORT_KEY.to_string(), v.clone());
+            }
         }
     }
 }
@@ -127,10 +135,10 @@ pub(crate) fn get_ci<'a>(map: &'a BTreeMap<String, String>, key: &str) -> Option
 
 /// Resolve the single harness-agnostic effort authority and apply it to a fully
 /// layered launch `env`: strip every known/legacy/transport effort key, then
-/// emit exactly the one destination key holding the effective value. Called by
-/// the descriptor resolver AFTER the full layer stack, so the launch env, the
-/// remote deploy payload, and the restart snapshot all carry one effort key and
-/// one value — no double authority, no foreign key, no launch/badge disagreement.
+/// emit the destination key holding the effective value (plus Claude's matching
+/// adapter transport mirror). Called by the descriptor resolver AFTER the full
+/// layer stack, so the launch env, remote deploy payload, and restart snapshot
+/// all carry one value authority with no launch/badge disagreement.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_launch_effort(
     env: &mut BTreeMap<String, String>,
@@ -215,7 +223,7 @@ pub(crate) fn normalize_effort(
 
 /// The destination env key the effective effort is emitted under for `runtime`:
 /// the runtime's native `thinking_env_var`, else the ACP-startup sentinel
-/// (Claude, Codex, keyless ACP adapters, and unknown/custom runtimes).
+/// (Codex, keyless ACP adapters, and unknown/custom runtimes).
 pub(crate) fn effort_dest_key(runtime: Option<&KnownAcpRuntime>) -> &'static str {
     runtime
         .and_then(|r| r.thinking_env_var)
@@ -303,6 +311,9 @@ pub(crate) fn apply_effort_launch_to_command(
     }
     if let Some(ref value) = launch.value {
         cmd.env(launch.key, value);
+        if launch.mirror_to_acp_transport && launch.key != ACP_STARTUP_EFFORT_KEY {
+            cmd.env(ACP_STARTUP_EFFORT_KEY, value);
+        }
     }
 }
 
@@ -372,13 +383,14 @@ pub(crate) fn effort_launch_projection(
     // Value gate: Goose canonicalizes through its alias contract; buzz-agent
     // validates against its accepted set (invalid → skip, so a foreign
     // canonical like Goose `off` is never emitted where the destination parser
-    // rejects it); Claude/Codex and unknown/custom pass raw over the sentinel.
+    // rejects it); Claude validates against its CLI contract; Codex and
+    // unknown/custom runtimes pass raw over the sentinel.
     let contract = runtime.and_then(|r| r.effort_normalization);
     let accepted = runtime.and_then(|r| r.effort_accepted_values);
     let norm = |raw: &str| -> Option<String> { normalize_effort(contract, accepted, raw) };
 
-    // Tier-reading native key: the runtime's REAL native key. `None` (Claude,
-    // Codex, unknown/custom) means there are no env-tier authorities — the
+    // Tier-reading native key: the runtime's REAL native key. `None` (Codex,
+    // unknown/custom) means there are no env-tier authorities — the
     // sentinel in user env is transport only — so the column is the sole source.
     let native_key = runtime.and_then(|r| r.thinking_env_var);
 
@@ -396,6 +408,7 @@ pub(crate) fn effort_launch_projection(
     EffortLaunch {
         value,
         key,
+        mirror_to_acp_transport: runtime.is_some_and(|known| known.id == "claude"),
         suppress,
         preserve_passthrough,
     }

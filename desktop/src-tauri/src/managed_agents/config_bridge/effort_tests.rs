@@ -15,6 +15,7 @@ use crate::managed_agents::types::{AgentDefinition, ManagedAgentRecord};
 pub(super) const GOOSE_KEY: &str = "GOOSE_THINKING_EFFORT";
 pub(super) const BUZZ_AGENT_KEY: &str = "BUZZ_AGENT_THINKING_EFFORT";
 pub(super) const ACP_KEY: &str = "BUZZ_ACP_EFFORT_LEVEL";
+const CLAUDE_KEY: &str = "CLAUDE_CODE_EFFORT_LEVEL";
 
 pub(super) fn goose() -> &'static KnownAcpRuntime {
     known_acp_runtime_exact("goose").expect("goose runtime in catalog")
@@ -164,14 +165,45 @@ fn goose_emits_only_goose_key() {
 }
 
 #[test]
-fn claude_routes_canonical_through_acp_sentinel() {
+fn claude_routes_canonical_through_native_environment() {
     let mut r = record();
     r.effort_level = Some("high".into());
     let launch = project_record_only(&r, Some(claude()));
-    // Claude has no native key: the column is the sole authority and it emits
-    // under the retained ACP-startup sentinel.
+    // Claude's documented host environment is the startup authority. The ACP
+    // session config applies the same persisted choice after session/new.
     assert_eq!(launch.value.as_deref(), Some("high"));
-    assert_eq!(launch.key, ACP_KEY);
+    assert_eq!(launch.key, CLAUDE_KEY);
+    assert!(launch.mirror_to_acp_transport);
+
+    let mut environment = BTreeMap::from([
+        (CLAUDE_KEY.to_string(), "low".to_string()),
+        (ACP_KEY.to_string(), "stale".to_string()),
+    ]);
+    launch.apply(&mut environment);
+    assert_eq!(
+        environment.get(CLAUDE_KEY).map(String::as_str),
+        Some("high")
+    );
+    assert_eq!(environment.get(ACP_KEY).map(String::as_str), Some("high"));
+}
+
+#[test]
+fn claude_accepts_only_documented_host_effort_values() {
+    for value in ["low", "medium", "high", "xhigh", "max"] {
+        let mut r = record();
+        r.effort_level = Some(value.into());
+        let launch = project_record_only(&r, Some(claude()));
+        assert_eq!(launch.value.as_deref(), Some(value));
+        assert_eq!(launch.key, CLAUDE_KEY);
+    }
+
+    let mut invalid = record();
+    invalid.effort_level = Some("minimal".into());
+    assert_eq!(
+        project_record_only(&invalid, Some(claude())).value,
+        None,
+        "Claude CLI does not accept the Codex-only minimal effort value"
+    );
 }
 
 #[test]

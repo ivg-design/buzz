@@ -47,6 +47,11 @@ pub(crate) static GOOSE_EFFORT_NORMALIZATION: EffortNormalization = EffortNormal
 pub(crate) static BUZZ_AGENT_EFFORT_VALUES: &[&str] =
     &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 
+/// Claude Code's accepted `CLAUDE_CODE_EFFORT_LEVEL` values. The installed
+/// host CLI exposes the same set through `claude --help --effort`; unlike
+/// Goose, `xhigh` and `max` are distinct and require no alias normalization.
+pub(crate) static CLAUDE_CODE_EFFORT_VALUES: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
 impl EffortNormalization {
     /// Normalize `raw` to canonical form. `None` → invalid for this harness;
     /// the caller must treat it as absent (skip-as-absent policy).
@@ -120,11 +125,12 @@ pub(crate) struct KnownAcpRuntime {
     /// normalized through this contract before validity checks, precedence
     /// resolution, override tracking, and B-equality comparison.
     ///
-    /// `None` — harness accepts any provider/model-specific value via its own
-    /// catalog (buzz-agent); see `getProviderEffortConfig()` in TS for that
-    /// path. Contract-less does NOT mean keyless: buzz-agent still has a native
-    /// `thinking_env_var`, and Claude/Codex route the canonical through
-    /// `BUZZ_ACP_EFFORT_LEVEL` for ACP startup even with `thinking_env_var: None`.
+    /// `None` — either `effort_accepted_values` supplies a validation-only
+    /// vocabulary (buzz-agent and Claude) or the harness accepts an open
+    /// provider/model-specific value (Codex). Contract-less does NOT mean
+    /// keyless: buzz-agent and Claude still have native `thinking_env_var`
+    /// keys, while Codex routes the canonical through
+    /// `BUZZ_ACP_EFFORT_LEVEL` for ACP startup.
     ///
     /// The single canonical authority shared by UI choices, the launch
     /// projection, and the reader. No value-authority logic may live outside
@@ -139,8 +145,8 @@ pub(crate) struct KnownAcpRuntime {
     /// destination parser would reject it and crash the child.
     ///
     /// `None` means "no validation": Goose validates through
-    /// `effort_normalization`; Claude/Codex and unknown/custom runtimes accept
-    /// any string over the `BUZZ_ACP_EFFORT_LEVEL` transport.
+    /// `effort_normalization`; Codex and unknown/custom runtimes accept any
+    /// string over the `BUZZ_ACP_EFFORT_LEVEL` transport.
     pub effort_accepted_values: Option<&'static [&'static str]>,
     /// Env var for normalizing `max_output_tokens`. `None` when the harness
     /// does not have a first-class env var for this field (config-file only).
@@ -162,6 +168,15 @@ pub(crate) struct KnownAcpRuntime {
 }
 
 impl KnownAcpRuntime {
+    /// Finite effort vocabulary exposed to the runtime catalog and UI. A
+    /// canonicalization contract supplies canonical values; validation-only
+    /// runtimes expose their distinct accepted values directly.
+    pub(crate) fn effort_values(&self) -> Option<&'static [&'static str]> {
+        self.effort_normalization
+            .map(|normalization| normalization.canonical)
+            .or(self.effort_accepted_values)
+    }
+
     /// Return the CLI install commands for the current platform.
     ///
     /// On Windows, returns `cli_install_commands_windows` when non-empty,
@@ -209,6 +224,11 @@ mod tests {
             .adapter_install_instructions_url
             .contains("claude-agent-acp"));
         assert!(claude.cli_install_hint.contains("Claude Code CLI"));
+        assert_eq!(claude.thinking_env_var, Some("CLAUDE_CODE_EFFORT_LEVEL"));
+        assert_eq!(
+            claude.effort_values(),
+            Some(&["low", "medium", "high", "xhigh", "max"][..])
+        );
 
         let codex = known_acp_runtime_exact("codex").unwrap();
         assert_eq!(

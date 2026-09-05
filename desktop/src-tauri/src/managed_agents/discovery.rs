@@ -11,6 +11,7 @@ use crate::managed_agents::{
 };
 mod auth_status_cache;
 pub(crate) mod bounded_command;
+mod host_environment;
 mod login_shell;
 mod presets;
 mod runtime_metadata;
@@ -18,6 +19,7 @@ mod runtime_metadata;
 mod windows_install;
 mod catalog;
 pub(crate) use catalog::KNOWN_ACP_RUNTIMES;
+pub(crate) use host_environment::login_shell_environment;
 pub use login_shell::{find_nvm_default_bin, login_shell_path};
 pub(crate) use login_shell::{find_via_login_shell, refresh_login_shell_path};
 #[cfg(test)]
@@ -1143,8 +1145,8 @@ fn discover_acp_runtime_phase1(runtime: &'static KnownAcpRuntime, force: bool) -
             provider_env_var: runtime.provider_env_var.map(str::to_string),
             thinking_env_var: runtime.thinking_env_var.map(str::to_string),
             effort_canonical_values: runtime
-                .effort_normalization
-                .map(|norm| norm.canonical.iter().map(|s| s.to_string()).collect()),
+                .effort_values()
+                .map(|values| values.iter().map(|s| s.to_string()).collect()),
             max_tokens_env_var: runtime.max_tokens_env_var.map(str::to_string),
             context_limit_env_var: runtime.context_limit_env_var.map(str::to_string),
             max_rounds_env_var: runtime.max_rounds_env_var.map(str::to_string),

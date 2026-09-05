@@ -37,10 +37,8 @@ fn claude_spawn_uses_the_probed_cli_executable() {
     assert!(command
         .get_envs()
         .any(|(key, value)| { key == "CLAUDE_CODE_EXECUTABLE" && value == Some(cli.as_os_str()) }));
-    assert!(command
-        .get_envs()
-        .any(|(key, value)| key == "NODE_OPTIONS" && value.is_none()));
-    assert!(command
-        .get_envs()
-        .any(|(key, value)| key == "NODE_PATH" && value.is_none()));
+    assert!(command.get_envs().any(|(key, value)| key == "NODE_OPTIONS"
+        && value == Some(std::ffi::OsStr::new("--import=/tmp/inject.mjs"))));
+    assert!(command.get_envs().any(|(key, value)| key == "NODE_PATH"
+        && value == Some(std::ffi::OsStr::new("/tmp/ambient-modules"))));
 }

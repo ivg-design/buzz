@@ -671,10 +671,10 @@ pub struct AcpRuntimeCatalogEntry {
     /// Environment variable used to apply thinking effort, when supported.
     pub thinking_env_var: Option<String>,
     /// Canonical accepted effort values for this runtime, in display order.
-    /// Serialized from `KnownAcpRuntime::effort_normalization.canonical` for
-    /// runtimes with a static finite vocabulary (e.g. Goose). `None` for
-    /// runtimes with no canonicalization contract (buzz-agent uses a
-    /// provider/model catalog; Claude/Codex/unknown runtimes accept any string).
+    /// Serialized from `KnownAcpRuntime::effort_values` for runtimes with a
+    /// static finite vocabulary. This includes canonicalized values (Goose) and
+    /// distinct validation-only values (Claude). `None` for open vocabularies
+    /// and runtimes without effort.
     ///
     /// The renderer uses this to drive choices and validation, replacing the
     /// TS-side `GOOSE_EFFORT_CANONICAL_VALUES` duplicate. When non-null, the

@@ -5,7 +5,8 @@
 //! in the parent.
 
 use super::runtime_metadata::{
-    KnownAcpRuntime, BUZZ_AGENT_EFFORT_VALUES, GOOSE_EFFORT_NORMALIZATION,
+    KnownAcpRuntime, BUZZ_AGENT_EFFORT_VALUES, CLAUDE_CODE_EFFORT_VALUES,
+    GOOSE_EFFORT_NORMALIZATION,
 };
 use super::{BUZZ_AGENT_AVATAR_URL, CLAUDE_CODE_AVATAR_URL, CODEX_AVATAR_URL, GOOSE_AVATAR_URL};
 
@@ -72,9 +73,9 @@ pub(crate) const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
         config_file_path: Some("~/.claude/settings.json"),
         config_file_format: Some("json"),
         supports_acp_native_config: false,
-        thinking_env_var: None,
-        effort_normalization: None, // claude: canonical routes through BUZZ_ACP_EFFORT_LEVEL (ACP startup)
-        effort_accepted_values: None, // claude: adapter accepts any value over BUZZ_ACP_EFFORT_LEVEL
+        thinking_env_var: Some("CLAUDE_CODE_EFFORT_LEVEL"),
+        effort_normalization: None, // Claude values are distinct; validation-only contract below.
+        effort_accepted_values: Some(CLAUDE_CODE_EFFORT_VALUES),
         max_tokens_env_var: None,
         context_limit_env_var: None,
         max_rounds_env_var: None,

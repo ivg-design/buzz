@@ -4,12 +4,13 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use super::{
     agent_readiness, append_log_marker, current_instance_id, find_managed_agent_mut,
-    load_global_agent_config, load_managed_agents, load_personas, managed_agent_runtime_log_path,
-    process_is_running, record_agent_command, resolve_effective_agent_env, save_managed_agents,
-    spawn_agent_child, spawn_agent_child_with_harness_descriptor, terminate_process,
-    terminate_untracked_pair_runtime, write_agent_runtime_receipt, AgentReadiness, BackendKind,
-    ManagedAgentPairRuntime, ManagedAgentRuntimeKey, ManagedAgentRuntimeLifecycle,
-    ManagedAgentRuntimeReceipt, ManagedAgentRuntimeStatus,
+    load_global_agent_config, load_managed_agents, load_personas, managed_agent_runtime_is_paused,
+    managed_agent_runtime_log_path, pause_managed_agent_runtime, process_is_running,
+    record_agent_command, resolve_effective_agent_env, resume_managed_agent_runtime,
+    save_managed_agents, spawn_agent_child, spawn_agent_child_with_harness_descriptor,
+    terminate_process, terminate_untracked_pair_runtime, write_agent_runtime_receipt,
+    AgentReadiness, BackendKind, ManagedAgentPairRuntime, ManagedAgentRuntimeKey,
+    ManagedAgentRuntimeLifecycle, ManagedAgentRuntimeReceipt, ManagedAgentRuntimeStatus,
 };
 use crate::app_state::AppState;
 

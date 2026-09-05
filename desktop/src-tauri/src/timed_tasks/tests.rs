@@ -345,7 +345,7 @@ fn saved_destination_and_mentions_retain_prompt_and_timing_without_setup_deliver
     assert!(event
         .tags
         .iter()
-        .any(|t| t.as_slice() == ["e", &task.thread_id, "", "root"]));
+        .any(|t| t.as_slice() == ["e", &task.thread_id, "", "reply"]));
     restored.input.post_to_channel = true;
     restored.input.thread_root_id = None;
     let channel_event = events::occurrence(&restored, "second", &owner).unwrap();

@@ -75,6 +75,20 @@ pub enum TerminalDisposition {
     },
 }
 
+/// Accept an optional single Markdown JSON fence without weakening scope or
+/// duplicate-key validation. Multiple objects/fences remain invalid JSON.
+pub(super) fn terminal_json_text(text: &str) -> &str {
+    let text = text.trim();
+    let unfenced = text
+        .strip_prefix("```json\n")
+        .or_else(|| text.strip_prefix("```JSON\n"))
+        .or_else(|| text.strip_prefix("```\n"));
+    unfenced
+        .and_then(|body| body.trim_end().strip_suffix("```"))
+        .map(str::trim)
+        .unwrap_or(text)
+}
+
 /// Parse one exact, scope-bound terminal envelope from the assistant's final text.
 pub fn parse_terminal_outcome(
     text: Option<String>,
@@ -102,7 +116,7 @@ pub fn parse_terminal_outcome_with_report(
         message: "Worker did not return one valid scope-bound buzz.job-outcome.v1 envelope".into(),
     };
     let Some(text) = text else { return fallback() };
-    let Ok(unique) = serde_json::from_str::<NoDuplicateValue>(text.trim()) else {
+    let Ok(unique) = serde_json::from_str::<NoDuplicateValue>(terminal_json_text(&text)) else {
         return fallback();
     };
     let Ok(envelope) = serde_json::from_value::<OutcomeEnvelope>(unique.0) else {
@@ -950,5 +964,49 @@ mod tests {
                     if code == "invalid_terminal_envelope"
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod fenced_outcome_regression {
+    use super::*;
+    #[test]
+    fn fenced_r06_report_finalizes_with_confirmed_evidence_and_exact_scope() {
+        let operation = "603b97c8-d3dc-4663-91d9-bf6a4cb37b65";
+        let request = "c09bbd869eaa7a46ead554021a23f2c9897f2745b585b242bbee2f931206b87c";
+        let digest = "f082b8c67d0e9d3d943ab368579f4071609f1492a45d22748b0763c739e1a777";
+        let report = "d".repeat(64);
+        let value = serde_json::json!({"schema_version":OUTCOME_SCHEMA,"operation_id":operation,"request_event_id":request,"scope_digest":digest,"outcome":"success","summary":"R06 source review complete; local changes require reconciliation.","artifacts":[{"note":"Source inspection","file_refs":["src/native.rs"]},format!("git:{}","a".repeat(40))],"evidence":[format!("buzz:event:{}","b".repeat(64)),{"searches":["native isolation"]}]});
+        let text = format!("```json\n{value}\n```");
+        assert!(matches!(
+            parse_terminal_outcome_with_report(
+                Some(text.clone()),
+                operation,
+                request,
+                digest,
+                Some(&report)
+            ),
+            TerminalDisposition::Success { .. }
+        ));
+        assert!(matches!(
+            parse_terminal_outcome_with_report(
+                Some(text.clone()),
+                operation,
+                request,
+                "wrong",
+                Some(&report)
+            ),
+            TerminalDisposition::Indeterminate { .. }
+        ));
+        assert!(matches!(
+            parse_terminal_outcome(Some(text.clone()), operation, request, digest),
+            TerminalDisposition::Indeterminate { .. }
+        ));
+        let human =
+            super::super::human_report::HumanJobReport::from_turn_output(Some(&text), Some(&text))
+                .unwrap();
+        assert!(human.content().contains("Source inspection"));
+        assert!(!human.content().contains("schema_version"));
+        assert!(!human.content().contains("```"));
     }
 }

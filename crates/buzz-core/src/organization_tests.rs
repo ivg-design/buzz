@@ -642,3 +642,32 @@ fn incremental_ancestry_is_atomic_and_new_replies_inherit_moved_subtree_policy()
         Some(&[][..])
     );
 }
+
+#[test]
+fn legacy_job_and_forum_entries_can_be_hidden_restored_and_grouped() {
+    let channel = Uuid::new_v4();
+    let root = message(channel, None);
+    for kind in [43001, 43002, 43003, 43004, 43005, 43006, 45001, 45003] {
+        let source = EventBuilder::new(Kind::Custom(kind), "{\"legacy\":true}")
+            .tags([Tag::parse(["h", &channel.to_string()]).unwrap()])
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let original = source.as_json();
+        for hidden in [true, false] {
+            let operation = change(
+                channel,
+                OrganizationAction::Hide {
+                    message_ids: vec![source.id.to_hex()],
+                    hidden,
+                },
+            );
+            assert!(validate_references(&operation, &[source.clone()]).is_ok());
+        }
+        assert!(validate_references(
+            &grouping(channel, &source, &root),
+            &[source.clone(), root.clone()]
+        )
+        .is_ok());
+        assert_eq!(source.as_json(), original);
+    }
+}

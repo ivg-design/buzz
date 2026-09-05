@@ -371,3 +371,15 @@ test("original grouped-root links retain their subtree and hidden reply links pr
     "deep-link reveal cannot undo a real deletion",
   );
 });
+
+
+test("legacy task JSON can be hidden and restored without changing its signed source", () => {
+  const legacy = { ...message(2), kind: 43001, content: '{"legacy":"raw task payload"}' };
+  const original = JSON.stringify(legacy);
+  const hidden = change(10, { type: "hide", message_ids: [legacy.id], hidden: true });
+  assert.ok(format([legacy]).some(m => m.id === legacy.id));
+  assert.ok(!format([legacy, hidden]).some(m => m.id === legacy.id));
+  const undo = change(11, { type: "undo", change_event_id: hidden.id });
+  assert.ok(format([legacy, hidden, undo]).some(m => m.id === legacy.id));
+  assert.equal(JSON.stringify(legacy), original);
+});

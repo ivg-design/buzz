@@ -134,3 +134,16 @@ fn effective_participant_result_distinguishes_unset_empty_and_undo() {
     assert_eq!(undone["configured"], false);
     assert_eq!(undone["agent_pubkeys"], serde_json::json!([]));
 }
+
+#[test]
+fn history_discovers_legacy_job_receipts_and_forum_entries() {
+    let filter = history_filter(uuid::Uuid::new_v4(), &params()).unwrap();
+    for kind in [
+        9, 40002, 45001, 45003, 43001, 43002, 43003, 43004, 43005, 43006,
+    ] {
+        assert!(filter["kinds"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!(kind)));
+    }
+}

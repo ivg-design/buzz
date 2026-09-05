@@ -1,4 +1,4 @@
-use super::outcome::prepare_human_report_text;
+use super::outcome::{prepare_human_report_text, terminal_json_text};
 
 /// Bounded worker-authored text suitable for the durable task conversation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,11 +56,14 @@ impl HumanJobReport {
 }
 
 fn looks_like_structured_payload(text: &str) -> bool {
-    matches!(text.trim_start().chars().next(), Some('{') | Some('['))
+    matches!(
+        terminal_json_text(text).chars().next(),
+        Some('{') | Some('[')
+    ) || text.contains("buzz.job-outcome.v1")
 }
 
 fn render_terminal_candidate(candidate: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(candidate).ok()?;
+    let value: serde_json::Value = serde_json::from_str(terminal_json_text(candidate)).ok()?;
     let object = value.as_object()?;
     let mut sections = Vec::new();
     if let Some(summary) = object

@@ -1,5 +1,6 @@
 //! Trusted, typed relay operations kept outside the model shell boundary.
 
+mod channels;
 mod chat;
 mod credentials;
 mod git;

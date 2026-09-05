@@ -282,6 +282,17 @@ impl TrustedRelay {
             .await
     }
 
+    /// Sign only an SDK-built channel command; the relay enforces operator rights.
+    pub(super) async fn publish_channel_command(
+        &self,
+        builder: EventBuilder,
+        cancellation: &CancellationToken,
+    ) -> Result<PublishedEvent, String> {
+        self.fresh_context(cancellation).await?;
+        self.submit(self.sign(builder)?, PublishClass::Channel, cancellation)
+            .await
+    }
+
     pub(super) fn bound_chat_channel(&self) -> Result<uuid::Uuid, String> {
         self.current_chat_destination().map(|(channel, _)| channel)
     }
@@ -661,6 +672,7 @@ enum PublishClass {
     ModelJob,
     Chat,
     Organization,
+    Channel,
 }
 
 impl PublishClass {
@@ -669,6 +681,7 @@ impl PublishClass {
             Self::ModelJob => matches!(kind, 43001 | 43005),
             Self::Chat => kind == buzz_core::kind::KIND_STREAM_MESSAGE,
             Self::Organization => kind == buzz_core::kind::KIND_CONVERSATION_ORGANIZATION,
+            Self::Channel => matches!(kind, 9000 | 9001 | 9002 | 9007 | 9021 | 9022),
         }
     }
 }

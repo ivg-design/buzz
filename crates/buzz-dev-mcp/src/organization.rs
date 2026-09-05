@@ -89,7 +89,7 @@ pub enum OrganizationActionInput {
         /// Verified enrolled agent public keys. An empty list removes all agents.
         agent_pubkeys: Vec<String>,
     },
-    /// Hide clutter or restore previously hidden messages and replies.
+    /// Archive/hide or restore chat, forum and legacy A2A entries and their replies.
     Hide {
         message_ids: Vec<String>,
         hidden: bool,
@@ -151,7 +151,7 @@ pub async fn organization_apply(
             .query_signed_events(
                 vec![serde_json::json!({
                     "#h": [channel], "ids": change.references(),
-                    "kinds": [9,40002,45001,45003,buzz_core::kind::KIND_CONVERSATION_ORGANIZATION],
+                    "kinds": organization::ORGANIZABLE_MESSAGE_KINDS.iter().copied().chain(std::iter::once(buzz_core::kind::KIND_CONVERSATION_ORGANIZATION)).collect::<Vec<_>>(),
                     "limit": change.references().len(),
                 })],
                 &cancellation,
@@ -201,7 +201,7 @@ async fn read(
     let mut filters = vec![filter];
     if let Some(root) = params.thread_root_id.as_deref() {
         filters.push(serde_json::json!({
-            "#h": [channel], "ids": [root], "kinds": [9,40002,45001,45003], "limit": 1,
+            "#h": [channel], "ids": [root], "kinds": organization::ORGANIZABLE_MESSAGE_KINDS, "limit": 1,
         }));
     }
     let mut events = relay.query_signed_events(filters, cancellation).await?;
@@ -388,7 +388,7 @@ fn history_filter(
         "kinds": if params.source == OrganizationHistorySource::Changes {
             vec![buzz_core::kind::KIND_CONVERSATION_ORGANIZATION]
         } else {
-            vec![9,40002,45001,45003]
+            organization::ORGANIZABLE_MESSAGE_KINDS.to_vec()
         },
         "limit": params.limit + 1,
     });

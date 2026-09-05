@@ -325,7 +325,7 @@ pub async fn validate_admin_event(
     let channel_id =
         extract_h_tag_channel(event).ok_or_else(|| anyhow::anyhow!("missing or invalid h tag"))?;
 
-    let actor_bytes = event.pubkey.to_bytes().to_vec();
+    let actor_bytes = super::channel_operator::actor(tenant, state, channel_id, event).await?;
 
     // Reject mutations on archived channels — except kind:9002 with archived=false
     // (unarchive), which must be allowed through so the channel can be restored.
@@ -1314,7 +1314,7 @@ async fn handle_put_user(
             .unwrap_or(MemberRole::Member),
     };
 
-    let actor_bytes = event.pubkey.to_bytes().to_vec();
+    let actor_bytes = super::channel_operator::actor(tenant, state, channel_id, event).await?;
 
     state
         .db
@@ -1372,7 +1372,7 @@ async fn handle_remove_user(
     let channel_id =
         extract_h_tag_channel(event).ok_or_else(|| anyhow::anyhow!("missing h tag"))?;
     let target_pubkey = extract_p_tag(event).ok_or_else(|| anyhow::anyhow!("missing p tag"))?;
-    let actor_bytes = event.pubkey.to_bytes().to_vec();
+    let actor_bytes = super::channel_operator::actor(tenant, state, channel_id, event).await?;
 
     // Guard: prevent last-owner orphaning on self-removal (kind 9001).
     if target_pubkey == actor_bytes {
@@ -1440,8 +1440,8 @@ async fn handle_edit_metadata(
 ) -> anyhow::Result<()> {
     let channel_id =
         extract_h_tag_channel(event).ok_or_else(|| anyhow::anyhow!("missing h tag"))?;
-    let actor_bytes = event.pubkey.to_bytes().to_vec();
-    let actor_hex = hex::encode(&actor_bytes);
+    let actor_bytes = super::channel_operator::actor(tenant, state, channel_id, event).await?;
+    let actor_hex = event.pubkey.to_hex();
 
     for tag in event.tags.iter() {
         let key = tag.kind().to_string();

@@ -8,7 +8,7 @@
 
 # Nemo workspace workflow
 
-Protocol: `NEMO-A2A-1`. Skill version: `1.5.0`.
+Protocol: `NEMO-A2A-1`. Skill version: `1.5.1`.
 
 This is the shared working contract for Codex and Claude in Nemo. In Nemo's dedicated
 Buzz community, every enrolled collaborator's managed agents participate in the Nemo
@@ -148,3 +148,10 @@ promptly. Do not silently retry unchanged configuration failures, fabricate succ
 credentials, or reconstruct raw signing/relay requests. Use the trusted Buzz tools for
 chat and coordination. Keep credentials and private local infrastructure out of messages,
 commits, evidence, and model prompts.
+
+
+## Conversation administration and worker visibility
+
+Use `buzz_channel_read` and `buzz_channel_apply` for channel discovery, creation, metadata, archive/restore and membership administration on request. `buzz_organization_read` includes legacy A2A task entries and forum content; `buzz_organization_apply` groups, titles, summarizes, hides/restores and undoes organization without deleting signed originals. Preserve active task discussions while hiding historical payload clutter.
+
+Independent `buzz_a2a_dispatch` calls default to separate visible threads, preserving the initiating conversation for result delivery. Worker updates and peer questions/answers belong there. Do not override the thread with the orchestrator's parent root for independent jobs. Peer presence is live connectivity, not proof of spare capacity. Human replies remain visible; replies from the managing owner are sent to the exact active worker through native steering, with a visible delivery receipt. If a provider cannot accept a correction mid-turn, the receipt says so and the worker is not silently cancelled or replayed.

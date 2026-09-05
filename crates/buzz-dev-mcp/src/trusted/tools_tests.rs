@@ -138,7 +138,7 @@ async fn dispatch_captures_the_current_conversation_origin_automatically() {
 }
 
 #[test]
-fn task_conversation_defaults_to_current_thread_and_explicit_timeline_starts_fresh() {
+fn delegated_jobs_create_separate_visible_threads_and_keep_explicit_destinations() {
     let (_harness, relay) = managed_nemo_relay_without_github_login();
     let channel = "3580ca9b-47b4-4af9-b22a-1068778f26c6";
     let root = "a".repeat(64);
@@ -147,7 +147,7 @@ fn task_conversation_defaults_to_current_thread_and_explicit_timeline_starts_fre
     let defaults = managed_dispatch_params(Some("default-thread"));
     assert_eq!(
         requested_task_conversation(&relay, &defaults).unwrap(),
-        (channel.into(), Some(root.clone()))
+        (channel.into(), None)
     );
 
     let mut timeline = managed_dispatch_params(Some("new-task-thread"));

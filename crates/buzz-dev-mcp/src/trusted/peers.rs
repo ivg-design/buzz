@@ -333,3 +333,36 @@ fn tags_named<'a>(event: &'a Event, name: &'a str) -> impl Iterator<Item = &'a [
 #[cfg(test)]
 #[path = "peers_tests.rs"]
 mod tests;
+
+/// Attach a fresh relay-signed presence snapshot; unknown remains distinct from offline.
+pub(super) async fn with_presence(
+    relay: &TrustedRelay,
+    peers: &[VerifiedPeer],
+    cancellation: &CancellationToken,
+) -> Result<Vec<serde_json::Value>, String> {
+    if peers.is_empty() {
+        return Ok(vec![]);
+    }
+    let signer = relay.relay_signer_pubkey(cancellation).await?;
+    let events = relay.query_signed_events(vec![serde_json::json!({"kinds":[40902],"authors":peers.iter().map(|p| &p.pubkey).collect::<Vec<_>>()})], cancellation).await?;
+    let mut presence = HashMap::new();
+    for event in events {
+        let subjects = event
+            .tags
+            .iter()
+            .filter(|t| t.as_slice().first().is_some_and(|v| v == "p"))
+            .collect::<Vec<_>>();
+        let subject = subjects.first().and_then(|t| t.as_slice().get(1));
+        if event.pubkey.to_hex() != signer
+            || event.kind.as_u16() != 20001
+            || subjects.len() != 1
+            || !subject.is_some_and(|s| peers.iter().any(|p| &p.pubkey == s))
+        {
+            return Err("invalid relay presence snapshot".into());
+        }
+        if let Some(subject) = subject {
+            presence.insert(subject.clone(), event.content);
+        }
+    }
+    Ok(peers.iter().map(|peer| serde_json::json!({"name":peer.name,"pubkey":peer.pubkey,"presence":presence.get(&peer.pubkey).map(String::as_str).unwrap_or("offline"),"workload":"unknown"})).collect())
+}

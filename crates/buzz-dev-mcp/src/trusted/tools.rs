@@ -28,8 +28,8 @@ pub struct A2aDispatchParams {
     /// channel and thread automatically.
     #[serde(default)]
     pub origin: Option<A2aDispatchOrigin>,
-    /// Optional task discussion destination. Omit to reuse the current thread,
-    /// or create a visible task root when called from a channel timeline.
+    /// Optional task discussion destination. Omit to create a separate visible
+    /// task thread for this operation, retaining the current thread as origin.
     #[serde(default)]
     pub conversation: Option<A2aDispatchConversation>,
     pub summary: String,
@@ -173,7 +173,14 @@ pub async fn peers(
             if let Some(name) = name {
                 peers.retain(|peer| peer.name.eq_ignore_ascii_case(name));
             }
-            json_result(&serde_json::json!({"peers": peers}))
+            match super::peers::with_presence(relay, &peers, &cancellation).await {
+                Ok(peers) => json_result(
+                    &serde_json::json!({"peers": peers, "presence_note": "Fresh relay presence; online does not mean idle. Check active assignments before dispatch."}),
+                ),
+                Err(error) => json_result(
+                    &serde_json::json!({"peers": peers.iter().map(|p| serde_json::json!({"name":p.name,"pubkey":p.pubkey,"presence":"unknown","workload":"unknown"})).collect::<Vec<_>>(), "presence_error":error}),
+                ),
+            }
         }
         Err(error) => error_result(error),
     }
@@ -359,7 +366,7 @@ fn requested_task_conversation(
     relay: &TrustedRelay,
     params: &A2aDispatchParams,
 ) -> Result<(String, Option<String>), String> {
-    let (current_channel, current_thread_root) = relay.current_chat_destination_parts()?;
+    let (current_channel, _) = relay.current_chat_destination_parts()?;
     let current_channel = current_channel.as_deref();
     match &params.conversation {
         Some(requested) => {
@@ -373,7 +380,7 @@ fn requested_task_conversation(
         None => {
             let channel = current_channel
                 .ok_or_else(|| "task conversation requires a Buzz channel".to_owned())?;
-            Ok((channel.to_owned(), current_thread_root))
+            Ok((channel.to_owned(), None))
         }
     }
 }

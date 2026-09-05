@@ -7,6 +7,7 @@ mod config;
 mod engram_fetch;
 mod filter;
 mod job_completion;
+mod job_feedback;
 mod job_notifications;
 mod job_receiver;
 mod job_runtime;
@@ -4405,6 +4406,13 @@ async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
                             // launched by the same human). Allowlist adds the
                             // explicit pubkey list on top, for external people;
                             // it never revokes same-owner team bots.
+                            // Owner-authored replies to a unique active job belong to
+                            // that worker, not a second ordinary thread session.
+                            let active_job_feedback = if kind_u32 == KIND_STREAM_MESSAGE
+                                && owner_cache.get().is_some_and(|owner| *owner == buzz_event.event.pubkey.to_hex()) {
+                                job_feedback::target(&job_emitters, buzz_event.channel_id, &buzz_event.event)
+                                    .map(|(scope, emitter)| (scope.clone(), emitter.clone(), buzz_event.event.clone()))
+                            } else { None };
                             let Some(authorized_event) = authorize_normal_listener_event(
                                 &mut author_gate_ctx,
                                 buzz_event,
@@ -4418,6 +4426,10 @@ async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
                             else {
                                 continue;
                             };
+                            if let Some((scope, emitter, event)) = active_job_feedback {
+                                job_feedback::deliver(&mut pool, &scope, &emitter, &event);
+                                continue;
+                            }
                             let Some(mut ingress) =
                                 AuthorizedNormalListenerEvent(authorized_event)
                                     .match_subscription(

@@ -247,12 +247,24 @@ pub fn event_channel(event: &Event) -> Result<Uuid, String> {
     Ok(channel)
 }
 
-/// Supported original message kinds; routing/job/tool events are not clutter.
+/// Visible conversation entries eligible for reversible organization.
+/// Job receipts remain immutable protocol evidence even when hidden from chat.
+pub const ORGANIZABLE_MESSAGE_KINDS: &[u32] = &[
+    KIND_STREAM_MESSAGE,
+    KIND_STREAM_MESSAGE_V2,
+    KIND_FORUM_POST,
+    KIND_FORUM_COMMENT,
+    43001,
+    43002,
+    43003,
+    43004,
+    43005,
+    43006,
+];
+
+/// Whether this event can be organized without changing its original semantics.
 pub fn is_organizable_message(event: &Event) -> bool {
-    matches!(
-        event_kind_u32(event),
-        KIND_STREAM_MESSAGE | KIND_STREAM_MESSAGE_V2 | KIND_FORUM_POST | KIND_FORUM_COMMENT
-    )
+    ORGANIZABLE_MESSAGE_KINDS.contains(&event_kind_u32(event))
 }
 
 /// Validate resolved references without mutating them. Reads must come from the

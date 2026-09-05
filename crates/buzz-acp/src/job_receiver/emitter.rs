@@ -311,6 +311,11 @@ impl JobEmitter {
         }
     }
 
+    /// Visible conversation bound to this active worker's signed request.
+    pub(crate) fn conversation(&self) -> Option<&buzz_core::job::JobConversation> {
+        self.common.conversation.as_ref()
+    }
+
     pub fn scope_digest(&self) -> &str {
         &self.scope_digest
     }

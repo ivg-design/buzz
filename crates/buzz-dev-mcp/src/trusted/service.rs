@@ -299,8 +299,38 @@ impl TrustedSessionMcp {
     }
 
     #[tool(
+        name = "buzz_channel_read",
+        description = "List accessible channels including archived channels, or read one channel and its members. Use returned channel IDs for administration."
+    )]
+    async fn buzz_channel_read(
+        &self,
+        Parameters(params): Parameters<super::channels::ChannelReadParams>,
+        context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let cancellation = combine_cancellation(&self.session_cancellation, context.ct);
+        let result = super::channels::read(&self.relay, params, cancellation.clone()).await;
+        cancellation.cancel();
+        Ok(result)
+    }
+
+    #[tool(
+        name = "buzz_channel_apply",
+        description = "Administer a channel on user request: create stream/forum, rename/update, archive/restore, topic/purpose, join/leave, add/remove members or change roles. Uses existing authenticated relay authority. For threads, forum entries and raw A2A clutter use buzz_organization_apply hide/group/metadata/undo."
+    )]
+    async fn buzz_channel_apply(
+        &self,
+        Parameters(params): Parameters<super::channels::ChannelApplyParams>,
+        context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let cancellation = combine_cancellation(&self.session_cancellation, context.ct);
+        let result = super::channels::apply(&self.relay, params, cancellation.clone()).await;
+        cancellation.cancel();
+        Ok(result)
+    }
+
+    #[tool(
         name = "buzz_organization_read",
-        description = "Read or search a bounded page of signed conversation history or reversible organization changes, and optionally return the effective persistent agent participants for one thread."
+        description = "Read or search a bounded page of signed chat, forum and legacy A2A task history or reversible organization changes, and optionally return the effective persistent agent participants for one thread."
     )]
     async fn buzz_organization_read(
         &self,
@@ -315,7 +345,7 @@ impl TrustedSessionMcp {
 
     #[tool(
         name = "buzz_organization_apply",
-        description = "Apply one user-requested reversible grouping, metadata, participant-list, visibility, or undo change while preserving the original signed messages. A participants action supplies the complete desired enrolled-agent list."
+        description = "Apply one user-requested reversible grouping, metadata, participant-list, archive/hide/restore (including legacy A2A JSON and forum entries), or undo change while preserving the original signed messages. A participants action supplies the complete desired enrolled-agent list."
     )]
     async fn buzz_organization_apply(
         &self,

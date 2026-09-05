@@ -254,6 +254,8 @@ mod tool_inventory_tests {
                     "buzz_peer_ask",
                     "buzz_peer_wait",
                     "buzz_peer_reply",
+                    "buzz_channel_read",
+                    "buzz_channel_apply",
                     "buzz_organization_read",
                     "buzz_organization_apply",
                     "buzz_private_media_get",

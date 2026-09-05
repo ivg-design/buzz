@@ -47,6 +47,7 @@ enum OutcomeEnvelope {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminalDisposition {
     Success {
+        summary: String,
         candidate_sha: Option<String>,
         artifacts: Vec<String>,
         evidence: Vec<String>,
@@ -114,10 +115,8 @@ pub fn parse_terminal_outcome(
                 <= MAX_TOTAL_REFERENCE_BYTES
             && (!artifacts.is_empty() || !evidence.is_empty()) =>
         {
-            // The v1 relay result schema has no summary field. Requiring and
-            // validating it still proves the worker made an explicit terminal
-            // assertion; only inert protocol evidence is published.
             TerminalDisposition::Success {
+                summary,
                 candidate_sha,
                 artifacts,
                 evidence,
@@ -390,7 +389,8 @@ mod tests {
                 &request,
                 &"c".repeat(64)
             ),
-            TerminalDisposition::Success { .. }
+            TerminalDisposition::Success { summary, .. }
+                if summary == "Implemented and verified"
         ));
         for invalid in [
             "ordinary agent response".into(),
@@ -488,6 +488,15 @@ mod tests {
             ))
             .collect::<Vec<_>>());
         invalid.push(oversized_total.to_string());
+
+        let mut secret_summary: serde_json::Value =
+            serde_json::from_str(&success(operation, &request)).expect("base outcome");
+        secret_summary["summary"] = "authorization: Bearer abcdefghijkl".into();
+        invalid.push(secret_summary.to_string());
+        let mut oversized_summary: serde_json::Value =
+            serde_json::from_str(&success(operation, &request)).expect("base outcome");
+        oversized_summary["summary"] = "x".repeat(MAX_SUMMARY_BYTES + 1).into();
+        invalid.push(oversized_summary.to_string());
 
         for text in invalid {
             assert!(matches!(

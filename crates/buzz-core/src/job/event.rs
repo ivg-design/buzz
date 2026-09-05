@@ -217,6 +217,9 @@ impl JobEvent {
             Self::Result(body) => {
                 validate_followup(event, &body.followup)?;
                 require_prior(&body.followup, "result")?;
+                if let Some(summary) = &body.summary {
+                    validate_text("summary", summary, MAX_MESSAGE_BYTES)?;
+                }
                 if let Some(sha) = &body.candidate_sha {
                     validate_hex("candidate_sha", sha, &[40, 64])?;
                 }

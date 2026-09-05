@@ -298,6 +298,7 @@ impl JobFixture {
                 prior_event_id: Some(prior.id.to_hex()),
             },
             outcome: JobSuccessOutcome::Success,
+            summary: None,
             candidate_sha: None,
             artifacts: vec![],
             evidence: vec![],

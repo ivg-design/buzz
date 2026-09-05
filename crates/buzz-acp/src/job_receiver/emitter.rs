@@ -191,6 +191,7 @@ impl JobEmitter {
 
     pub async fn complete(
         &self,
+        summary: String,
         candidate_sha: Option<String>,
         artifacts: Vec<String>,
         evidence: Vec<String>,
@@ -199,6 +200,7 @@ impl JobEmitter {
             JobEvent::Result(JobResult {
                 followup,
                 outcome: JobSuccessOutcome::Success,
+                summary: Some(summary),
                 candidate_sha,
                 artifacts,
                 evidence,
@@ -266,10 +268,14 @@ impl JobEmitter {
     pub async fn terminal(&self, disposition: TerminalDisposition) -> Result<String, EmitError> {
         match disposition {
             TerminalDisposition::Success {
+                summary,
                 candidate_sha,
                 artifacts,
                 evidence,
-            } => self.complete(candidate_sha, artifacts, evidence).await,
+            } => {
+                self.complete(summary, candidate_sha, artifacts, evidence)
+                    .await
+            }
             TerminalDisposition::Failed {
                 code,
                 message,
@@ -403,7 +409,12 @@ mod tests {
                     && progress.message == "Worker prompt admitted"
         ));
         let result_id = emitter
-            .complete(None, vec![], vec![format!("git:{}", "a".repeat(40))])
+            .complete(
+                "Implemented and verified".into(),
+                None,
+                vec![],
+                vec![format!("git:{}", "a".repeat(40))],
+            )
             .await
             .expect("result");
         let event = published.recv().await.expect("published");
@@ -412,6 +423,7 @@ mod tests {
             JobEvent::parse(&event).expect("valid event"),
             JobEvent::Result(result)
                 if result.capabilities == ["rust"]
+                    && result.summary.as_deref() == Some("Implemented and verified")
                     && result.followup.prior_event_id.as_deref() == Some(progress_id.as_str())
         ));
         assert!(emitter.is_terminal().await.expect("terminal snapshot"));

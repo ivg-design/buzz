@@ -140,7 +140,7 @@ pub(in crate::job) fn validate_wire_keys(kind: u32, raw: &Value) -> Result<(), J
         }
         KIND_JOB_RESULT => {
             required.extend(["request_event_id", "outcome", "artifacts", "evidence"]);
-            optional.extend(["prior_event_id", "candidate_sha", "capabilities"]);
+            optional.extend(["prior_event_id", "summary", "candidate_sha", "capabilities"]);
         }
         KIND_JOB_CANCEL => {
             required.extend(["request_event_id", "action", "reason"]);

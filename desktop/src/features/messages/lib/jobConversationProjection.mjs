@@ -97,11 +97,15 @@ function progressBody(payload) {
 
 function resultBody(payload) {
   if (payload.outcome !== "success") return null;
+  const hasSummary = Object.hasOwn(payload, "summary");
+  const summary = hasSummary ? nonEmptyString(payload.summary) : null;
   const artifacts = stringList(payload.artifacts);
   const evidence = stringList(payload.evidence);
-  if (artifacts === null || evidence === null) return null;
+  if ((hasSummary && !summary) || artifacts === null || evidence === null)
+    return null;
   return joinSections(
     "Completed successfully.",
+    summary,
     bulletSection("Artifacts", artifacts),
     bulletSection("Evidence", evidence),
   );

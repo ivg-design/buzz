@@ -100,6 +100,7 @@ fn applied_git_effect_never_preserves_a_retryable_failure() {
 #[test]
 fn applied_git_effect_preserves_success_and_nonretryable_failure() {
     let success = TerminalDisposition::Success {
+        summary: "Completed requested work".into(),
         candidate_sha: Some("1".repeat(40)),
         artifacts: vec!["git:1111111111111111111111111111111111111111".into()],
         evidence: Vec::new(),

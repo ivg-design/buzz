@@ -178,6 +178,9 @@ pub struct JobResult {
     pub followup: JobFollowup,
     /// Must be `success`; relay delivery alone never implies this outcome.
     pub outcome: JobSuccessOutcome,
+    /// Bounded human-readable result summary. Absent on earlier v1 events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
     /// Candidate commit SHA, if the work produced one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub candidate_sha: Option<String>,

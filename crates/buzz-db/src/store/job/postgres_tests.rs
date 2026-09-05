@@ -132,6 +132,7 @@ fn job_sequence(requester: &Keys, worker: &Keys, channel_id: Uuid) -> Vec<(JobEv
     let result_job = JobEvent::Result(JobResult {
         followup: followup(Some(progress.id.to_hex())),
         outcome: JobSuccessOutcome::Success,
+        summary: None,
         candidate_sha: Some("b".repeat(40)),
         artifacts: vec!["crates/buzz-db/src/store/job.rs".into()],
         evidence: vec!["cargo:test".into()],

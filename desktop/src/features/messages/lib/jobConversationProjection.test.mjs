@@ -99,11 +99,12 @@ test("projects every signed job lifecycle kind into human-readable conversation 
     [
       followup(43004, "3".repeat(64), {
         outcome: "success",
+        summary: "The reconnect path preserves the provider session.",
         candidate_sha: "9".repeat(40),
         artifacts: ["Review notes attached"],
         evidence: ["Focused tests passed"],
       }),
-      "Completed successfully.\n\nArtifacts:\n- Review notes attached\n\nEvidence:\n- Focused tests passed",
+      "Completed successfully.\n\nThe reconnect path preserves the provider session.\n\nArtifacts:\n- Review notes attached\n\nEvidence:\n- Focused tests passed",
     ],
     [
       followup(43005, "4".repeat(64), {
@@ -195,7 +196,12 @@ test("renders the request in the channel and real agent updates in its one task 
   const result = followup(
     43004,
     "d".repeat(64),
-    { outcome: "success", artifacts: [], evidence: ["contract:tests-pass"] },
+    {
+      outcome: "success",
+      summary: "The provider session resumed without replaying the prompt.",
+      artifacts: [],
+      evidence: ["contract:tests-pass"],
+    },
     [
       ["e", REQUEST_ID, "", "root"],
       ["e", progress.id, "", "reply"],
@@ -289,6 +295,11 @@ test("renders the request in the channel and real agent updates in its one task 
     thread.visibleReplies.map((entry) => entry.message.id),
     [accepted.id, progress.id, result.id],
   );
+  assert.equal(
+    thread.visibleReplies.at(-1)?.message.body,
+    "Completed successfully.\n\nThe provider session resumed without replaying the prompt.\n\nEvidence:\n- contract:tests-pass",
+  );
+  assert.equal(thread.visibleReplies.at(-1)?.message.author, "Clauditron");
 });
 
 test("deduplicates reconnect deliveries without inventing another task or update", () => {

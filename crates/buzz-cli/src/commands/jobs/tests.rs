@@ -125,6 +125,7 @@ fn chain() -> Vec<Event> {
             prior_event_id: Some(progress.id.to_hex()),
         },
         outcome: JobSuccessOutcome::Success,
+        summary: None,
         candidate_sha: Some("b".repeat(40)),
         artifacts: vec![format!("git:{}", "b".repeat(40))],
         evidence: vec!["contract:unit".into()],

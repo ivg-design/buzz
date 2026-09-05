@@ -156,13 +156,29 @@ for (const scope of ["definition", "instance", "global", "onboarding"]) {
     assert.equal(effort.render, "control");
     assert.equal(effort.value, "xhigh");
     assert.deepEqual(effort.currentPersistence, {
-      kind: "envVar", key: "CLAUDE_CODE_EFFORT_LEVEL",
+      kind: "envVar",
+      key: "CLAUDE_CODE_EFFORT_LEVEL",
     });
     assert.deepEqual(effort.targetApplication, effort.currentPersistence);
     assert.deepEqual(structuredEnvKeys([effort]), ["CLAUDE_CODE_EFFORT_LEVEL"]);
     assert.deepEqual(model.omissions, []);
   });
 }
+
+test("Claude descriptor matches backend precedence for mixed-case saved effort keys", () => {
+  const model = deriveAgentConfigFieldModel({
+    config: {
+      ...config,
+      env_vars: {
+        claude_code_effort_level: "low",
+        CLAUDE_CODE_EFFORT_LEVEL: "max",
+      },
+    },
+    runtime: runtime("claude", { thinkingEnvVar: "CLAUDE_CODE_EFFORT_LEVEL" }),
+    scope: "instance",
+  });
+  assert.equal(field(model, "effort").value, "low");
+});
 
 // Per-agent scopes (definition/instance) intentionally keep Goose effort on the
 // generic legacy BUZZ_AGENT_THINKING_EFFORT row until PR 2.7 migrates Goose —

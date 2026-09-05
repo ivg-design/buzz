@@ -3,6 +3,7 @@ import type {
   GlobalAgentConfig,
 } from "@/shared/api/types";
 import { BUZZ_AGENT_THINKING_EFFORT } from "../ui/buzzAgentConfig";
+import { readAgentEnvCaseInsensitive } from "./agentEnvironment";
 
 /**
  * Lifecycle status of the ACP runtime catalog query on a per-agent surface.
@@ -222,7 +223,13 @@ export function deriveAgentConfigFieldModel({
       },
       targetApplication: { kind: "envVar", key: nativeKey },
       render: "control",
-      value: valueFromEnv(config, persistenceKey),
+      value:
+        runtime.id === "claude"
+          ? readAgentEnvCaseInsensitive(
+              config.env_vars,
+              persistenceKey,
+            )?.trim() || null
+          : valueFromEnv(config, persistenceKey),
     });
   } else if (runtime?.id === "claude") {
     fields.push({

@@ -491,6 +491,8 @@ pub const KIND_STREAM_MESSAGE_SCHEDULED: u32 = 40006;
 pub const KIND_STREAM_REMINDER: u32 = 40007;
 /// A diff/patch message showing file changes (unified diff format).
 pub const KIND_STREAM_MESSAGE_DIFF: u32 = 40008;
+/// Reversible channel organization overlays; original signed messages remain intact.
+pub const KIND_CONVERSATION_ORGANIZATION: u32 = 40009;
 /// Canvas (shared document) for a channel.
 pub const KIND_CANVAS: u32 = 40100;
 /// System message for channel state changes (join, leave, rename, etc.).
@@ -715,6 +717,7 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_STREAM_MESSAGE_SCHEDULED,
     KIND_STREAM_REMINDER,
     KIND_STREAM_MESSAGE_DIFF,
+    KIND_CONVERSATION_ORGANIZATION,
     KIND_CANVAS,
     KIND_SYSTEM_MESSAGE,
     KIND_CHANNEL_SUMMARY,

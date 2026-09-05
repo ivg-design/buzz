@@ -65,8 +65,7 @@ pub(crate) fn login_probe(
     if let Some(path) = augmented_path {
         command.env("PATH", path);
     }
-    if let Err(stderr_excerpt) =
-        crate::managed_agents::configure_runtime_cli(&mut command, runtime)
+    if let Err(stderr_excerpt) = crate::managed_agents::configure_runtime_cli(&mut command, runtime)
     {
         return ProbeOutcome::ConfigInvalid { stderr_excerpt };
     }

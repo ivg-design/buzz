@@ -47,6 +47,7 @@ pub(crate) mod mesh_readiness;
 mod messages;
 mod notifications;
 mod observer_archive;
+pub mod organization;
 mod os_idle;
 pub mod pairing;
 mod personas;

@@ -13,7 +13,7 @@ pub(super) use body::{
 pub(crate) use body::{validate_project_address, validate_repository};
 pub(super) use primitives::{
     validate_event_id, validate_hex, validate_list, validate_machine_token, validate_pubkey,
-    validate_text,
+    validate_text, validate_uuid,
 };
 pub(super) use references::validate_inert_references;
 #[cfg(test)]

@@ -452,24 +452,35 @@ export function buildMainTimelineEntries(
   return messages
     .filter(
       (message) =>
-        message.parentId == null || isBroadcastReply(message.tags ?? []),
+        message.parentId == null ||
+        (!message.organizationMoved && isBroadcastReply(message.tags ?? [])),
     )
     .map((message) => {
       const relaySummary = relaySummaries.get(message.id);
+      const summary =
+        message.kind === KIND_HUDDLE_STARTED
+          ? null
+          : mergeThreadSummaries(
+              buildSummaryForDirectReplies(
+                message.id,
+                descendantStatsByMessageId,
+              ),
+              relaySummary
+                ? buildRelayThreadSummary(message.id, relaySummary, profiles)
+                : null,
+            );
       return {
         message,
         summary:
-          message.kind === KIND_HUDDLE_STARTED
-            ? null
-            : mergeThreadSummaries(
-                buildSummaryForDirectReplies(
-                  message.id,
-                  descendantStatsByMessageId,
-                ),
-                relaySummary
-                  ? buildRelayThreadSummary(message.id, relaySummary, profiles)
-                  : null,
-              ),
+          summary ??
+          (message.taskThread
+            ? {
+                threadHeadId: message.id,
+                replyCount: 0,
+                lastReplyAt: null,
+                participants: [],
+              }
+            : null),
       };
     });
 }

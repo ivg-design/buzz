@@ -47,6 +47,7 @@ mod templates;
 mod terminal_runtime;
 #[cfg_attr(not(test), allow(dead_code))]
 mod terminal_transport;
+mod timed_tasks;
 #[cfg(target_os = "macos")]
 mod tray_menu;
 mod unread_catch_up;
@@ -234,6 +235,7 @@ pub fn run() {
         .manage(native_relay_client::NativeRelayClient::default())
         .manage(observed_unread::ObservedUnreadStore::default())
         .manage(channel_head_cache::ChannelHeadCacheStore::default())
+        .manage(timed_tasks::TimedTasksState::default())
         .setup(move |app| {
             let app_handle = app.handle().clone();
             if let Ok(resource_dir) = app_handle.path().resource_dir() {
@@ -521,9 +523,17 @@ pub fn run() {
                     }
                 });
             }
+            if let Err(error) = timed_tasks::start(app.handle()) {
+                tracing::error!(%error, "timed task storage initialization failed");
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            timed_tasks::timed_tasks_list,
+            timed_tasks::timed_tasks_create,
+            timed_tasks::timed_tasks_update,
+            timed_tasks::timed_tasks_set_status,
+            commands::organization::apply_conversation_organization,
             terminal_runtime::terminal_attach,
             terminal_runtime::terminal_detach,
             terminal_runtime::terminal_close,

@@ -1,3 +1,5 @@
+import { OrganizationThreadIntro } from "@/features/messages/organization/OrganizationHistory";
+import type { ThreadMetadata } from "@/features/messages/organization/projection";
 import { ArrowLeft, MessageSquare } from "lucide-react";
 import * as React from "react";
 
@@ -25,6 +27,8 @@ import { ForumComposer } from "./ForumComposer";
 
 type ForumThreadPanelProps = {
   thread: ForumThreadResponse | undefined;
+  organizationMetadata?: ThreadMetadata;
+  organizationSourceView?: boolean;
   isLoading: boolean;
   isSendingReply: boolean;
   channelId: string;
@@ -142,6 +146,8 @@ function ReplyRow({
 }
 
 export function ForumThreadPanel({
+  organizationMetadata,
+  organizationSourceView,
   thread,
   isLoading,
   isSendingReply,
@@ -249,6 +255,13 @@ export function ForumThreadPanel({
           )}
           data-forum-event-id={post.eventId}
         >
+          <OrganizationThreadIntro metadata={organizationMetadata} />
+          {organizationSourceView ? (
+            <p className="mb-2 text-xs text-muted-foreground">
+              Original thread · view or restore its organization changes from
+              the history control.
+            </p>
+          ) : null}
           <div className="flex items-center gap-2">
             <UserProfilePopover
               pubkey={post.pubkey}

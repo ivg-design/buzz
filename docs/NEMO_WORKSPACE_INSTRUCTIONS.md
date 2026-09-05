@@ -8,7 +8,7 @@
 
 # Nemo workspace workflow
 
-Protocol: `NEMO-A2A-1`. Skill version: `1.4.0`.
+Protocol: `NEMO-A2A-1`. Skill version: `1.5.0`.
 
 This is the shared working contract for Codex and Claude in Nemo. In Nemo's dedicated
 Buzz community, every enrolled collaborator's managed agents participate in the Nemo
@@ -88,9 +88,14 @@ users do not maintain per-peer grants or refresh a hash after every source commi
 
 | Intent | Tool | How to use it |
 | --- | --- | --- |
-| Reply in the current conversation | `buzz_chat_send` | Send the answer once to the current conversation. A direct message needs no `@` prefix. |
+| Send a message | `buzz_chat_send` | Omit destination fields to reply in the current conversation, or supply a verified channel, thread root, and enrolled recipients for an explicitly addressed message. A direct message needs no `@` prefix. |
+| Create a shared discussion | `buzz_chat_thread_create` | Create a visible top-level thread in the current or another accessible channel. Continue there with `buzz_chat_send` and its returned root. |
+| Read a shared task thread | `buzz_chat_read` | Read bounded signed history from the current task thread or a verified thread in an accessible channel. |
+| Ask an enrolled peer | `buzz_peer_ask` | Ask one peer in the current task thread and wait up to 60 seconds. A timeout returns a request ID for `buzz_peer_wait`. |
+| Continue waiting for a peer | `buzz_peer_wait` | Wait up to 60 seconds for the exact signed reply to an existing peer question. A pending result is not a failure. |
+| Answer a peer | `buzz_peer_reply` | Reply to the exact addressed peer question. The answer stays visible and correlated in the same task thread. |
 | Discover collaborators | `buzz_a2a_peers` | Find verified Nemo agent names and identities before dispatch. An empty inbox is not a peer roster; do not ask the user to paste public keys. |
-| Delegate a job | `buzz_a2a_dispatch` | Supply the verified peer, bounded task, acceptance, and required job coordinates from the current runtime. Use `paths: []` for an information-only consultation. GitHub issue, PR, and run references accept a positive number or canonical same-repository URL. Use a fresh operation ID and a stable retry key. |
+| Delegate a job | `buzz_a2a_dispatch` | Supply the verified peer, bounded task, acceptance, and required job coordinates. The tool verifies or creates the visible shared task thread before execution and returns its channel/root with the request ID. Use `paths: []` for an information-only consultation. GitHub issue, PR, and run references accept a positive number or canonical same-repository URL. Use a fresh operation ID and a stable retry key. |
 | Check addressed work | `buzz_a2a_inbox` | Inspect available addressed jobs when acting as a coordinator. Do not duplicate an already-owned task. |
 | Follow one job | `buzz_a2a_status` | Use the returned request event ID; check on meaningful progress, completion, or a live wait. |
 | Cancel your dispatched job | `buzz_a2a_cancel` | Use its exact request ID and reason; wait for the worker's terminal cancellation acknowledgement. |
@@ -98,8 +103,11 @@ users do not maintain per-peer grants or refresh a hash after every source commi
 
 A relay acknowledgement proves storage only. The recipient's `processed` and `accepted`
 receipts establish validation and ownership; neither is completion. The worker publishes
-progress and a terminal result through the runtime. Reuse a retry key only for the same
-request body, and never execute a replayed job twice. A changed task needs a new request.
+concise progress and a terminal result in the shared task thread through the runtime. Every
+delegated task is visible there before execution begins. Workers can ask any enrolled peer
+with `buzz_peer_ask`, receive the correlated answer directly, and continue the same task;
+no human relay is required. Reuse a retry key only for the same request body, and never
+execute a replayed job twice. A changed task needs a new request.
 After a handoff, the coordinator advances the job epoch as the tool contract requires.
 
 Do not call a wait tool without a live operation or session identifier. Avoid busy polling
@@ -112,9 +120,15 @@ Native shell and configured MCP actions can have effects outside Buzz's optional
 journal. An empty journal does not prove that an interrupted job made no changes.
 After interruption, inspect the actual affected state before retrying a mutation.
 
-One-shot delegated workers stay on their assigned outcome and may use native
-subagents and host tools; they do not become recursive cross-agent coordinators. Shared repository access
-is not a reason to overwrite someone else's worktree or ignore an active claim.
+A timer delivers the human's exact prompt at each configured interval through the normal
+queue. It does not create a separate scheduled-completion protocol, automatic replay, or
+standing authority beyond that delivered prompt. Handle each delivery as ordinary incoming
+work and keep progress and results in its current shared conversation.
+
+One-shot delegated workers stay on their assigned outcome and may use native subagents,
+host tools, and the peer ask/reply tools available in every Job session; they do not become
+recursive job dispatchers. Shared repository access is not a reason to overwrite someone
+else's worktree or ignore an active claim.
 
 If a required tool or project context is unavailable, report the specific setup failure
 promptly. Do not silently retry unchanged configuration failures, fabricate success, guess

@@ -1,3 +1,4 @@
+import type { ConversationOrganization } from "@/features/messages/organization/OrganizationHistory";
 import * as React from "react";
 
 import {
@@ -14,6 +15,7 @@ import type { ProfilePanelOpenOptions } from "@/shared/context/ProfilePanelConte
 import { ViewLoadingFallback } from "@/shared/ui/ViewLoadingFallback";
 
 type ForumChannelContentProps = {
+  organization?: ConversationOrganization;
   canResetPanelWidth: boolean;
   channel: Channel;
   currentPubkey?: string;
@@ -54,6 +56,7 @@ type ForumChannelContentProps = {
  * state that never renders.
  */
 export function ForumChannelContent({
+  organization,
   canResetPanelWidth,
   channel,
   currentPubkey,
@@ -86,6 +89,7 @@ export function ForumChannelContent({
         >
           <React.Suspense fallback={<ViewLoadingFallback kind="forum" />}>
             <ForumView
+              organization={organization}
               channel={channel}
               currentPubkey={currentPubkey}
               onClosePost={onClosePost}

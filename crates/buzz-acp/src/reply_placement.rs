@@ -26,10 +26,10 @@ impl std::fmt::Display for ReplyPlacement {
 pub(crate) fn append_thread_instruction(prompt: &mut String, event_id: &str) {
     prompt.push_str(&format!(
         "\nIMPORTANT: For ordinary replies in this turn, use `buzz_chat_send`. \
-         Its trusted session scope fixes the reply destination. Trusted reply \
-         destination: thread root {event_id}. Do not supply or reconstruct it. \
-         If the human asks for a different destination, explain that this turn \
-         is scope-bound and ask the owner or operator to perform that action."
+         Trusted reply destination: thread root {event_id}. This is the default; for an explicitly requested different destination, use buzz_chat_thread_create \
+         when a new task needs its own thread, and buzz_chat_send with that returned \
+         root_event_id when explicitly addressing it. Keep this task and its peer \
+         questions and answers together; no human relay is needed."
     ));
 }
 
@@ -37,9 +37,8 @@ pub(crate) fn append_thread_instruction(prompt: &mut String, event_id: &str) {
 pub(crate) fn append_new_thread_instruction(prompt: &mut String, event_id: &str) {
     prompt.push_str(&format!(
         "\nIMPORTANT: This is a new top-level message. For ordinary replies in \
-         this turn, use `buzz_chat_send`. Its trusted session scope fixes the \
-         destination. Trusted reply destination: new thread root {event_id}. \
-         Do not supply or reconstruct it, and do not reply into an older thread."
+         this turn, use `buzz_chat_send`. Trusted reply destination: new thread root {event_id}. \
+         This is the default. Use an explicit destination only when continuing work in another selected thread."
     ));
 }
 
@@ -49,9 +48,10 @@ pub(crate) fn append_timeline_instruction(prompt: &mut String) {
         "\nIMPORTANT: This is a top-level message. For ordinary replies \
          in this turn, use `buzz_chat_send`. Its trusted session scope places \
          the response directly in the current timeline. Trusted reply \
-         destination: current timeline. Do not supply or \
-         reconstruct a destination. If the human asks for a thread, explain \
-         that this turn is scope-bound and ask the owner or operator to start it.",
+         destination: current timeline. For a work assignment or requested new discussion, first create a task thread \
+         with buzz_chat_thread_create. Continue its progress, questions and results \
+         there using buzz_chat_send with the returned root_event_id. You can ask \
+         any enrolled teammate with buzz_peer_ask and receive the reply directly.",
     );
 }
 

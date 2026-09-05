@@ -14,8 +14,12 @@ fn test_relay() -> TrustedRelay {
         auth_tag_json: None,
         grants: super::super::GrantSet::default(),
         a2a_channel_id: None,
-        session_channel_id: None,
-        session_thread_root_id: std::sync::RwLock::new(None),
+        provider_channel_id: None,
+        provider_thread_root_id: None,
+        chat_destination: std::sync::RwLock::new(ChatDestination {
+            channel_id: None,
+            thread_root_id: None,
+        }),
         job_operation_id: None,
         job_request_event_id: None,
         session_working_directory: None,
@@ -41,8 +45,12 @@ fn owner_backed_relay() -> TrustedRelay {
         auth_tag_json: Some(auth_tag_json),
         grants: super::super::GrantSet::default(),
         a2a_channel_id: None,
-        session_channel_id: None,
-        session_thread_root_id: std::sync::RwLock::new(None),
+        provider_channel_id: None,
+        provider_thread_root_id: None,
+        chat_destination: std::sync::RwLock::new(ChatDestination {
+            channel_id: None,
+            thread_root_id: None,
+        }),
         job_operation_id: None,
         job_request_event_id: None,
         session_working_directory: None,
@@ -68,6 +76,7 @@ fn owner_backed_job_uses_http_authorization_without_an_envelope_auth_tag() {
                 address: format!("30621:{}:nemo", relay.owner_pubkey),
                 home_channel: "3580ca9b-47b4-4af9-b22a-1068778f26c6".into(),
             },
+            conversation: None,
             repository: JobRepository {
                 canonical: "https://github.com/mysteropodes/nemo".into(),
                 github_issue: None,
@@ -89,6 +98,8 @@ fn owner_backed_job_uses_http_authorization_without_an_envelope_auth_tag() {
                 .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         },
         capability: "workspace-file-smoke".into(),
+        title: None,
+        origin: None,
         summary: "Create, verify, and remove one temporary file.".into(),
         acceptance: vec!["The temporary file is absent after verification.".into()],
         supersedes_event_id: None,
@@ -136,6 +147,33 @@ fn model_publisher_kind_allowlist_is_exact() {
     }
     assert!(PublishClass::Chat.accepts(9));
     assert!(!PublishClass::Chat.accepts(40002));
+    assert!(PublishClass::Organization.accepts(40009));
+    assert!(!PublishClass::Organization.accepts(9));
+    assert!(!PublishClass::Organization.accepts(43001));
+}
+
+#[tokio::test]
+async fn organization_publisher_rejects_a_foreign_signer_before_transport() {
+    let relay = test_relay();
+    let foreign = nostr::Keys::generate();
+    let event = nostr::EventBuilder::new(
+        nostr::Kind::Custom(buzz_core::kind::KIND_CONVERSATION_ORGANIZATION as u16),
+        serde_json::json!({
+            "version": 1,
+            "action": {"type": "hide", "message_ids": ["a".repeat(64)], "hidden": true}
+        })
+        .to_string(),
+    )
+    .tags([nostr::Tag::parse(["h", "3580ca9b-47b4-4af9-b22a-1068778f26c6"]).unwrap()])
+    .sign_with_keys(&foreign)
+    .unwrap();
+
+    let error = relay
+        .publish_organization_event(event, &tokio_util::sync::CancellationToken::new())
+        .await
+        .err()
+        .expect("foreign signer");
+    assert!(error.contains("signer does not match"));
 }
 
 #[test]
@@ -208,7 +246,9 @@ fn chat_thread_destination_can_be_set_replaced_and_cleared() {
     let first = "a".repeat(64);
     let second = "b".repeat(64);
 
-    relay.set_chat_thread_root_id(Some(&first)).unwrap();
+    relay
+        .set_chat_destination(&channel.to_string(), Some(&first))
+        .unwrap();
     let first_event = relay
         .build_session_chat_event(channel, "first")
         .expect("first destination");
@@ -252,9 +292,34 @@ fn chat_thread_destination_can_be_set_replaced_and_cleared() {
         .iter()
         .all(|tag| tag.as_slice().get(1) == Some(&second)));
 
+    let replacement_channel = "0be7a777-728b-48d2-8164-d777f9046ec4";
+    relay
+        .set_chat_destination(replacement_channel, Some(&first))
+        .unwrap();
+    assert_eq!(
+        relay.bound_chat_channel().unwrap().to_string(),
+        replacement_channel
+    );
+    assert_eq!(relay.current_chat_thread_root().unwrap(), Some(first));
+
+    assert!(relay
+        .set_chat_destination("not-a-channel", Some(&second))
+        .is_err());
+    assert_eq!(
+        relay.bound_chat_channel().unwrap().to_string(),
+        replacement_channel
+    );
+    assert_eq!(
+        relay.current_chat_thread_root().unwrap(),
+        Some("a".repeat(64))
+    );
+
     relay.set_chat_thread_root_id(None).unwrap();
     let timeline = relay
-        .build_session_chat_event(channel, "timeline")
+        .build_session_chat_event(
+            uuid::Uuid::parse_str(replacement_channel).unwrap(),
+            "timeline",
+        )
         .expect("cleared destination");
     assert!(!timeline
         .tags

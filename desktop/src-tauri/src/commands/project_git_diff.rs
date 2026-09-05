@@ -22,11 +22,7 @@ struct DiffGit<'a> {
 }
 
 impl DiffGit<'_> {
-    fn run(
-        &mut self,
-        args: &[&str],
-        cwd: Option<&std::path::Path>,
-    ) -> Result<String, String> {
+    fn run(&mut self, args: &[&str], cwd: Option<&std::path::Path>) -> Result<String, String> {
         run_git_in_request(args, cwd, self.auth, self.budget)
     }
 }
@@ -74,17 +70,17 @@ fn fetch_target(
     if let Some(target_ref) = target_ref {
         if git
             .run(
-            &[
-                "fetch",
-                "--depth=100",
-                "--no-tags",
-                "--end-of-options",
-                "origin",
-                target_ref,
-            ],
-            Some(repo_dir),
-        )
-        .is_ok()
+                &[
+                    "fetch",
+                    "--depth=100",
+                    "--no-tags",
+                    "--end-of-options",
+                    "origin",
+                    target_ref,
+                ],
+                Some(repo_dir),
+            )
+            .is_ok()
         {
             git.run(
                 &["update-ref", "--no-deref", "HEAD", "FETCH_HEAD"],
@@ -95,17 +91,17 @@ fn fetch_target(
     } else if let Some(target_commit) = target_commit {
         if git
             .run(
-            &[
-                "fetch",
-                "--depth=100",
-                "--no-tags",
-                "--end-of-options",
-                "origin",
-                target_commit,
-            ],
-            Some(repo_dir),
-        )
-        .is_ok()
+                &[
+                    "fetch",
+                    "--depth=100",
+                    "--no-tags",
+                    "--end-of-options",
+                    "origin",
+                    target_commit,
+                ],
+                Some(repo_dir),
+            )
+            .is_ok()
         {
             git.run(
                 &["update-ref", "--no-deref", "HEAD", "FETCH_HEAD"],
@@ -118,17 +114,17 @@ fn fetch_target(
     if let Some(target_commit) = target_commit {
         if git
             .run(
-            &[
-                "fetch",
-                "--depth=100",
-                "--no-tags",
-                "--end-of-options",
-                "origin",
-                target_commit,
-            ],
-            Some(repo_dir),
-        )
-        .is_ok()
+                &[
+                    "fetch",
+                    "--depth=100",
+                    "--no-tags",
+                    "--end-of-options",
+                    "origin",
+                    target_commit,
+                ],
+                Some(repo_dir),
+            )
+            .is_ok()
         {
             git.run(
                 &["update-ref", "--no-deref", "HEAD", "FETCH_HEAD"],
@@ -221,11 +217,8 @@ fn parse_numstat(output: &str) -> Vec<(String, usize, usize)> {
 }
 
 fn empty_tree_ref(repo_dir: &std::path::Path, git: &mut DiffGit<'_>) -> Result<String, String> {
-    git.run(
-        &["hash-object", "-t", "tree", "/dev/null"],
-        Some(repo_dir),
-    )
-    .map(|output| output.trim().to_string())
+    git.run(&["hash-object", "-t", "tree", "/dev/null"], Some(repo_dir))
+        .map(|output| output.trim().to_string())
 }
 
 fn diff_range(
@@ -271,10 +264,10 @@ fn commit_parent_range(
     let parent = format!("{commit}^");
     if git
         .run(
-        &["rev-parse", "--verify", "--quiet", &parent],
-        Some(repo_dir),
-    )
-    .is_ok()
+            &["rev-parse", "--verify", "--quiet", &parent],
+            Some(repo_dir),
+        )
+        .is_ok()
     {
         return Ok(format!("{parent}..{commit}"));
     }
@@ -343,7 +336,7 @@ fn local_diff_range(
         if base_commit != target_ref && local_ref_exists(repo_dir, git, base_commit) {
             return if git
                 .run(&["merge-base", base_commit, &target_ref], Some(repo_dir))
-            .is_ok()
+                .is_ok()
             {
                 format!("{base_commit}...{target_ref}")
             } else {
@@ -354,7 +347,7 @@ fn local_diff_range(
     if let Some(base_ref) = local_base_ref(repo_dir, git, base_branch, target_branch) {
         return if git
             .run(&["merge-base", &base_ref, &target_ref], Some(repo_dir))
-        .is_ok()
+            .is_ok()
         {
             format!("{base_ref}...{target_ref}")
         } else {

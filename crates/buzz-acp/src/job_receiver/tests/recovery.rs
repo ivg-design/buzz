@@ -420,8 +420,47 @@ async fn accepted_job_reaches_provider_with_conversation_recovery_enabled() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind context query fixture");
-    let context_url = format!("http://{}", listener.local_addr().unwrap());
-    let router = axum::Router::new().fallback(|| async { axum::Json(serde_json::json!([])) });
+    let context_host = listener.local_addr().unwrap().to_string();
+    let context_url = format!("http://{context_host}");
+    let context_document = AuthenticatedContext {
+        schema_version: "buzz.context.v1".into(),
+        community_id: tenant.community_id.clone(),
+        host: context_host,
+        pubkey: worker.public_key().to_hex(),
+    };
+    let queried_request = request_event.clone();
+    let queried_request_id = request_event.id.to_hex();
+    let router = axum::Router::new()
+        .route(
+            "/api/context",
+            axum::routing::get(move || {
+                let context = context_document.clone();
+                async move { axum::Json(context) }
+            }),
+        )
+        .route(
+            "/query",
+            axum::routing::post(move |axum::Json(filters): axum::Json<serde_json::Value>| {
+                let request = queried_request.clone();
+                let request_id = queried_request_id.clone();
+                async move {
+                    let requests_exact_job =
+                        filters.as_array().into_iter().flatten().any(|filter| {
+                            filter
+                                .get("ids")
+                                .and_then(serde_json::Value::as_array)
+                                .is_some_and(|ids| {
+                                    ids.iter().any(|id| id.as_str() == Some(&request_id))
+                                })
+                        });
+                    axum::Json(if requests_exact_job {
+                        serde_json::json!([request])
+                    } else {
+                        serde_json::json!([])
+                    })
+                }
+            }),
+        );
     let context_server = tokio::spawn(async move {
         axum::serve(listener, router)
             .await
@@ -448,6 +487,17 @@ async fn accepted_job_reaches_provider_with_conversation_recovery_enabled() {
         cancelled_events: vec![],
         cancel_reason: None,
     };
+    let trusted_grants = format!(
+        r#"{{"version":1,"grants":[{{"project_address":"{}","home_channel":"{}","repository":"{}","requester_pubkeys":["{}"],"capabilities":["rust"],"git_operations":[],"path_prefixes":["src"],"base_sha":"{}","branch":"{}","worktree_id":"{}","checkout_root":{}}}]}}"#,
+        request.common.project.address,
+        request.common.project.home_channel,
+        request.common.repository.canonical,
+        request.common.sender_pubkey,
+        request.common.repository.base_sha,
+        request.common.repository.branch,
+        request.common.repository.worktree_id,
+        serde_json::to_string(&dispatch.checkout_root).expect("trusted checkout path JSON"),
+    );
 
     for (provider, full_mode, capture_name) in [
         (
@@ -463,11 +513,11 @@ async fn accepted_job_reaches_provider_with_conversation_recovery_enabled() {
     ] {
         let identity = buzz_dev_mcp::HarnessTrustedIdentity::new(
             &dispatch.checkout_root,
-            rest.base_url.clone(),
+            context_url.clone(),
             worker.clone(),
             None,
             Some(worker_sponsor.github_login.clone()),
-            None,
+            Some(trusted_grants.clone()),
             None,
             true,
         )

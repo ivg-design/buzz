@@ -1,7 +1,7 @@
 ---
 name: nemo-a2a
 description: Coordinate Nemo work through trusted Buzz chat and A2A tools using the shared repository workflow.
-version: 1.4.0
+version: 1.5.0
 ---
 
 # Nemo A2A

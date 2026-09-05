@@ -15,7 +15,8 @@ use super::validation::{
     github_repository_tag, make_tag, require_prior, validate_allowed_tags, validate_common,
     validate_event_id, validate_exact_tag, validate_followup, validate_hex,
     validate_inert_references, validate_list, validate_machine_token, validate_no_secret_material,
-    validate_optional_exact_tag, validate_pubkey, validate_text, validate_wire_keys, UniqueValue,
+    validate_optional_exact_tag, validate_pubkey, validate_text, validate_uuid, validate_wire_keys,
+    UniqueValue,
 };
 use super::{MAX_MESSAGE_BYTES, MAX_SHORT_TEXT_BYTES};
 
@@ -129,6 +130,10 @@ impl JobEvent {
         validate_exact_tag(event, "i", &common.operation_id)?;
         validate_exact_tag(event, "k", &common.idempotency_key)?;
         validate_exact_tag(event, "a", &common.project.address)?;
+        if let Some(conversation) = &common.conversation {
+            validate_uuid("conversation.channel_id", &conversation.channel_id)?;
+            validate_event_id("conversation.thread_root_id", &conversation.thread_root_id)?;
+        }
         let repository_tag = github_repository_tag(&common.repository.canonical)?;
         validate_exact_tag(event, "github-repository", &repository_tag)?;
         validate_optional_exact_tag(
@@ -166,6 +171,21 @@ impl JobEvent {
                     }
                 }
                 validate_text("capability", &body.capability, MAX_SHORT_TEXT_BYTES)?;
+                if let Some(title) = &body.title {
+                    validate_text("title", title, MAX_SHORT_TEXT_BYTES)?;
+                }
+                if let Some(origin) = &body.origin {
+                    validate_uuid("origin.channel_id", &origin.channel_id)?;
+                    if let Some(thread_root_id) = &origin.thread_root_id {
+                        validate_event_id("origin.thread_root_id", thread_root_id)?;
+                    }
+                    if let Some(session_channel_id) = &origin.session_channel_id {
+                        validate_uuid("origin.session_channel_id", session_channel_id)?;
+                    }
+                    if let Some(session_thread_root_id) = &origin.session_thread_root_id {
+                        validate_event_id("origin.session_thread_root_id", session_thread_root_id)?;
+                    }
+                }
                 validate_text("summary", &body.summary, MAX_MESSAGE_BYTES)?;
                 validate_list("acceptance", &body.acceptance, true)?;
             }

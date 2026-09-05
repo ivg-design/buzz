@@ -1,3 +1,8 @@
+import {
+  OrganizationThreadIntro,
+  type ConversationOrganization,
+} from "@/features/messages/organization/OrganizationHistory";
+import { projectForumOrganization } from "@/features/messages/organization/forumProjection";
 import { MessageSquareText } from "lucide-react";
 import * as React from "react";
 
@@ -24,6 +29,7 @@ import { ForumPostCard } from "./ForumPostCard";
 import { ForumThreadPanel } from "./ForumThreadPanel";
 
 type ForumViewProps = {
+  organization?: ConversationOrganization;
   channel: Channel;
   currentPubkey?: string;
   onClosePost: () => void;
@@ -43,6 +49,7 @@ function canDelete(postPubkey: string, currentPubkey?: string): boolean {
 }
 
 export function ForumView({
+  organization,
   channel,
   currentPubkey,
   onClosePost,
@@ -70,7 +77,30 @@ export function ForumView({
     selectedPostId,
   );
 
-  const posts = postsQuery.data?.posts ?? [];
+  const organizationState = organization?.state;
+  const organizationSources = organization?.supplementalEvents;
+  const organized = React.useMemo(
+    () =>
+      organizationState
+        ? projectForumOrganization(
+            postsQuery.data?.posts ?? [],
+            threadQuery.data,
+            organizationSources ?? [],
+            organizationState,
+            channel.id,
+            selectedPostId,
+          )
+        : { posts: postsQuery.data?.posts ?? [], thread: threadQuery.data },
+    [
+      postsQuery.data,
+      threadQuery.data,
+      organizationSources,
+      organizationState,
+      channel.id,
+      selectedPostId,
+    ],
+  );
+  const posts = organized.posts;
 
   // Collect all pubkeys from posts and thread for profile resolution.
   // Mentioned pubkeys (`p`/`mention` tags) must be included too: mention
@@ -130,7 +160,7 @@ export function ForumView({
   }, [channel.id]);
 
   if (selectedPostId) {
-    const threadPost = threadQuery.data?.post;
+    const threadPost = organized.thread?.post;
     const canDeleteExpandedPost = threadPost
       ? canDelete(threadPost.pubkey, effectiveCurrentPubkey)
       : false;
@@ -163,7 +193,15 @@ export function ForumView({
         targetEventId={targetReplyId}
         targetSearchMessageId={targetSearchMessageId}
         targetSearchQuery={targetSearchQuery}
-        thread={threadQuery.data}
+        organizationMetadata={
+          selectedPostId
+            ? organization?.state.metadata.get(selectedPostId)
+            : undefined
+        }
+        organizationSourceView={
+          "originalView" in organized && organized.originalView === true
+        }
+        thread={organized.thread}
       />
     );
   }
@@ -237,6 +275,9 @@ export function ForumView({
             items={posts}
             renderItem={(post) => (
               <div className="pb-3">
+                <OrganizationThreadIntro
+                  metadata={organization?.state.metadata.get(post.eventId)}
+                />
                 <ForumPostCard
                   canDelete={canDelete(post.pubkey, effectiveCurrentPubkey)}
                   currentPubkey={effectiveCurrentPubkey}

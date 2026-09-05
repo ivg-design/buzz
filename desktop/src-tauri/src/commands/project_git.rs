@@ -287,9 +287,10 @@ fn snapshot_from_repo(
     .map_err(|error| format!("read latest repository commit: {error}"))?;
     let latest_commit = parse_latest_commit(&latest_commit_output)
         .ok_or_else(|| "Latest repository commit metadata was malformed.".to_string())?;
-    let branch_activity_range = if let (Some(branch_name), Some(base_branch)) =
-        (branch_name.map(normalize_branch_name), base_branch.map(normalize_branch_name))
-    {
+    let branch_activity_range = if let (Some(branch_name), Some(base_branch)) = (
+        branch_name.map(normalize_branch_name),
+        base_branch.map(normalize_branch_name),
+    ) {
         if !branch_name.is_empty() && !base_branch.is_empty() && branch_name != base_branch {
             let remote_base_ref = format!("refs/remotes/origin/{base_branch}");
             run_git_in_request(
@@ -348,14 +349,9 @@ fn snapshot_from_repo(
     )
     .map(|output| parse_latest_commit_by_path(&output))
     .map_err(|error| format!("read repository path history: {error}"))?;
-    let files = run_git_in_request(
-        &["ls-tree", "-r", "HEAD"],
-        Some(repo_dir),
-        auth,
-        budget,
-    )
-    .map(|output| parse_ls_tree(&output, &latest_commit_by_path))
-    .map_err(|error| format!("read repository file tree: {error}"))?;
+    let files = run_git_in_request(&["ls-tree", "-r", "HEAD"], Some(repo_dir), auth, budget)
+        .map(|output| parse_ls_tree(&output, &latest_commit_by_path))
+        .map_err(|error| format!("read repository file tree: {error}"))?;
 
     Ok(ProjectRepoSnapshotInfo {
         latest_commit: Some(latest_commit),
@@ -395,25 +391,25 @@ fn snapshot_from_worktree(
         auth,
     )
     .is_ok();
-    let latest_commit = if has_commit {
-        let output = run_git(
-            &[
-                "log",
-                "-1",
-                "--format=%H%x00%h%x00%an%x00%ae%x00%at%x00%s",
-                treeish,
-            ],
-            Some(repo_dir),
-            auth,
-        )
-        .map_err(|error| format!("read latest local repository commit: {error}"))?;
-        Some(
-            parse_latest_commit(&output)
-                .ok_or_else(|| "Latest local repository commit metadata was malformed.".to_string())?,
-        )
-    } else {
-        None
-    };
+    let latest_commit =
+        if has_commit {
+            let output = run_git(
+                &[
+                    "log",
+                    "-1",
+                    "--format=%H%x00%h%x00%an%x00%ae%x00%at%x00%s",
+                    treeish,
+                ],
+                Some(repo_dir),
+                auth,
+            )
+            .map_err(|error| format!("read latest local repository commit: {error}"))?;
+            Some(parse_latest_commit(&output).ok_or_else(|| {
+                "Latest local repository commit metadata was malformed.".to_string()
+            })?)
+        } else {
+            None
+        };
     let branch_activity_range =
         branch_activity_range(repo_dir, auth, branch_name, base_branch, treeish);
     let branch_activity_ref = branch_activity_range.as_deref().unwrap_or(treeish);

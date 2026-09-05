@@ -231,9 +231,7 @@ fn configure_git_auth(command: &mut Command, auth: &GitAuthConfig, needs_credent
     // removing the indexed values keeps them unavailable to any child helper.
     for (key, _) in std::env::vars_os() {
         let key_text = key.to_string_lossy();
-        if key_text.starts_with("GIT_CONFIG_KEY_")
-            || key_text.starts_with("GIT_CONFIG_VALUE_")
-        {
+        if key_text.starts_with("GIT_CONFIG_KEY_") || key_text.starts_with("GIT_CONFIG_VALUE_") {
             command.env_remove(key);
         }
     }
@@ -347,7 +345,10 @@ pub(crate) fn ensure_safe_local_network_config(
         auth,
     )
     .map_err(|error| format!("validate local checkout config: {error}"))?;
-    let fields = output.split('\0').filter(|field| !field.is_empty()).collect::<Vec<_>>();
+    let fields = output
+        .split('\0')
+        .filter(|field| !field.is_empty())
+        .collect::<Vec<_>>();
     if fields.len() % 3 != 0 {
         return Err("Local checkout config metadata was malformed.".to_string());
     }
@@ -833,8 +834,7 @@ mod tests {
         let remote_path = remote.to_str().expect("remote path is utf-8");
         let checkout_path = checkout.to_str().expect("checkout path is utf-8");
 
-        run_git(&["init", "--bare", "--", remote_path], None, &auth)
-            .expect("initialize remote");
+        run_git(&["init", "--bare", "--", remote_path], None, &auth).expect("initialize remote");
         run_git(&["init", "--", checkout_path], None, &auth).expect("initialize checkout");
         run_git(
             &["remote", "add", "origin", remote_path],
@@ -888,10 +888,13 @@ mod tests {
         auth.git_path = "/bin/sh".into();
         let script = format!("head -c {} /dev/zero", GIT_CAPTURE_LIMIT_BYTES + 8192);
 
-        let error = run_git(&["-c", &script], None, &auth)
-            .expect_err("over-limit git output must fail");
+        let error =
+            run_git(&["-c", &script], None, &auth).expect_err("over-limit git output must fail");
 
         assert!(error.contains("output exceeded"), "{error}");
-        assert!(error.contains(&GIT_CAPTURE_LIMIT_BYTES.to_string()), "{error}");
+        assert!(
+            error.contains(&GIT_CAPTURE_LIMIT_BYTES.to_string()),
+            "{error}"
+        );
     }
 }

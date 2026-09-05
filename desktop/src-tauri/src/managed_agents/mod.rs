@@ -11,10 +11,10 @@ pub(crate) use agent_env::{
 mod agent_description;
 pub(crate) use agent_description::{effective_agent_description, record_effective_description};
 mod backend;
-mod bundled_claude_adapter;
-mod bundled_codex_manifest;
-pub(crate) mod bundled_codex_cli;
 pub(crate) mod bestie_assignment;
+mod bundled_claude_adapter;
+pub(crate) mod bundled_codex_cli;
+mod bundled_codex_manifest;
 pub(crate) mod claude_config;
 pub(crate) mod config_bridge;
 pub(crate) mod custom_harnesses;

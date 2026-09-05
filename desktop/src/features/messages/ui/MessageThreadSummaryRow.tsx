@@ -94,9 +94,16 @@ export function MessageThreadSummaryRow({
     THREAD_SUMMARY_SURFACE_AVATAR_INSET_REM,
   )})`;
   const replyLabel = summary.replyCount === 1 ? "reply" : "replies";
-  const summaryAriaLabel = summary.lastReplyAt
-    ? `View thread with ${summary.replyCount} ${replyLabel}, last reply ${formatThreadSummaryLastReplyTime(summary.lastReplyAt)}`
-    : `View thread with ${summary.replyCount} ${replyLabel}`;
+  const isTask = message.taskThread === true;
+  const summaryAriaLabel = isTask
+    ? summary.lastReplyAt
+      ? `Open task with ${summary.replyCount} ${replyLabel}, last reply ${formatThreadSummaryLastReplyTime(summary.lastReplyAt)}`
+      : summary.replyCount > 0
+        ? `Open task with ${summary.replyCount} ${replyLabel}`
+        : "Open task"
+    : summary.lastReplyAt
+      ? `View thread with ${summary.replyCount} ${replyLabel}, last reply ${formatThreadSummaryLastReplyTime(summary.lastReplyAt)}`
+      : `View thread with ${summary.replyCount} ${replyLabel}`;
   const guideDepths = depthGuideDepths
     ? [...depthGuideDepths]
     : Array.from({ length: Math.max(0, depth - 1) }, (_, index) => index + 1);
@@ -229,20 +236,24 @@ export function MessageThreadSummaryRow({
             right: 0,
           }}
         />
-        <div className="relative z-10 flex shrink-0 items-center">
-          {summary.participants.map((participant, index) => (
-            <ParticipantAvatar
-              index={index}
-              key={participant.id}
-              participant={participant}
-              participantCount={summary.participants.length}
-            />
-          ))}
-        </div>
+        {summary.participants.length > 0 ? (
+          <div className="relative z-10 flex shrink-0 items-center">
+            {summary.participants.map((participant, index) => (
+              <ParticipantAvatar
+                index={index}
+                key={participant.id}
+                participant={participant}
+                participantCount={summary.participants.length}
+              />
+            ))}
+          </div>
+        ) : null}
         <div className="relative z-10 min-w-0">
           <div>
             <span className="font-medium transition-colors group-hover:text-foreground">
-              {summary.replyCount} {replyLabel}
+              {isTask && summary.replyCount === 0
+                ? "Open task"
+                : `${summary.replyCount} ${replyLabel}`}
             </span>
             {unreadCount != null && unreadCount > 0 ? (
               <span className="ml-1" data-testid="thread-unread-badge">

@@ -1525,7 +1525,15 @@ async fn query_events_authed(
     let db = state.db.clone();
     let mut catchall_results = stream::iter(catchall_queries.into_iter().map(|(idx, query)| {
         let db = db.clone();
-        async move { (idx, db.query_events_routed("bridge_query", &query).await) }
+        async move {
+            let result = query_with_organization_consistency(
+                query.kinds.as_deref(),
+                db.query_events_for_event_write(&query),
+                db.query_events_routed("bridge_query", &query),
+            )
+            .await;
+            (idx, result)
+        }
     }))
     .buffered(crate::handlers::req::FILTER_QUERY_CONCURRENCY);
 
@@ -2578,11 +2586,58 @@ fn ban_json(b: &buzz_db::moderation::BanRecord) -> Value {
     })
 }
 
+/// Organization heads and undo references affect the next durable write. Read
+/// them from the writer so an acknowledged change cannot disappear behind a
+/// lagging display replica. Only the selected read future is polled.
+async fn query_with_organization_consistency<T>(
+    kinds: Option<&[i32]>,
+    writer: impl std::future::Future<Output = T>,
+    routed: impl std::future::Future<Output = T>,
+) -> T {
+    if kinds.is_some_and(|kinds| {
+        kinds.contains(&(buzz_core::kind::KIND_CONVERSATION_ORGANIZATION as i32))
+    }) {
+        writer.await
+    } else {
+        routed.await
+    }
+}
+
 #[cfg(test)]
 mod postgres_tests {
     use super::*;
     use nostr::{Alphabet, EventBuilder, Keys, Kind, SingleLetterTag, Tag};
     use std::sync::Mutex;
+
+    #[tokio::test]
+    async fn organization_reads_use_writer_including_mixed_undo_reference_queries() {
+        let organization = buzz_core::kind::KIND_CONVERSATION_ORGANIZATION as i32;
+        for kinds in [vec![organization], vec![9, 40002, organization]] {
+            // This is the same future-selection seam used by POST /query. A
+            // stale replica must not hide an acknowledged head or Undo target,
+            // and a writer error must not be masked as a successful stale read.
+            let result = query_with_organization_consistency(
+                Some(&kinds),
+                async { Err::<(), _>("writer unavailable") },
+                async { panic!("organization read polled the stale display path") },
+            )
+            .await;
+            assert_eq!(result, Err("writer unavailable"));
+        }
+    }
+
+    #[tokio::test]
+    async fn organization_consistency_keeps_unrelated_display_reads_routed() {
+        for kinds in [None, Some(vec![]), Some(vec![9, 40002])] {
+            let result = query_with_organization_consistency(
+                kinds.as_deref(),
+                async { panic!("ordinary display read unexpectedly used writer") },
+                async { "display result" },
+            )
+            .await;
+            assert_eq!(result, "display result");
+        }
+    }
 
     fn redis_pool() -> deadpool_redis::Pool {
         let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());

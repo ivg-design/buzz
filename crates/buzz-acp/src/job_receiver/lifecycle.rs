@@ -10,6 +10,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 const LIFECYCLE_VERSION: u32 = 3;
+const HUMAN_REPORT_VERSION: u32 = 1;
 
 #[derive(Debug, Error)]
 pub enum LifecycleError {
@@ -31,8 +32,21 @@ struct LifecycleState {
     head_event_id: String,
     outbox: Option<Event>,
     outbox_terminal: bool,
+    #[serde(default)]
+    outbox_machine_confirmed: bool,
+    #[serde(default)]
+    outbox_conversation_confirmed: bool,
     cancel_event_id: Option<String>,
     terminal: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HumanReportState {
+    version: u32,
+    request_event_id: String,
+    outbox: Option<Event>,
+    confirmed_event_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +75,18 @@ pub struct LifecycleStore {
     lock_path: PathBuf,
 }
 
+/// Independent durable outbox for the worker's human-facing chat report.
+///
+/// Report delivery is intentionally separate from the job lifecycle head: a
+/// retry may republish the exact signed chat event, but it must never replay
+/// the task or claim another lifecycle transition.
+#[derive(Debug, Clone)]
+pub struct HumanReportStore {
+    path: PathBuf,
+    lock_path: PathBuf,
+    request_event_id: String,
+}
+
 impl LifecycleStore {
     pub fn new(root: &Path, key: &str) -> Self {
         Self {
@@ -71,6 +97,14 @@ impl LifecycleStore {
 
     pub(super) fn privilege_lock_path(&self) -> PathBuf {
         self.lock_path.with_extension("privilege.lock")
+    }
+
+    pub fn human_report_store(&self, request_event_id: &str) -> HumanReportStore {
+        HumanReportStore {
+            path: self.path.with_extension("report.json"),
+            lock_path: self.lock_path.with_extension("report.lock"),
+            request_event_id: request_event_id.to_owned(),
+        }
     }
 
     pub async fn initialize(&self, accepted_event_id: String) -> Result<(), LifecycleError> {
@@ -128,7 +162,29 @@ impl LifecycleStore {
 
     pub async fn confirm(&self, event_id: String) -> Result<(), LifecycleError> {
         let store = self.clone();
-        tokio::task::spawn_blocking(move || store.confirm_blocking(&event_id)).await?
+        tokio::task::spawn_blocking(move || store.confirm_blocking(&event_id, false)).await?
+    }
+
+    /// Record acknowledgement of the deterministic ordinary-chat mirror.
+    pub async fn confirm_conversation(&self, event_id: String) -> Result<(), LifecycleError> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || store.confirm_blocking(&event_id, true)).await?
+    }
+
+    /// Frozen transition plus its independently durable delivery acknowledgements.
+    pub async fn pending_delivery(&self) -> Result<Option<(Event, bool, bool)>, LifecycleError> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let state = store.with_lock(|| store.read())?;
+            Ok(state.outbox.map(|event| {
+                (
+                    event,
+                    state.outbox_machine_confirmed,
+                    state.outbox_conversation_confirmed,
+                )
+            }))
+        })
+        .await?
     }
 
     pub async fn observe_cancel(
@@ -178,6 +234,8 @@ impl LifecycleStore {
                 head_event_id: accepted_event_id,
                 outbox: None,
                 outbox_terminal: false,
+                outbox_machine_confirmed: false,
+                outbox_conversation_confirmed: false,
                 cancel_event_id: None,
                 terminal: false,
             };
@@ -208,11 +266,13 @@ impl LifecycleStore {
             }
             state.outbox = Some(event);
             state.outbox_terminal = terminal;
+            state.outbox_machine_confirmed = false;
+            state.outbox_conversation_confirmed = false;
             replace_private(&self.path, &state)
         })
     }
 
-    fn confirm_blocking(&self, event_id: &str) -> Result<(), LifecycleError> {
+    fn confirm_blocking(&self, event_id: &str, conversation: bool) -> Result<(), LifecycleError> {
         self.with_lock(|| {
             let mut state = self.read()?;
             // Submission acknowledgement can race the background outbox retry
@@ -231,10 +291,25 @@ impl LifecycleStore {
                     "acknowledgement does not match the frozen lifecycle event".into(),
                 ));
             }
+            if conversation {
+                state.outbox_conversation_confirmed = true;
+            } else {
+                state.outbox_machine_confirmed = true;
+            }
+            let requires_conversation = buzz_core::job::JobEvent::parse(event)
+                .ok()
+                .is_some_and(|job| job.common().conversation.is_some());
+            if !state.outbox_machine_confirmed
+                || (requires_conversation && !state.outbox_conversation_confirmed)
+            {
+                return replace_private(&self.path, &state);
+            }
             state.head_event_id = event_id.into();
             state.outbox = None;
             state.terminal = state.outbox_terminal;
             state.outbox_terminal = false;
+            state.outbox_machine_confirmed = false;
+            state.outbox_conversation_confirmed = false;
             replace_private(&self.path, &state)
         })
     }
@@ -275,6 +350,8 @@ impl LifecycleStore {
             // outbox instead of retrying an impossible transition forever.
             state.outbox = None;
             state.outbox_terminal = false;
+            state.outbox_machine_confirmed = false;
+            state.outbox_conversation_confirmed = false;
             state.head_event_id = event_id.into();
             state.cancel_event_id = Some(event_id.into());
             replace_private(&self.path, &state)?;
@@ -306,6 +383,8 @@ impl LifecycleStore {
             }
             state.outbox = None;
             state.outbox_terminal = false;
+            state.outbox_machine_confirmed = false;
+            state.outbox_conversation_confirmed = false;
             state.cancel_event_id = None;
             state.head_event_id = event_id.into();
             state.terminal = true;
@@ -344,6 +423,154 @@ impl LifecycleStore {
         }
         Ok(state)
     }
+}
+
+impl HumanReportStore {
+    pub async fn snapshot(&self) -> Result<(Option<Event>, Option<String>), LifecycleError> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || store.snapshot_blocking()).await?
+    }
+
+    pub async fn stage(&self, event: Event) -> Result<(), LifecycleError> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || store.stage_blocking(event)).await?
+    }
+
+    pub async fn confirm(&self, event_id: String) -> Result<(), LifecycleError> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || store.confirm_blocking(&event_id)).await?
+    }
+
+    fn snapshot_blocking(&self) -> Result<(Option<Event>, Option<String>), LifecycleError> {
+        self.with_lock(|| {
+            if !self.path.exists() {
+                return Ok((None, None));
+            }
+            let state = self.read()?;
+            Ok((state.outbox, state.confirmed_event_id))
+        })
+    }
+
+    fn stage_blocking(&self, event: Event) -> Result<(), LifecycleError> {
+        self.with_lock(|| {
+            if self.path.exists() {
+                let state = self.read()?;
+                if state.confirmed_event_id.as_deref() == Some(event.id.to_hex().as_str())
+                    || state
+                        .outbox
+                        .as_ref()
+                        .is_some_and(|pending| pending.id == event.id)
+                {
+                    return Ok(());
+                }
+                return Err(LifecycleError::Invalid(
+                    "a different human report is already frozen or confirmed".into(),
+                ));
+            }
+            write_new_human_report(
+                &self.path,
+                &HumanReportState {
+                    version: HUMAN_REPORT_VERSION,
+                    request_event_id: self.request_event_id.clone(),
+                    outbox: Some(event),
+                    confirmed_event_id: None,
+                },
+            )
+        })
+    }
+
+    fn confirm_blocking(&self, event_id: &str) -> Result<(), LifecycleError> {
+        self.with_lock(|| {
+            let mut state = self.read()?;
+            if state.confirmed_event_id.as_deref() == Some(event_id) {
+                return Ok(());
+            }
+            let Some(event) = state.outbox.as_ref() else {
+                return Err(LifecycleError::Invalid(
+                    "human report outbox is empty".into(),
+                ));
+            };
+            if event.id.to_hex() != event_id {
+                return Err(LifecycleError::Invalid(
+                    "acknowledgement does not match the frozen human report".into(),
+                ));
+            }
+            state.outbox = None;
+            state.confirmed_event_id = Some(event_id.to_owned());
+            replace_private_human_report(&self.path, &state)
+        })
+    }
+
+    fn with_lock<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, LifecycleError>,
+    ) -> Result<T, LifecycleError> {
+        let parent = self
+            .lock_path
+            .parent()
+            .ok_or_else(|| LifecycleError::Invalid("report lock path has no parent".into()))?;
+        std::fs::create_dir_all(parent)?;
+        #[cfg(windows)]
+        let lock = super::windows_private::open_private_lock(&self.lock_path, true)?.0;
+        #[cfg(not(windows))]
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&self.lock_path)?;
+        fs2::FileExt::lock_exclusive(&lock)?;
+        let result = operation();
+        fs2::FileExt::unlock(&lock)?;
+        result
+    }
+
+    fn read(&self) -> Result<HumanReportState, LifecycleError> {
+        let state: HumanReportState = serde_json::from_slice(&read_private_bytes(&self.path)?)?;
+        if state.version != HUMAN_REPORT_VERSION || state.request_event_id != self.request_event_id
+        {
+            return Err(LifecycleError::Invalid(
+                "human report state does not match this request".into(),
+            ));
+        }
+        Ok(state)
+    }
+}
+
+fn write_new_human_report(path: &Path, state: &HumanReportState) -> Result<(), LifecycleError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| LifecycleError::Invalid("report path has no parent".into()))?;
+    let mut file = private_new(path)?;
+    file.write_all(&serde_json::to_vec(state)?)?;
+    file.sync_all()?;
+    sync_directory(parent)?;
+    Ok(())
+}
+
+fn replace_private_human_report(
+    path: &Path,
+    state: &HumanReportState,
+) -> Result<(), LifecycleError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| LifecycleError::Invalid("report path has no parent".into()))?;
+    let temporary = parent.join(format!(".report-{}.tmp", Uuid::new_v4()));
+    let result = (|| {
+        let mut file = private_new(&temporary)?;
+        file.write_all(&serde_json::to_vec(state)?)?;
+        file.sync_all()?;
+        #[cfg(windows)]
+        super::windows_private::replace_private_file(&temporary, path)?;
+        #[cfg(not(windows))]
+        std::fs::rename(&temporary, path)?;
+        sync_directory(parent)?;
+        Ok::<_, LifecycleError>(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(temporary);
+    }
+    result
 }
 
 fn write_new_or_validate(path: &Path, state: &LifecycleState) -> Result<(), LifecycleError> {
@@ -493,6 +720,60 @@ mod tests {
         assert!(pending.is_none());
         assert!(!terminal);
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn human_report_outbox_replays_exact_event_without_advancing_lifecycle() {
+        let root = tempfile::tempdir().expect("root");
+        let lifecycle = LifecycleStore::new(root.path(), "job");
+        lifecycle
+            .initialize("a".repeat(64))
+            .await
+            .expect("initialize");
+        let report = lifecycle.human_report_store(&"b".repeat(64));
+        let signed = event("human-readable report");
+        report.stage(signed.clone()).await.expect("stage report");
+
+        let reopened = LifecycleStore::new(root.path(), "job").human_report_store(&"b".repeat(64));
+        let (pending, confirmed) = reopened.snapshot().await.expect("snapshot");
+        assert_eq!(pending.expect("pending report").id, signed.id);
+        assert!(confirmed.is_none());
+        assert!(reopened.confirm("c".repeat(64)).await.is_err());
+        reopened
+            .confirm(signed.id.to_hex())
+            .await
+            .expect("confirm report");
+        reopened
+            .confirm(signed.id.to_hex())
+            .await
+            .expect("idempotent confirmation");
+        let (pending, confirmed) = reopened.snapshot().await.expect("confirmed snapshot");
+        assert!(pending.is_none());
+        assert_eq!(confirmed.as_deref(), Some(signed.id.to_hex().as_str()));
+
+        let (head, pending, terminal) = lifecycle.snapshot().await.expect("lifecycle unchanged");
+        assert_eq!(head, "a".repeat(64));
+        assert!(pending.is_none());
+        assert!(!terminal);
+    }
+
+    #[tokio::test]
+    async fn human_report_store_binds_request_and_one_signed_event() {
+        let root = tempfile::tempdir().expect("root");
+        let lifecycle = LifecycleStore::new(root.path(), "job");
+        let first = lifecycle.human_report_store(&"a".repeat(64));
+        let signed = event("first");
+        first.stage(signed.clone()).await.expect("stage first");
+        first
+            .stage(signed.clone())
+            .await
+            .expect("same frozen event is idempotent");
+        assert!(first.stage(event("different")).await.is_err());
+        assert!(lifecycle
+            .human_report_store(&"b".repeat(64))
+            .snapshot()
+            .await
+            .is_err());
     }
 
     #[tokio::test]

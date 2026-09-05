@@ -18,6 +18,7 @@ const MAX_GRANT_DOCUMENT_BYTES: u64 = 768 * 1024;
 const MAX_GIT_OUTPUT_BYTES: u64 = 64 * 1024;
 const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 const GIT_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+const GIT_WORKTREE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Error)]
 pub enum GrantError {
@@ -695,14 +696,12 @@ fn prepare_nemo_worktree(checkout: &NemoCheckout, request: &JobRequest) -> Resul
         .root
         .canonicalize()
         .map_err(|_| "the Nemo repository checkout is unavailable".to_owned())?;
-    checkout_config_is_safe(&source)
-        .ok_or_else(|| "the Nemo repository Git configuration is unsafe".to_owned())?;
     let top = PathBuf::from(
-        git_output(&source, &["rev-parse", "--show-toplevel"])
+        host_git_output(&source, &["rev-parse", "--show-toplevel"])
             .ok_or_else(|| "the Nemo repository root could not be verified".to_owned())?,
     );
     let origin = canonical_git_origin(
-        &git_output(&source, &["remote", "get-url", "origin"])
+        &host_git_output(&source, &["config", "--get", "remote.origin.url"])
             .ok_or_else(|| "the Nemo repository origin could not be verified".to_owned())?,
     )
     .ok_or_else(|| "the Nemo repository origin is not canonical".to_owned())?;
@@ -711,9 +710,9 @@ fn prepare_nemo_worktree(checkout: &NemoCheckout, request: &JobRequest) -> Resul
     }
 
     let commit_spec = format!("{}^{{commit}}", request.common.repository.base_sha);
-    let mut resolved = git_output(&source, &["rev-parse", "--verify", &commit_spec]);
+    let mut resolved = host_git_output(&source, &["rev-parse", "--verify", &commit_spec]);
     if resolved.as_deref() != Some(request.common.repository.base_sha.as_str()) {
-        let fetched = git_success_with_timeout(
+        let fetched = host_git_success_with_timeout(
             &source,
             &[
                 "fetch",
@@ -732,7 +731,7 @@ fn prepare_nemo_worktree(checkout: &NemoCheckout, request: &JobRequest) -> Resul
                     .into(),
             );
         }
-        resolved = git_output(&source, &["rev-parse", "--verify", &commit_spec]);
+        resolved = host_git_output(&source, &["rev-parse", "--verify", &commit_spec]);
     }
     if resolved.as_deref() != Some(request.common.repository.base_sha.as_str()) {
         return Err("the requested Nemo base commit is unavailable after fetch".into());
@@ -770,10 +769,10 @@ fn prepare_nemo_worktree(checkout: &NemoCheckout, request: &JobRequest) -> Resul
             let target_argument = git_worktree_path_argument(&target)
                 .ok_or_else(|| "the Nemo worktree path is not supported by Git".to_owned())?;
             let branch_ref = format!("refs/heads/{}", request.common.repository.branch);
-            let existing = git_output(&source, &["rev-parse", "--verify", &branch_ref]);
+            let existing = host_git_output(&source, &["rev-parse", "--verify", &branch_ref]);
             let added = match existing {
                 Some(value)
-                    if git_success(
+                    if host_git_success(
                         &source,
                         &[
                             "merge-base",
@@ -783,23 +782,20 @@ fn prepare_nemo_worktree(checkout: &NemoCheckout, request: &JobRequest) -> Resul
                         ],
                     ) =>
                 {
-                    git_success(
+                    host_git_success_with_timeout(
                         &source,
                         &[
-                            "-c",
-                            &format!("core.hooksPath={}", null_device()),
                             "worktree",
                             "add",
                             &target_argument,
                             &request.common.repository.branch,
                         ],
+                        GIT_WORKTREE_TIMEOUT,
                     )
                 }
-                None => git_success(
+                None => host_git_success_with_timeout(
                     &source,
                     &[
-                        "-c",
-                        &format!("core.hooksPath={}", null_device()),
                         "worktree",
                         "add",
                         "-b",
@@ -807,6 +803,7 @@ fn prepare_nemo_worktree(checkout: &NemoCheckout, request: &JobRequest) -> Resul
                         &target_argument,
                         &request.common.repository.base_sha,
                     ],
+                    GIT_WORKTREE_TIMEOUT,
                 ),
                 _ => false,
             };
@@ -825,26 +822,24 @@ fn prepare_nemo_worktree(checkout: &NemoCheckout, request: &JobRequest) -> Resul
     if !target.starts_with(&worktrees) {
         return Err("the Nemo job worktree escaped its managed root".into());
     }
-    checkout_config_is_safe(&target)
-        .ok_or_else(|| "the Nemo job worktree Git configuration is unsafe".to_owned())?;
     let target_top = PathBuf::from(
-        git_output(&target, &["rev-parse", "--show-toplevel"])
+        host_git_output(&target, &["rev-parse", "--show-toplevel"])
             .ok_or_else(|| "the Nemo job worktree root could not be verified".to_owned())?,
     );
-    let branch = git_output(&target, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+    let branch = host_git_output(&target, &["symbolic-ref", "--quiet", "--short", "HEAD"])
         .ok_or_else(|| "the Nemo job worktree branch could not be verified".to_owned())?;
-    let head = git_output(&target, &["rev-parse", "HEAD"])
+    let head = host_git_output(&target, &["rev-parse", "HEAD"])
         .ok_or_else(|| "the Nemo job worktree head could not be verified".to_owned())?;
     let target_origin = canonical_git_origin(
-        &git_output(&target, &["remote", "get-url", "origin"])
+        &host_git_output(&target, &["config", "--get", "remote.origin.url"])
             .ok_or_else(|| "the Nemo job worktree origin could not be verified".to_owned())?,
     )
     .ok_or_else(|| "the Nemo job worktree origin is not canonical".to_owned())?;
-    let source_common = git_common_dir(&source)
+    let source_common = host_git_common_dir(&source)
         .ok_or_else(|| "the Nemo repository common Git directory is unavailable".to_owned())?;
-    let target_common = git_common_dir(&target)
+    let target_common = host_git_common_dir(&target)
         .ok_or_else(|| "the Nemo job worktree common Git directory is unavailable".to_owned())?;
-    let base_is_ancestor = git_success(
+    let base_is_ancestor = host_git_success(
         &target,
         &[
             "merge-base",
@@ -864,8 +859,8 @@ fn prepare_nemo_worktree(checkout: &NemoCheckout, request: &JobRequest) -> Resul
     Ok(target)
 }
 
-fn git_common_dir(root: &Path) -> Option<PathBuf> {
-    PathBuf::from(git_output(
+fn host_git_common_dir(root: &Path) -> Option<PathBuf> {
+    PathBuf::from(host_git_output(
         root,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     )?)
@@ -896,6 +891,7 @@ fn git_output(root: &Path, args: &[&str]) -> Option<String> {
     (!value.is_empty()).then(|| value.to_owned())
 }
 
+#[cfg(test)]
 fn git_success(root: &Path, args: &[&str]) -> bool {
     git_run(root, args).is_some()
 }
@@ -904,8 +900,43 @@ fn git_run(root: &Path, args: &[&str]) -> Option<Vec<u8>> {
     git_run_with_timeout(root, args, GIT_COMMAND_TIMEOUT)
 }
 
-fn git_success_with_timeout(root: &Path, args: &[&str], timeout: Duration) -> bool {
-    git_run_with_timeout(root, args, timeout).is_some()
+fn host_git_output(root: &Path, args: &[&str]) -> Option<String> {
+    let bytes = host_git_run(root, args, GIT_COMMAND_TIMEOUT)?;
+    let value = String::from_utf8(bytes).ok()?;
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+fn host_git_success(root: &Path, args: &[&str]) -> bool {
+    host_git_success_with_timeout(root, args, GIT_COMMAND_TIMEOUT)
+}
+
+fn host_git_success_with_timeout(root: &Path, args: &[&str], timeout: Duration) -> bool {
+    host_git_run(root, args, timeout).is_some()
+}
+
+fn host_git_run(root: &Path, args: &[&str], timeout: Duration) -> Option<Vec<u8>> {
+    // Ordinary agents use the host's Git, config, hooks, helper PATH and auth.
+    // Only repository-redirection variables are removed: the captured checkout
+    // and its verified worktree, rather than an inherited Git invocation, own
+    // these preparation operations. Typed grants retain the isolated runner.
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(git_worktree_path_argument(root)?)
+        .args(args);
+    for key in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_PREFIX",
+    ] {
+        command.env_remove(key);
+    }
+    bounded_git_output(command, timeout)
 }
 
 fn git_run_with_timeout(root: &Path, args: &[&str], timeout: Duration) -> Option<Vec<u8>> {
@@ -931,6 +962,10 @@ fn git_run_with_timeout(root: &Path, args: &[&str], timeout: Duration) -> Option
         .env("SSH_ASKPASS", system_false());
     #[cfg(windows)]
     apply_windows_runtime_environment(&mut command)?;
+    bounded_git_output(command, timeout)
+}
+
+fn bounded_git_output(command: Command, timeout: Duration) -> Option<Vec<u8>> {
     let output = match crate::bounded_command::output_with_limits(
         command,
         crate::bounded_command::Limits {
@@ -1004,39 +1039,17 @@ fn apply_windows_runtime_environment(command: &mut Command) -> Option<()> {
 }
 
 fn checkout_config_is_safe(root: &Path) -> Option<()> {
-    let local = git_output(
+    // git_run disables system/global config and clears the environment. Reading
+    // the remaining scopes together includes local and enabled worktree config,
+    // while Git treats a missing or empty optional config.worktree as empty.
+    // Explicit --worktree --list instead fails when that optional file is absent.
+    let config = git_output(
         root,
-        &[
-            "config",
-            "--local",
-            "--no-includes",
-            "--name-only",
-            "--null",
-            "--list",
-        ],
+        &["config", "--no-includes", "--name-only", "--null", "--list"],
     )?;
-    let keys = parse_config_keys(&local)?;
+    let keys = parse_config_keys(&config)?;
     if keys.iter().any(|key| dangerous_local_config_key(key)) {
         return None;
-    }
-    if keys.iter().any(|key| key == "extensions.worktreeconfig") {
-        let worktree = git_output(
-            root,
-            &[
-                "config",
-                "--worktree",
-                "--no-includes",
-                "--name-only",
-                "--null",
-                "--list",
-            ],
-        )?;
-        if parse_config_keys(&worktree)?
-            .iter()
-            .any(|key| dangerous_local_config_key(key))
-        {
-            return None;
-        }
     }
     Some(())
 }
@@ -1287,6 +1300,7 @@ mod tests {
                     address: format!("30621:{}:nemo", "a".repeat(64)),
                     home_channel: "3580ca9b-47b4-4af9-b22a-1068778f26c6".into(),
                 },
+                conversation: None,
                 repository: JobRepository {
                     canonical: "https://github.com/mysteropodes/nemo".into(),
                     github_issue: None,
@@ -1307,6 +1321,8 @@ mod tests {
                 expires_at: "2030-01-01T00:00:00Z".into(),
             },
             capability: "rust".into(),
+            title: None,
+            origin: None,
             summary: "Do work".into(),
             acceptance: vec!["Tests pass".into()],
             supersedes_event_id: None,
@@ -1689,6 +1705,41 @@ mod tests {
         assert!(!git.starts_with(std::env::current_dir().expect("cwd")));
     }
 
+    #[test]
+    fn optional_worktree_config_accepts_absent_empty_and_valid_files() {
+        let checkout = initialized_checkout();
+        assert!(git_success(
+            checkout.path(),
+            &["config", "--local", "extensions.worktreeConfig", "true"]
+        ));
+        let config = checkout.path().join(".git/config.worktree");
+        assert!(!config.exists());
+        assert!(checkout_config_is_safe(checkout.path()).is_some());
+        for content in ["", "[user]\n\tname = Worktree Test\n"] {
+            std::fs::write(&config, content).expect("optional worktree config");
+            assert!(checkout_config_is_safe(checkout.path()).is_some());
+        }
+    }
+
+    #[test]
+    fn optional_worktree_config_rejects_dangerous_and_malformed_files() {
+        let checkout = initialized_checkout();
+        assert!(git_success(
+            checkout.path(),
+            &["config", "--local", "extensions.worktreeConfig", "true"]
+        ));
+        let config = checkout.path().join(".git/config.worktree");
+        for content in [
+            "[credential]\n\thelper = !untrusted-helper\n",
+            "[core]\n\thooksPath = /untrusted/hooks\n",
+            "[include]\n\tpath = /untrusted/config\n",
+            "[invalid section\n",
+        ] {
+            std::fs::write(&config, content).expect("invalid worktree config fixture");
+            assert!(checkout_config_is_safe(checkout.path()).is_none());
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn git_paths_remove_only_supported_windows_verbatim_prefixes() {
@@ -1704,7 +1755,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_nemo_worktree_is_created_and_reused_after_worker_progress() {
+    fn managed_nemo_worktree_accepts_host_config_and_preserves_worker_progress() {
         let harness = tempfile::tempdir().expect("harness");
         let checkout = harness.path().join("REPOS/nemo");
         std::fs::create_dir_all(&checkout).expect("checkout");
@@ -1739,6 +1790,47 @@ mod tests {
             &checkout,
             &["config", "--local", "branch.main.vscode-merge-base", "main"],
         );
+        run(
+            &checkout,
+            &["config", "--local", "extensions.worktreeConfig", "true"],
+        );
+        assert!(!checkout.join(".git/config.worktree").exists());
+        for (key, value) in [
+            ("credential.helper", "cache"),
+            ("core.sshCommand", "ssh"),
+            ("filter.preflight.clean", "cat"),
+            ("filter.preflight.smudge", "cat"),
+            ("url.ssh://git@github.com/.insteadOf", "https://github.com/"),
+        ] {
+            run(&checkout, &["config", "--local", key, value]);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let hooks = harness.path().join("host-hooks");
+            std::fs::create_dir(&hooks).expect("host hooks");
+            let hook = hooks.join("post-checkout");
+            std::fs::write(
+                &hook,
+                "#!/bin/sh\ntest -n \"$HOME\" || exit 1\nprintf 'host environment retained\\n' > .host-preflight-receipt\n",
+            )
+            .expect("host hook");
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700))
+                .expect("executable host hook");
+            run(
+                &checkout,
+                &[
+                    "config",
+                    "--local",
+                    "core.hooksPath",
+                    hooks.to_str().unwrap(),
+                ],
+            );
+        }
+        assert!(
+            checkout_config_is_safe(&checkout).is_none(),
+            "typed grants remain restricted"
+        );
         let base = git_output(&checkout, &["rev-parse", "HEAD"]).expect("base");
         let mut candidate = request();
         candidate.common.project.address = buzz_core::nemo::PROJECT_ADDRESS.into();
@@ -1758,6 +1850,35 @@ mod tests {
             .expect("managed grant")
             .checkout_root;
         assert!(first.ends_with("nemo-worktrees/worker_2"));
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::read_to_string(first.join(".host-preflight-receipt")).expect("host hook ran"),
+            "host environment retained\n"
+        );
+
+        let mut consultation = candidate.clone();
+        consultation.common.repository.worktree_id = "consultation".into();
+        consultation.common.repository.branch = "codex/consultation".into();
+        consultation.common.repository.paths.clear();
+        let consultation_root = grants
+            .authorize_request(&consultation)
+            .expect("ordinary consultation accepts host Git settings")
+            .expect("consultation grant")
+            .checkout_root;
+        assert!(consultation_root.ends_with("nemo-worktrees/consultation"));
+        assert_eq!(grants.git_operations_for(&consultation), Some(Vec::new()));
+
+        let worktree_config = git_output(
+            &first,
+            &[
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "config.worktree",
+            ],
+        )
+        .expect("linked worktree config path");
+        std::fs::write(worktree_config, "").expect("empty linked worktree config");
 
         std::fs::write(first.join("progress.txt"), "progress\n").expect("progress");
         run(&first, &["add", "progress.txt"]);
@@ -1774,6 +1895,19 @@ mod tests {
             git_output(&resumed, &["rev-parse", "HEAD"]).as_deref(),
             Some(progressed_head.as_str()),
             "resume must preserve legitimate worker commits"
+        );
+        run(
+            &checkout,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/mysteropodes/other.git",
+            ],
+        );
+        assert!(
+            grants.authorize_request(&candidate).is_err(),
+            "repository identity remains enforced"
         );
     }
 }

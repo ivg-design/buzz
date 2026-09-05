@@ -59,7 +59,7 @@ pub(super) fn operation_receipt(
         invocation_id,
         operation,
         session_channel_id: relay
-            .session_channel_id
+            .provider_channel_id
             .clone()
             .ok_or_else(|| "Project Git requires an exact session channel binding".to_owned())?,
         operation_id: relay
@@ -351,7 +351,7 @@ async fn resolve_checkout(
     let checkout = relay
         .grants
         .trusted_git_checkout(
-            relay.session_channel_id.as_deref(),
+            relay.provider_channel_id.as_deref(),
             relay.session_working_directory.as_deref(),
             &request,
             operation,

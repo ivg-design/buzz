@@ -183,6 +183,8 @@ impl JobFixture {
         let job = JobEvent::Request(JobRequest {
             common: self.request_common(operation_id, idempotency_key),
             capability: "rust".into(),
+            title: None,
+            origin: None,
             summary: "Exercise the durable A2A seam".into(),
             acceptance: vec!["Production seam remains single-writer".into()],
             supersedes_event_id: None,
@@ -200,6 +202,7 @@ impl JobFixture {
                 address: self.project_address.clone(),
                 home_channel: self.channel_id.to_string(),
             },
+            conversation: None,
             repository: JobRepository {
                 canonical: REPOSITORY_URL.into(),
                 github_issue: Some("1".into()),

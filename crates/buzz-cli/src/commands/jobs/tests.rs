@@ -25,6 +25,7 @@ fn common(sender: &Keys, recipient: &Keys) -> JobCommon {
             address: format!("30621:{}:nemo", sender.public_key().to_hex()),
             home_channel: "3580ca9b-47b4-4af9-b22a-1068778f26c6".into(),
         },
+        conversation: None,
         repository: JobRepository {
             canonical: "https://github.com/example/repo".into(),
             github_issue: Some("1".into()),
@@ -73,6 +74,8 @@ fn chain() -> Vec<Event> {
     let request_body = JobRequest {
         common: common(&requester, &worker),
         capability: "rust".into(),
+        title: None,
+        origin: None,
         summary: "Build the seam".into(),
         acceptance: vec!["tests pass".into()],
         supersedes_event_id: None,

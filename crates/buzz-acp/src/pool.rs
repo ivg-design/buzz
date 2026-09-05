@@ -3609,7 +3609,10 @@ pub async fn run_prompt_task(
         };
         let chat_thread_root = crate::queue::trusted_chat_thread_root(b, &format_args);
         if let Some(session) = agent.state.trusted_mcp.get(&b.scope) {
-            if let Err(error) = session.set_chat_thread_root_id(chat_thread_root.as_deref()) {
+            if let Err(error) = session.set_chat_destination(
+                crate::queue::trusted_chat_channel(b),
+                chat_thread_root.as_deref(),
+            ) {
                 tracing::error!(
                     target: "pool::session",
                     scope = %b.scope.telemetry_label(),
@@ -4714,6 +4717,7 @@ async fn fetch_conversation_context(
     ctx: &PromptContext,
 ) -> Option<ConversationContext> {
     let limit = ctx.context_message_limit;
+    let chat_channel = crate::queue::trusted_chat_channel(batch);
     let is_dm = channel_info
         .as_ref()
         .map(|ci| ci.channel_type == "dm")
@@ -4722,7 +4726,7 @@ async fn fetch_conversation_context(
     match resolve_context_target(batch, is_dm) {
         ContextTarget::Thread(root_id) => {
             fetch_thread_context(
-                batch.channel_id,
+                chat_channel,
                 &root_id,
                 limit,
                 ctx.agent_keys.public_key(),
@@ -4730,7 +4734,7 @@ async fn fetch_conversation_context(
             )
             .await
         }
-        ContextTarget::Dm => fetch_dm_context(batch.channel_id, limit, &ctx.rest_client).await,
+        ContextTarget::Dm => fetch_dm_context(chat_channel, limit, &ctx.rest_client).await,
         ContextTarget::None => None,
     }
 }
@@ -4754,6 +4758,17 @@ enum ContextTarget {
 ///   threaded reply fetches its reply chain; a DM non-reply fetches recent
 ///   conversation history; a plain top-level channel message has none.
 fn resolve_context_target(batch: &FlushBatch, is_dm: bool) -> ContextTarget {
+    if batch.scope.is_job()
+        || batch.events.last().is_some_and(|event| {
+            crate::job_notifications::parse_reply_destination(&event.prompt_tag).is_some()
+        })
+    {
+        return match crate::queue::trusted_chat_thread_root(batch, &Default::default()) {
+            Some(root) => ContextTarget::Thread(root),
+            None if is_dm => ContextTarget::Dm,
+            None => ContextTarget::None,
+        };
+    }
     if let Some(root_id) = batch.scope.root_event_id() {
         return ContextTarget::Thread(root_id.to_string());
     }

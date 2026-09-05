@@ -99,10 +99,7 @@ pub(crate) fn verify_bundle(
             return Err(format!("duplicate bundled payload path {:?}", payload.path));
         }
         if payload.sha256.len() != 64
-            || !payload
-                .sha256
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
+            || !payload.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
         {
             return Err(format!(
                 "invalid SHA-256 for bundled Codex CLI payload {:?}",
@@ -136,8 +133,9 @@ pub(crate) fn verify_bundle(
                 metadata.len()
             ));
         }
-        let bytes = std::fs::read(&path)
-            .map_err(|error| format!("failed to read bundled payload {}: {error}", path.display()))?;
+        let bytes = std::fs::read(&path).map_err(|error| {
+            format!("failed to read bundled payload {}: {error}", path.display())
+        })?;
         let actual = sha256(&bytes);
         if !actual.eq_ignore_ascii_case(&payload.sha256) {
             return Err(format!(

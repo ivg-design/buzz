@@ -40,6 +40,15 @@ pub struct TrustedMcpFactory {
 }
 
 impl TrustedMcpFactory {
+    /// Use the same enrolled-peer verification for inbound chat and MCP discovery.
+    pub(crate) async fn is_enrolled_peer(&self, pubkey: &str) -> Result<bool, String> {
+        let relay = self.identity.scoped_relay(TrustedSessionScope {
+            channel_id: Some(buzz_core::nemo::HOME_CHANNEL.into()),
+            ..TrustedSessionScope::default()
+        })?;
+        let cancellation = CancellationToken::new();
+        relay.is_enrolled_peer(pubkey, &cancellation).await
+    }
     /// Create a factory. `lifetime` must cover a complete maximum-length turn;
     /// callers rotate provider sessions before the remaining lifetime is short.
     #[cfg(test)]
@@ -82,9 +91,29 @@ impl TrustedMcpFactory {
             return Err("trusted MCP listener was not bound to loopback".into());
         }
 
-        let relay = self
-            .identity
-            .scoped_relay(scope_binding(scope, working_directory))?;
+        let mut binding = scope_binding(scope, working_directory);
+        if let SessionScope::Job {
+            request_event_id, ..
+        } = scope
+        {
+            let transport = self.identity.scoped_relay(binding.clone())?;
+            let events = transport
+                .query_job_events(Some(request_event_id), 1, &CancellationToken::new())
+                .await?;
+            let request = events
+                .iter()
+                .find(|event| event.id.to_hex() == *request_event_id)
+                .ok_or_else(|| "task conversation request is unavailable".to_owned())?;
+            if let buzz_core::job::JobEvent::Request(request) =
+                buzz_core::job::JobEvent::parse(request).map_err(|error| error.to_string())?
+            {
+                if let Some(conversation) = request.common.conversation {
+                    binding.channel_id = Some(conversation.channel_id);
+                    binding.thread_root_id = Some(conversation.thread_root_id);
+                }
+            }
+        }
+        let relay = self.identity.scoped_relay(binding)?;
         let cancellation = CancellationToken::new();
         let privilege_gate = self.job_privileges.for_session(scope, working_directory)?;
         let handler =
@@ -167,11 +196,14 @@ impl TrustedMcpSession {
                 .is_some_and(|remaining| remaining >= duration)
     }
 
-    /// Update only the harness-owned chat destination for the next turn.
-    /// The channel, signer, repository, A2A grants, and job scope remain fixed
-    /// for the lifetime of this capability.
-    pub fn set_chat_thread_root_id(&self, thread_root_id: Option<&str>) -> Result<(), String> {
-        self.routing.set_chat_thread_root_id(thread_root_id)
+    /// Set the next reply destination without moving the provider session.
+    pub(crate) fn set_chat_destination(
+        &self,
+        channel_id: uuid::Uuid,
+        thread_root_id: Option<&str>,
+    ) -> Result<(), String> {
+        self.routing
+            .set_chat_destination(&channel_id.to_string(), thread_root_id)
     }
 
     #[cfg(test)]

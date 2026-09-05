@@ -20,6 +20,10 @@ use crate::usage::{
     PromptResponseUsage, StandardAdapterKind, StandardUsageTracker, TurnUsage, UsageTracker,
 };
 
+mod turn_capture;
+pub(crate) use turn_capture::CapturedTurnOutput;
+use turn_capture::TurnTextCapture;
+
 /// Maximum allowed size of a single NDJSON line from the agent's stdout.
 /// Lines exceeding this limit are rejected to prevent OOM from rogue agents.
 const MAX_LINE_SIZE: usize = 10_000_000; // 10 MB
@@ -364,13 +368,9 @@ pub struct AcpClient {
     standard_usage: StandardUsageTracker,
     /// Known adapter identity for prompt-response usage mapping.
     standard_adapter: Option<StandardAdapterKind>,
-    /// Bounded visible assistant text emitted during the current prompt.
-    turn_text: String,
-    /// Set when assistant output exceeded the capture bound.
-    turn_text_overflowed: bool,
+    /// Bounded logical top-level assistant messages emitted during this prompt.
+    turn_text: TurnTextCapture,
 }
-
-const MAX_CAPTURED_TURN_TEXT_BYTES: usize = 128 * 1024;
 const HARNESS_ONLY_ENV: &[&str] = &[
     "BUZZ_PRIVATE_KEY",
     "BUZZ_ACP_PRIVATE_KEY",
@@ -819,8 +819,7 @@ impl AcpClient {
             goose_usage: UsageTracker::default(),
             standard_usage: StandardUsageTracker::default(),
             standard_adapter,
-            turn_text: String::new(),
-            turn_text_overflowed: false,
+            turn_text: TurnTextCapture::default(),
         })
     }
 
@@ -1122,7 +1121,6 @@ impl AcpClient {
         // delivered the prompt. Keep this boundary after response errors.
         self.prompt_attempted_turn_id = self.observer_context.turn_id.clone();
         self.turn_text.clear();
-        self.turn_text_overflowed = false;
         let params = build_prompt_params(session_id, prompt_blocks);
         let hard_deadline = tokio::time::Instant::now() + max_duration;
         self.current_hard_deadline = Some(hard_deadline);
@@ -1259,11 +1257,9 @@ impl AcpClient {
         goose_usage.or(standard_usage)
     }
 
-    /// Consume the bounded assistant text captured for the completed turn.
-    pub(crate) fn take_turn_text(&mut self) -> Option<String> {
-        let text = std::mem::take(&mut self.turn_text);
-        let overflowed = std::mem::replace(&mut self.turn_text_overflowed, false);
-        (!overflowed).then_some(text)
+    /// Consume bounded assistant output with separate terminal and transcript views.
+    pub(crate) fn take_turn_output(&mut self) -> CapturedTurnOutput {
+        self.turn_text.take()
     }
 
     /// Notify the usage tracker that buzz-acp just spawned a new session.
@@ -2139,15 +2135,21 @@ impl AcpClient {
         match update_type {
             "agent_message_chunk" => {
                 if let Some(text) = update["content"]["text"].as_str() {
-                    if self.last_prompt_id.is_some() && !self.turn_text_overflowed {
-                        if self.turn_text.len().saturating_add(text.len())
-                            <= MAX_CAPTURED_TURN_TEXT_BYTES
-                        {
-                            self.turn_text.push_str(text);
-                        } else {
-                            self.turn_text.clear();
-                            self.turn_text_overflowed = true;
-                        }
+                    let is_subagent = update
+                        .pointer("/_meta/claudeCode/parentToolUseId")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some();
+                    let belongs_to_active_session = msg
+                        .pointer("/params/sessionId")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|session_id| {
+                            self.active_prompt_session_id.as_deref() == Some(session_id)
+                        });
+                    if self.last_prompt_id.is_some() && belongs_to_active_session && !is_subagent {
+                        self.turn_text.push(
+                            update.get("messageId").and_then(serde_json::Value::as_str),
+                            text,
+                        );
                     }
                     tracing::info!(target: "acp::stream", "{text}");
                 }
@@ -4469,6 +4471,87 @@ mod tests {
         AcpClient::spawn("cat", &[], &[], false)
             .await
             .expect("spawn cat as inert client")
+    }
+
+    fn assistant_message_update(
+        message_id: Option<&str>,
+        text: &str,
+        parent_tool_use_id: Option<&str>,
+    ) -> serde_json::Value {
+        let mut update = serde_json::json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": { "type": "text", "text": text },
+        });
+        if let Some(message_id) = message_id {
+            update["messageId"] = message_id.into();
+        }
+        if let Some(parent_tool_use_id) = parent_tool_use_id {
+            update["_meta"] = serde_json::json!({
+                "claudeCode": { "parentToolUseId": parent_tool_use_id }
+            });
+        }
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "test-session",
+                "update": update,
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn turn_capture_uses_last_top_level_message_as_terminal_candidate() {
+        let mut client = spawn_inert_client().await;
+        client.last_prompt_id = Some(7);
+        client.active_prompt_session_id = Some("test-session".into());
+
+        let progress = assistant_message_update(Some("progress-1"), "Work is underway", None);
+        let child = assistant_message_update(
+            Some("child-1"),
+            "Subagent commentary is not the parent answer",
+            Some("tool-use-1"),
+        );
+        let final_a = assistant_message_update(Some("final-2"), "{\"outcome\":", None);
+        let final_b = assistant_message_update(Some("final-2"), "\"success\"}", None);
+        let mut foreign = assistant_message_update(
+            Some("foreign-3"),
+            "A different session cannot replace the terminal",
+            None,
+        );
+        foreign["params"]["sessionId"] = "foreign-session".into();
+        for update in [&progress, &child, &final_a, &final_b, &foreign] {
+            let _ = client.handle_session_update(update);
+        }
+
+        assert_eq!(
+            client.take_turn_output(),
+            CapturedTurnOutput {
+                terminal_candidate: Some("{\"outcome\":\"success\"}".into()),
+                substantive_text: Some("Work is underway\n\n{\"outcome\":\"success\"}".into()),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn idless_updates_do_not_create_an_inferred_terminal_boundary() {
+        let mut client = spawn_inert_client().await;
+        client.last_prompt_id = Some(7);
+        client.active_prompt_session_id = Some("test-session".into());
+
+        for update in [
+            assistant_message_update(None, "Earlier prose", None),
+            assistant_message_update(None, "{\"outcome\":\"success\"}", None),
+        ] {
+            let _ = client.handle_session_update(&update);
+        }
+
+        let output = client.take_turn_output();
+        assert_eq!(
+            output.terminal_candidate.as_deref(),
+            Some("Earlier prose{\"outcome\":\"success\"}")
+        );
+        assert_eq!(output.substantive_text, output.terminal_candidate);
     }
 
     /// Build a `session/update` JSON-RPC notification carrying a

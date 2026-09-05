@@ -14,6 +14,10 @@ const MAX_PEERS: usize = 128;
 pub struct VerifiedPeer {
     pub name: String,
     pub pubkey: String,
+    /// Verified owner used internally for inherited channel membership checks.
+    /// Tool responses omit it because callers address the agent identity.
+    #[serde(skip_serializing)]
+    pub owner_pubkey: String,
 }
 
 /// Discover managed agents whose owners are currently authorized for the exact
@@ -193,9 +197,11 @@ fn resolve_policies(events: &[Event], owners: &[(String, String)]) -> Vec<Verifi
         .filter_map(|(pubkey, event)| {
             let content: ManagedAgentIdentity =
                 serde_json::from_str(event.content.as_ref()).ok()?;
+            let owner_pubkey = expected.get(&pubkey)?.clone();
             valid_peer_name(&content.name).then_some(VerifiedPeer {
                 name: content.name,
                 pubkey,
+                owner_pubkey,
             })
         })
         .collect::<Vec<_>>();

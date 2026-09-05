@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use buzz_core::job::{
-    JobCommon, JobControl, JobControlAction, JobEvent, JobFollowup, JobProject, JobRepository,
-    JobRequest, JobSponsor, JOB_SCHEMA_VERSION,
+    JobCommon, JobControl, JobControlAction, JobEvent, JobFollowup, JobOrigin, JobProject,
+    JobRepository, JobRequest, JobSponsor, JOB_SCHEMA_VERSION,
 };
 use chrono::{Duration, SecondsFormat, Utc};
 use rmcp::model::{CallToolResult, Content};
@@ -21,6 +21,17 @@ pub struct A2aDispatchParams {
     pub coordinator_epoch: u32,
     pub recipient_pubkey: String,
     pub capability: String,
+    /// Optional compact display title for the visible delegated task.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Optional initiating conversation. Omit to capture this session's current
+    /// channel and thread automatically.
+    #[serde(default)]
+    pub origin: Option<A2aDispatchOrigin>,
+    /// Optional task discussion destination. Omit to reuse the current thread,
+    /// or create a visible task root when called from a channel timeline.
+    #[serde(default)]
+    pub conversation: Option<A2aDispatchConversation>,
     pub summary: String,
     pub acceptance: Vec<String>,
     /// Optional coordination label. The Nemo workspace derives one from the
@@ -46,6 +57,26 @@ pub struct A2aDispatchParams {
     pub supersedes_event_id: Option<String>,
     #[serde(default = "default_ttl")]
     pub ttl_seconds: u32,
+}
+
+#[derive(Clone, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct A2aDispatchOrigin {
+    pub channel_id: String,
+    #[serde(default)]
+    pub thread_root_id: Option<String>,
+}
+
+#[derive(Clone, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct A2aDispatchConversation {
+    /// Omit to use the current Buzz channel.
+    #[serde(default)]
+    pub channel_id: Option<String>,
+    /// Existing oversight thread. Omit to create or reuse this operation's
+    /// visible assignment root in the selected channel.
+    #[serde(default)]
+    pub thread_root_id: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -86,12 +117,6 @@ pub struct A2aHandoffParams {
     pub reason: String,
 }
 
-#[derive(Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ChatSendParams {
-    pub content: String,
-}
-
 pub async fn dispatch(
     relay: &Arc<TrustedRelay>,
     params: A2aDispatchParams,
@@ -105,10 +130,10 @@ pub async fn dispatch(
     }
     let result = match params.supersedes_event_id.clone() {
         Some(event_id) => build_superseding_request(relay, params, &event_id, &cancellation).await,
-        None => build_request(relay, params).await,
+        None => prepare_initial_dispatch(relay, &params, &cancellation).await,
     };
     match result.and_then(|job| ensure_session_channel(relay, &job).map(|_| job)) {
-        Ok(job) => publish_result(relay.publish_job(job, &cancellation).await),
+        Ok(job) => publish_dispatch_result(relay, job, &cancellation).await,
         Err(error) => error_result(error),
     }
 }
@@ -257,23 +282,9 @@ pub(super) async fn publish_prepared_handoff(
     }
 }
 
-pub async fn send_chat(
-    relay: &Arc<TrustedRelay>,
-    params: ChatSendParams,
-    cancellation: CancellationToken,
-) -> CallToolResult {
-    if relay.job_operation_id.is_some() || relay.job_request_event_id.is_some() {
-        return error_result(
-            "chat send is unavailable inside a one-shot job session; return the required job outcome instead"
-                .into(),
-        );
-    }
-    publish_result(relay.publish_chat(&params.content, &cancellation).await)
-}
-
 async fn build_request(
     relay: &TrustedRelay,
-    params: A2aDispatchParams,
+    params: &A2aDispatchParams,
 ) -> Result<JobEvent, String> {
     if params.coordinator_epoch != 1 {
         return Err("initial A2A requests require coordinator_epoch=1".into());
@@ -295,12 +306,97 @@ async fn build_request(
     };
     let request = JobRequest {
         common: common_from(grant, relay, &params, github_login)?,
-        capability: params.capability,
-        summary: params.summary,
-        acceptance: params.acceptance,
+        capability: params.capability.clone(),
+        title: params.title.clone(),
+        origin: resolve_job_origin(relay, params.origin.as_ref())?,
+        summary: params.summary.clone(),
+        acceptance: params.acceptance.clone(),
         supersedes_event_id: None,
     };
     Ok(JobEvent::Request(request))
+}
+
+async fn prepare_initial_dispatch(
+    relay: &TrustedRelay,
+    params: &A2aDispatchParams,
+    cancellation: &CancellationToken,
+) -> Result<JobEvent, String> {
+    let mut job = build_request(relay, params).await?;
+    // Validate every non-conversation field before a visible root can be
+    // published, so invalid jobs leave no orphan discussion behind.
+    relay.prepare_job_event(job.clone())?;
+    ensure_session_channel(relay, &job)?;
+    let JobEvent::Request(request) = &mut job else {
+        return Err("initial dispatch did not produce a job request".into());
+    };
+    if let Some(origin) = &request.origin {
+        super::chat::validate_existing_conversation(
+            relay,
+            &origin.channel_id,
+            origin.thread_root_id.as_deref(),
+            cancellation,
+        )
+        .await?;
+    }
+    let (channel, existing_root) = requested_task_conversation(relay, params)?;
+    let content = request.title.as_deref().unwrap_or(&request.summary);
+    let prepared = relay
+        .prepare_visible_task_thread(
+            Some(&channel),
+            existing_root.as_deref(),
+            &request.common.operation_id,
+            content,
+            cancellation,
+        )
+        .await?;
+    request.common.conversation = Some(prepared);
+    // Revalidate the exact final body before the network-visible job publish.
+    relay.prepare_job_event(job.clone())?;
+    Ok(job)
+}
+
+fn requested_task_conversation(
+    relay: &TrustedRelay,
+    params: &A2aDispatchParams,
+) -> Result<(String, Option<String>), String> {
+    let (current_channel, current_thread_root) = relay.current_chat_destination_parts()?;
+    let current_channel = current_channel.as_deref();
+    match &params.conversation {
+        Some(requested) => {
+            let channel = requested
+                .channel_id
+                .as_deref()
+                .or(current_channel)
+                .ok_or_else(|| "task conversation requires a Buzz channel".to_owned())?;
+            Ok((channel.to_owned(), requested.thread_root_id.clone()))
+        }
+        None => {
+            let channel = current_channel
+                .ok_or_else(|| "task conversation requires a Buzz channel".to_owned())?;
+            Ok((channel.to_owned(), current_thread_root))
+        }
+    }
+}
+
+async fn publish_dispatch_result(
+    relay: &TrustedRelay,
+    job: JobEvent,
+    cancellation: &CancellationToken,
+) -> CallToolResult {
+    let conversation = match &job {
+        JobEvent::Request(request) => request.common.conversation.clone(),
+        _ => None,
+    };
+    match relay.publish_job(job, cancellation).await {
+        Ok(published) => json_result(&serde_json::json!({
+            "request_event_id": published.event_id,
+            "accepted": published.accepted,
+            "task_channel_id": conversation.as_ref().map(|task| &task.channel_id),
+            "task_thread_root_id": conversation.as_ref().map(|task| &task.thread_root_id),
+            "task": conversation,
+        })),
+        Err(error) => error_result(error),
+    }
 }
 
 async fn build_superseding_request(
@@ -348,6 +444,16 @@ async fn build_superseding_request(
         || params.idempotency_key != old.common.idempotency_key
         || params.coordinator_epoch != expected_epoch
         || params.capability != old.capability
+        || params
+            .title
+            .as_ref()
+            .is_some_and(|title| Some(title) != old.title.as_ref())
+        || params.origin.as_ref().is_some_and(|origin| {
+            old.origin.as_ref().is_none_or(|old| {
+                origin.channel_id != old.channel_id || origin.thread_root_id != old.thread_root_id
+            })
+        })
+        || !requested_conversation_matches(params.conversation.as_ref(), old)
         || params.summary != old.summary
         || params.acceptance != old.acceptance
         || params
@@ -377,11 +483,55 @@ async fn build_superseding_request(
     Ok(JobEvent::Request(next))
 }
 
+fn requested_conversation_matches(
+    requested: Option<&A2aDispatchConversation>,
+    old: &JobRequest,
+) -> bool {
+    let Some(requested) = requested else {
+        return true;
+    };
+    let Some(existing) = old.common.conversation.as_ref() else {
+        return false;
+    };
+    requested
+        .channel_id
+        .as_ref()
+        .is_none_or(|channel| channel == &existing.channel_id)
+        && requested
+            .thread_root_id
+            .as_ref()
+            .is_none_or(|root| root == &existing.thread_root_id)
+}
+
+fn resolve_job_origin(
+    relay: &TrustedRelay,
+    requested: Option<&A2aDispatchOrigin>,
+) -> Result<Option<JobOrigin>, String> {
+    let (current_channel, current_thread_root) = relay.current_chat_destination_parts()?;
+    let current = match current_channel {
+        Some(channel_id) => Some(JobOrigin {
+            channel_id,
+            thread_root_id: current_thread_root,
+            session_channel_id: relay.provider_channel_id.clone(),
+            session_thread_root_id: relay.provider_thread_root_id.clone(),
+        }),
+        None => None,
+    };
+    let requested = requested.map(|origin| JobOrigin {
+        channel_id: origin.channel_id.clone(),
+        thread_root_id: origin.thread_root_id.clone(),
+        session_channel_id: relay.provider_channel_id.clone(),
+        session_thread_root_id: relay.provider_thread_root_id.clone(),
+    });
+    Ok(requested.or(current))
+}
+
 fn same_operation_scope(left: &JobCommon, right: &JobCommon) -> bool {
     left.operation_id == right.operation_id
         && left.idempotency_key == right.idempotency_key
         && left.coordinator_epoch == right.coordinator_epoch
         && left.project == right.project
+        && left.conversation == right.conversation
         && left.repository == right.repository
         && left.sponsor == right.sponsor
         && left.expires_at == right.expires_at
@@ -403,6 +553,7 @@ fn common_from(
             address: grant.project_address,
             home_channel: grant.home_channel,
         },
+        conversation: None,
         repository: JobRepository {
             canonical: grant.repository,
             github_issue: references.issue,
@@ -660,21 +811,21 @@ fn query_result(result: Result<Vec<nostr::Event>, String>) -> CallToolResult {
     }
 }
 
-fn publish_result(result: Result<PublishedEvent, String>) -> CallToolResult {
+pub(super) fn publish_result(result: Result<PublishedEvent, String>) -> CallToolResult {
     match result {
         Ok(event) => json_result(&event),
         Err(error) => error_result(error),
     }
 }
 
-fn json_result(value: &impl Serialize) -> CallToolResult {
+pub(super) fn json_result(value: &impl Serialize) -> CallToolResult {
     match serde_json::to_string(value) {
         Ok(json) => CallToolResult::success(vec![Content::text(json)]),
         Err(_) => error_result("tool response serialization failed".into()),
     }
 }
 
-fn error_result(error: String) -> CallToolResult {
+pub(super) fn error_result(error: String) -> CallToolResult {
     CallToolResult::error(vec![Content::text(error)])
 }
 

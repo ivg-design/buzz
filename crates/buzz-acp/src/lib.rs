@@ -6,9 +6,12 @@ mod bounded_command;
 mod config;
 mod engram_fetch;
 mod filter;
+mod job_completion;
+mod job_notifications;
 mod job_receiver;
 mod job_runtime;
 mod observer;
+mod peer_conversation;
 mod pool;
 mod pool_lifecycle;
 mod project_preload;
@@ -25,6 +28,7 @@ mod startup_pipe;
 mod trusted_mcp;
 mod usage;
 
+use job_completion::{job_terminal_disposition, spawn_job_terminal_finisher, DeferredJobTerminal};
 pub use usage::TurnUsage;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -165,194 +169,6 @@ mod initial_runtime_lifecycle_tests {
     fn lazy_pool_listens_before_its_first_wake() {
         assert_eq!(initial_runtime_lifecycle(true), "listening");
     }
-}
-
-#[derive(Clone)]
-enum DeferredJobTerminal {
-    Cancellation(Box<job_receiver::CancellationTerminal>),
-    Outcome(job_receiver::TerminalDisposition),
-}
-
-fn job_terminal_disposition(
-    outcome: &PromptOutcome,
-    prompt_not_attempted: bool,
-    captured_text: Option<String>,
-    operation_id: &str,
-    request_event_id: &str,
-    scope_digest: &str,
-) -> job_receiver::TerminalDisposition {
-    match outcome {
-        PromptOutcome::Ok(_) => {
-            let disposition = job_receiver::parse_terminal_outcome(
-                captured_text,
-                operation_id,
-                request_event_id,
-                scope_digest,
-            );
-            match disposition {
-                job_receiver::TerminalDisposition::Failed {
-                    retryable: true, ..
-                } => job_receiver::TerminalDisposition::Indeterminate {
-                    code: "retryable_failure_after_full_host_turn".into(),
-                    message: "Worker requested a retry after a full-host turn; native host side effects cannot be proven absent, so automatic replay is unsafe".into(),
-                },
-                disposition => disposition,
-            }
-        }
-        // Only an exact pre-prompt boundary proves a setup failure. A generic
-        // ACP error after delivery cannot rule out non-Git side effects. The
-        // finisher also reconciles any applied/ambiguous durable Git effects.
-        PromptOutcome::Error(_) if prompt_not_attempted => {
-            job_receiver::TerminalDisposition::Failed {
-                code: "worker_startup_failed".into(),
-                message: "Worker setup failed before the requested prompt was sent".into(),
-                retryable: true,
-            }
-        }
-        _ => job_receiver::TerminalDisposition::Indeterminate {
-            code: "worker_turn_interrupted".into(),
-            message: "Worker turn ended without a proven terminal outcome".into(),
-        },
-    }
-}
-
-#[cfg(test)]
-mod job_terminal_disposition_tests {
-    use super::*;
-
-    #[test]
-    fn only_proven_preprompt_acp_error_is_retryable_failure() {
-        let outcome = PromptOutcome::Error(acp::AcpError::Protocol(
-            "session setup rejected permission mode".into(),
-        ));
-        let disposition = job_terminal_disposition(
-            &outcome,
-            true,
-            None,
-            "9064f66a-a18a-4f04-b85e-5c39b2b2a1ea",
-            &"4".repeat(64),
-            &"5".repeat(64),
-        );
-        assert!(matches!(
-            disposition,
-            job_receiver::TerminalDisposition::Failed {
-                ref code,
-                retryable: true,
-                ..
-            } if code == "worker_startup_failed"
-        ));
-        assert!(matches!(
-            job_terminal_disposition(
-                &outcome,
-                false,
-                None,
-                "9064f66a-a18a-4f04-b85e-5c39b2b2a1ea",
-                &"4".repeat(64),
-                &"5".repeat(64),
-            ),
-            job_receiver::TerminalDisposition::Indeterminate { ref code, .. }
-                if code == "worker_turn_interrupted"
-        ));
-    }
-
-    #[test]
-    fn retryable_worker_failure_after_full_host_prompt_is_indeterminate() {
-        let operation_id = "9064f66a-a18a-4f04-b85e-5c39b2b2a1ea";
-        let request_event_id = "4".repeat(64);
-        let scope_digest = "5".repeat(64);
-        let terminal = serde_json::json!({
-            "schema_version": "buzz.job-outcome.v1",
-            "operation_id": operation_id,
-            "request_event_id": request_event_id,
-            "scope_digest": scope_digest,
-            "outcome": "failed",
-            "code": "tool_unavailable",
-            "reason": "required host tool was unavailable",
-            "retryable": true
-        });
-        assert!(matches!(
-            job_terminal_disposition(
-                &PromptOutcome::Ok(acp::StopReason::EndTurn),
-                false,
-                Some(terminal.to_string()),
-                operation_id,
-                &request_event_id,
-                &scope_digest,
-            ),
-            job_receiver::TerminalDisposition::Indeterminate { ref code, .. }
-                if code == "retryable_failure_after_full_host_turn"
-        ));
-    }
-}
-
-fn spawn_job_terminal_finisher(
-    privileges: job_receiver::JobPrivilegeRegistry,
-    scope: scope::SessionScope,
-    terminal: Option<(job_receiver::JobEmitter, DeferredJobTerminal)>,
-) {
-    tokio::spawn(async move {
-        let mut retry_delay = Duration::from_millis(250);
-        loop {
-            match privileges.revoke_and_wait(&scope).await {
-                Ok(()) => break,
-                Err(error) => {
-                    tracing::warn!(
-                        scope = %scope.telemetry_label(),
-                        "agent-job cancellation terminal remains deferred until privileged operations drain: {error}"
-                    );
-                    tokio::time::sleep(retry_delay).await;
-                    retry_delay = (retry_delay * 2).min(Duration::from_secs(30));
-                }
-            }
-        }
-
-        // Resolve every registry-backed fact while the drained capability is
-        // still addressable, then revoke/remove it before any terminal event
-        // becomes externally observable. The relay can expose a publish to a
-        // subscriber before the HTTP acknowledgement returns, so removal
-        // after `publish().await` leaves a real post-terminal privilege window.
-        let terminal = terminal.map(|(emitter, terminal)| {
-            let terminal = match terminal {
-                DeferredJobTerminal::Cancellation(terminal) => {
-                    DeferredJobTerminal::Cancellation(Box::new((*terminal).resolve()))
-                }
-                DeferredJobTerminal::Outcome(disposition) => {
-                    DeferredJobTerminal::Outcome(job_receiver::guard_terminal_with_git_effect(
-                        disposition,
-                        privileges.git_effect_summary(&scope),
-                    ))
-                }
-            };
-            (emitter, terminal)
-        });
-        privileges.remove(&scope);
-
-        if let Some((emitter, terminal)) = terminal {
-            match emitter.is_terminal().await {
-                Ok(true) => {}
-                Ok(false) => {
-                    let publish = match terminal {
-                        DeferredJobTerminal::Cancellation(terminal) => {
-                            (*terminal).publish(&emitter).await
-                        }
-                        DeferredJobTerminal::Outcome(disposition) => {
-                            emitter.terminal(disposition).await
-                        }
-                    };
-                    if let Err(error) = publish {
-                        tracing::warn!(
-                            scope = %scope.telemetry_label(),
-                            "publishing drained agent-job terminal failed: {error}"
-                        );
-                    }
-                }
-                Err(error) => tracing::warn!(
-                    scope = %scope.telemetry_label(),
-                    "reading drained agent-job terminal state failed: {error}"
-                ),
-            }
-        }
-    });
 }
 
 /// Cache for the agent's owner pubkey.
@@ -3371,6 +3187,13 @@ async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
         );
     }
     let mut job_emitters: HashMap<scope::SessionScope, job_receiver::JobEmitter> = HashMap::new();
+    let mut job_result_notifications = job_receiver
+        .as_ref()
+        .map(|receiver| {
+            job_notifications::ResultNotificationRouter::open(receiver.notification_path())
+        })
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("restoring delegated results failed: {error}"))?;
     let mut job_cancellations: HashMap<scope::SessionScope, job_receiver::CancellationTerminal> =
         HashMap::new();
     if let Some(receiver) = job_receiver.as_ref() {
@@ -4097,7 +3920,11 @@ async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
                                 let Some(receiver) = job_receiver.as_ref() else {
                                     continue;
                                 };
-                                if kind_u32 == KIND_JOB_CANCEL {
+                                if kind_u32 == KIND_JOB_CANCEL && matches!(
+                                    buzz_core::job::JobEvent::parse(&buzz_event.event),
+                                    Ok(buzz_core::job::JobEvent::Control(control))
+                                        if control.action == buzz_core::job::JobControlAction::Cancel
+                                ) {
                                     match receiver
                                         .handle_cancel(
                                             &job_privileges,
@@ -4145,7 +3972,26 @@ async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
                                     continue;
                                 }
                                 if kind_u32 != KIND_JOB_REQUEST {
-                                    tracing::debug!(kind = kind_u32, "consuming job lifecycle event");
+                                    if let Some(router) = job_result_notifications.as_mut() {
+                                        match router.route(&ctx.rest_client, &buzz_event.event, &pubkey_hex).await {
+                                            Ok(Some(ready)) => {
+                                                let prompt_tag = ready.destination.prompt_tag();
+                                                let scope = ready.destination.scope;
+                                                queue.push_notification(QueuedEvent {
+                                                    channel_id: scope.channel_id(), scope,
+                                                    event: ready.event,
+                                                    received_at: std::time::Instant::now(), prompt_tag,
+                                                });
+                                                if pool_ready {
+                                                    for (scope, tags) in dispatch_pending(
+                                                        &mut pool, &mut queue, &ctx, &mut last_activity,
+                                                    ) { typing_channels.insert(scope, tags); }
+                                                }
+                                            }
+                                            Ok(None) => {}
+                                            Err(error) => tracing::warn!("delegated result retained for retry: {error}"),
+                                        }
+                                    }
                                     continue;
                                 }
                                 let project_context = match ctx
@@ -4202,6 +4048,19 @@ async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
 
                             if config.ignore_self && buzz_event.event.pubkey.to_hex() == pubkey_hex {
                                 tracing::debug!(channel_id = %buzz_event.channel_id, "dropping self-authored event");
+                                continue;
+                            }
+
+                            if peer_conversation::is_passive_record(&buzz_event.event) {
+                                continue;
+                            }
+
+                            // Correlated peer replies are returned by buzz_peer_ask/wait.
+                            // Re-prompting a second conversation here would duplicate the
+                            // answer and start an acknowledgement loop.
+                            if peer_conversation::peer_message(&buzz_event.event, &pubkey_hex)
+                                == Some(peer_conversation::PeerMessage::Reply)
+                            {
                                 continue;
                             }
 
@@ -4339,6 +4198,52 @@ async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
                                 // Not from owner — fall through to normal prompt handling.
                             }
 
+                            // Enrolled teammates may address one another regardless of
+                            // which collaborator owns them. This uses the same current
+                            // signed enrollment as discovery; ordinary human messages
+                            // retain the configured respond-to policy below.
+                            let directed_peer = kind_u32 == 9
+                                && config.respond_to != RespondTo::Nobody
+                                && peer_conversation::addressed_to(&buzz_event.event, &pubkey_hex);
+                            let enrolled_peer = if directed_peer {
+                                match ctx.trusted_mcp_factory.as_ref() {
+                                    Some(factory) => factory
+                                        .is_enrolled_peer(&buzz_event.event.pubkey.to_hex())
+                                        .await
+                                        .unwrap_or(false),
+                                    None => false,
+                                }
+                            } else {
+                                false
+                            };
+                            if enrolled_peer {
+                                let session_scope = peer_conversation::conversation_scope(
+                                    buzz_event.channel_id, &buzz_event.event,
+                                );
+                                let effective_author = buzz_event.event.pubkey.to_hex();
+                                let prompt_tag = if peer_conversation::peer_message(
+                                    &buzz_event.event, &pubkey_hex,
+                                ) == Some(peer_conversation::PeerMessage::Question) {
+                                    "peer-question"
+                                } else {
+                                    "peer-message"
+                                }.to_owned();
+                                let queued = NormalListenerIngress {
+                                    buzz_event, effective_author, prompt_tag,
+                                }.push(&mut queue, session_scope);
+                                queued.mark_seen(&ctx.rest_client);
+                                // A peer question queues in its own visible thread. It
+                                // never cancels or replaces the recipient's other work.
+                                if pool_ready {
+                                    for (scope, thread_tags) in dispatch_pending(
+                                        &mut pool, &mut queue, &ctx, &mut last_activity,
+                                    ) {
+                                        typing_channels.insert(scope, thread_tags);
+                                    }
+                                }
+                                continue;
+                            }
+
                             // Coarse security policy: drop events from disallowed
                             // authors before they reach subscription rules or the
                             // agent. Must be AFTER !shutdown (owner can always
@@ -4363,7 +4268,7 @@ async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
                             else {
                                 continue;
                             };
-                            let Some(ingress) =
+                            let Some(mut ingress) =
                                 AuthorizedNormalListenerEvent(authorized_event)
                                     .match_subscription(&rules, &pubkey_hex)
                                     .await
@@ -4378,7 +4283,14 @@ async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
                             // channel-keyed routing. Telemetry only for now —
                             // queue/pool partitioning by scope lands in a
                             // follow-up (see ticket outline steps 2–4).
-                            let session_scope = scope::SessionScope::derive(
+                            let session_scope = if peer_conversation::requires_task_thread(
+                                &ingress.buzz_event.event, &pubkey_hex,
+                            ) {
+                                ingress.prompt_tag = "task-message".into();
+                                peer_conversation::conversation_scope(
+                                    ingress.buzz_event.channel_id, &ingress.buzz_event.event,
+                                )
+                            } else { scope::SessionScope::derive(
                                 config.session_policy,
                                 ingress.buzz_event.channel_id,
                                 is_dm_channel(
@@ -4387,7 +4299,7 @@ async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
                                 )
                                 .await,
                                 &ingress.buzz_event.event,
-                            );
+                            ) };
                             tracing::debug!(
                                 channel_id = %session_scope.channel_id(),
                                 scope = %session_scope.telemetry_label(),
@@ -4581,6 +4493,15 @@ async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
 
         match pool_event {
             Some(PoolEvent::Result(mut result)) => {
+                if let (Some(router), Some(scope)) =
+                    (job_result_notifications.as_mut(), result.source.scope())
+                {
+                    if let Some(delivery) = result.agent.state.deliveries.get(scope) {
+                        if let Err(error) = router.ack_delivered(&delivery.delivered_event_ids) {
+                            tracing::warn!("could not persist delegated result delivery: {error}");
+                        }
+                    }
+                }
                 let job_scope = result
                     .source
                     .scope()
@@ -4598,7 +4519,7 @@ async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
                 }
                 let captured_job_text = job_scope
                     .as_ref()
-                    .map(|_| result.agent.acp.take_turn_text());
+                    .map(|_| result.agent.acp.take_turn_output());
                 let job_terminal = job_scope.as_ref().and_then(|scope| {
                     let (operation_id, request_event_id) = match scope {
                         scope::SessionScope::Job {
@@ -4618,22 +4539,28 @@ async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
                         Some(cancellation) if prompt_not_attempted => {
                             DeferredJobTerminal::Cancellation(Box::new(cancellation))
                         }
-                        Some(_) => DeferredJobTerminal::Outcome(
-                            job_receiver::TerminalDisposition::Indeterminate {
+                        Some(_) => DeferredJobTerminal::WorkerOutput {
+                            capture: captured_job_text.unwrap_or_default(),
+                            completed: false,
+                            fallback: job_receiver::TerminalDisposition::Indeterminate {
                                 code: "cancelled_full_host_turn".into(),
-                                message: "Worker cancellation interrupted a full-host turn after prompt delivery; native host side effects cannot be proven absent and require reconciliation".into(),
+                                message: "Worker cancellation interrupted execution; check existing effects before repeating actions.".into(),
                             },
-                        ),
+                        },
                         None => {
-                            let disposition = job_terminal_disposition(
+                            let fallback = job_terminal_disposition(
                                 &result.outcome,
                                 prompt_not_attempted,
-                                captured_job_text.flatten(),
+                                None,
                                 operation_id,
                                 request_event_id,
                                 emitter.scope_digest(),
                             );
-                            DeferredJobTerminal::Outcome(disposition)
+                            DeferredJobTerminal::WorkerOutput {
+                                capture: captured_job_text.unwrap_or_default(),
+                                completed: matches!(&result.outcome, PromptOutcome::Ok(_)),
+                                fallback,
+                            }
                         }
                     };
                     Some((emitter, terminal))
@@ -4682,6 +4609,37 @@ async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
                 }
             }
             Some(PoolEvent::RetryAgentJobs) => {
+                if let Some(router) = job_result_notifications.as_mut() {
+                    for _ in 0..16 {
+                        match router.poll_ready(&ctx.rest_client, &pubkey_hex).await {
+                            Ok(Some(ready)) => {
+                                let prompt_tag = ready.destination.prompt_tag();
+                                let scope = ready.destination.scope;
+                                queue.push_notification(QueuedEvent {
+                                    channel_id: scope.channel_id(),
+                                    scope,
+                                    event: ready.event,
+                                    received_at: std::time::Instant::now(),
+                                    prompt_tag,
+                                });
+                                if pool_ready {
+                                    for (scope, tags) in dispatch_pending(
+                                        &mut pool,
+                                        &mut queue,
+                                        &ctx,
+                                        &mut last_activity,
+                                    ) {
+                                        typing_channels.insert(scope, tags);
+                                    }
+                                }
+                            }
+                            Ok(None) => break,
+                            Err(error) => {
+                                tracing::warn!("delegated result retry remains pending: {error}")
+                            }
+                        }
+                    }
+                }
                 let Some(receiver) = job_receiver.as_ref() else {
                     continue;
                 };
@@ -6237,8 +6195,9 @@ mod agent_draft_prompt_tests {
         assert!(prompt.contains("use the person's **exact display name as shown in Buzz**"));
         assert!(prompt.contains("Do not expand a short display name, infer a surname"));
         assert!(prompt.contains("Preserve it exactly; do not infer, expand, or look up a surname"));
-        assert!(prompt.contains("`buzz_chat_send` accepts message content only"));
-        assert!(prompt.contains("does not prove a notification or recipient tag"));
+        assert!(prompt.contains("buzz_chat_thread_create"));
+        assert!(prompt.contains("buzz_peer_ask"));
+        assert!(prompt.contains("does not create a signed recipient tag"));
         assert!(prompt.contains("Use `buzz_a2a_dispatch` for a direct agent work request"));
         assert!(prompt.contains("typed chat tool never changes channel membership"));
     }

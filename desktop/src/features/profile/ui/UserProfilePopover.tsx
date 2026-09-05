@@ -1,5 +1,5 @@
 import * as React from "react";
-import { Activity, Headphones, MessageSquare } from "lucide-react";
+import { Activity, Clock3, Headphones, MessageSquare } from "lucide-react";
 import { AgentPopoverStopActions } from "./AgentPopoverStopActions";
 
 import { AgentManagementMarker } from "@/features/agents/ui/OtherSetupAgentMarker";
@@ -46,10 +46,17 @@ import { Button } from "@/shared/ui/button";
 import { Spinner } from "@/shared/ui/spinner";
 import { resolveModelLabel } from "@/features/agents/lib/formatAgentModelLabel";
 
+const TimedTaskDialog = React.lazy(() =>
+  import("@/features/timed-tasks/TimedTaskDialog").then((module) => ({
+    default: module.TimedTaskDialog,
+  })),
+);
+
 type UserProfilePopoverProps = {
   children: React.ReactNode;
   pubkey: string;
   channelId?: string | null;
+  originEventId?: string | null;
   triggerElement?: "div" | "span";
   /** Accessible name for interactive trigger content that is visually hidden. */
   triggerAriaLabel?: string;
@@ -137,8 +144,12 @@ export function UserProfilePopover({
   role,
   botIdenticonValue,
   channelId,
+  originEventId,
 }: UserProfilePopoverProps) {
   const [open, setOpen] = React.useState(false);
+  const [timedTaskRecipientName, setTimedTaskRecipientName] = React.useState<
+    string | null
+  >(null);
   const hoverTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(
     null,
   );
@@ -192,51 +203,69 @@ export function UserProfilePopover({
 
   const TriggerElement = triggerElement;
   return (
-    <Popover onOpenChange={setOpen} open={open}>
-      <PopoverAnchor asChild>
-        <TriggerElement
-          aria-label={triggerAriaLabel}
-          role={canOpenProfilePanel ? "button" : undefined}
-          tabIndex={canOpenProfilePanel ? 0 : undefined}
-          onClick={handleTriggerClick}
-          onKeyDown={(e) => {
-            if (
-              (e.key === "Enter" || e.key === " ") &&
-              canOpenProfilePanel &&
-              openProfilePanel
-            ) {
-              e.preventDefault();
-              e.stopPropagation();
+    <>
+      <Popover onOpenChange={setOpen} open={open}>
+        <PopoverAnchor asChild>
+          <TriggerElement
+            aria-label={triggerAriaLabel}
+            role={canOpenProfilePanel ? "button" : undefined}
+            tabIndex={canOpenProfilePanel ? 0 : undefined}
+            onClick={handleTriggerClick}
+            onKeyDown={(e) => {
+              if (
+                (e.key === "Enter" || e.key === " ") &&
+                canOpenProfilePanel &&
+                openProfilePanel
+              ) {
+                e.preventDefault();
+                e.stopPropagation();
+                clearHoverTimer();
+                setOpen(false);
+                openProfilePanel(pubkey);
+              }
+            }}
+            onMouseEnter={handleTriggerMouseEnter}
+            onMouseLeave={handleMouseLeave}
+            className={cn(
+              "inline-flex",
+              canOpenProfilePanel && "cursor-pointer [&_*]:cursor-pointer",
+            )}
+          >
+            {children}
+          </TriggerElement>
+        </PopoverAnchor>
+        {open ? (
+          <UserProfilePopoverBody
+            botIdenticonValue={botIdenticonValue}
+            channelId={channelId}
+            canOpenProfilePanel={canOpenProfilePanel}
+            onBeforeAction={clearHoverTimer}
+            onContentMouseEnter={handleContentMouseEnter}
+            onMouseLeave={handleMouseLeave}
+            onTriggerClick={handleTriggerClick}
+            pubkey={pubkey}
+            role={role}
+            setOpen={setOpen}
+            onAddTimedTask={(name) => {
               clearHoverTimer();
               setOpen(false);
-              openProfilePanel(pubkey);
-            }
-          }}
-          onMouseEnter={handleTriggerMouseEnter}
-          onMouseLeave={handleMouseLeave}
-          className={cn(
-            "inline-flex",
-            canOpenProfilePanel && "cursor-pointer [&_*]:cursor-pointer",
-          )}
-        >
-          {children}
-        </TriggerElement>
-      </PopoverAnchor>
-      {open ? (
-        <UserProfilePopoverBody
-          botIdenticonValue={botIdenticonValue}
-          channelId={channelId}
-          canOpenProfilePanel={canOpenProfilePanel}
-          onBeforeAction={clearHoverTimer}
-          onContentMouseEnter={handleContentMouseEnter}
-          onMouseLeave={handleMouseLeave}
-          onTriggerClick={handleTriggerClick}
-          pubkey={pubkey}
-          role={role}
-          setOpen={setOpen}
-        />
+              setTimedTaskRecipientName(name);
+            }}
+          />
+        ) : null}
+      </Popover>
+      {timedTaskRecipientName !== null ? (
+        <React.Suspense fallback={null}>
+          <TimedTaskDialog
+            recipientPubkey={pubkey}
+            recipientName={timedTaskRecipientName}
+            channelId={channelId}
+            originEventId={originEventId}
+            onClose={() => setTimedTaskRecipientName(null)}
+          />
+        </React.Suspense>
       ) : null}
-    </Popover>
+    </>
   );
 }
 
@@ -257,6 +286,7 @@ function UserProfilePopoverBody({
   pubkey,
   role,
   setOpen,
+  onAddTimedTask,
 }: {
   botIdenticonValue?: string;
   canOpenProfilePanel: boolean;
@@ -268,6 +298,7 @@ function UserProfilePopoverBody({
   channelId?: string | null;
   role?: string;
   setOpen: (open: boolean) => void;
+  onAddTimedTask: (name: string) => void;
 }) {
   const profileQuery = useUserProfileQuery(pubkey);
   const usersBatchQuery = useUsersBatchQuery([pubkey]);
@@ -508,6 +539,21 @@ function UserProfilePopoverBody({
             channelNames={channelIdToName}
             onBeforeAction={onBeforeAction}
           />
+        ) : null}
+
+        {isBotProfile && showProfileActions ? (
+          <button
+            className="flex w-full items-center gap-2 rounded-lg border border-border/60 px-3 py-2 text-left text-xs font-medium text-foreground transition-colors hover:bg-muted/50"
+            data-testid={`user-profile-add-timed-task-${pubkey}`}
+            onClick={() => onAddTimedTask(displayName)}
+            type="button"
+          >
+            <Clock3
+              aria-hidden="true"
+              className="h-4 w-4 text-muted-foreground"
+            />
+            Add timed task
+          </button>
         ) : null}
 
         {canViewActivity ? (

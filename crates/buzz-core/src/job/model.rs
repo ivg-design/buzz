@@ -48,6 +48,39 @@ pub struct JobSponsor {
     pub github_login: String,
 }
 
+/// Optional initiating Buzz conversation retained for presentation routing.
+///
+/// This is descriptive context only. The signed job `h` and `p` tags remain
+/// the transport and authorization coordinates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JobOrigin {
+    /// Channel in which the requester initiated the task.
+    pub channel_id: String,
+    /// Existing conversation root when the task began inside a thread.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_root_id: Option<String>,
+    /// Immutable requester provider-session channel used for continuation routing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_channel_id: Option<String>,
+    /// Immutable requester provider-session root used for continuation routing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_thread_root_id: Option<String>,
+}
+
+/// Ordinary Buzz task conversation chosen by the requester before dispatch.
+///
+/// This is a presentation destination only. The project home channel and the
+/// signed job route tags remain the protocol and authorization coordinates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JobConversation {
+    /// Channel containing the ordinary task thread.
+    pub channel_id: String,
+    /// Existing kind-9 task root created before the job request is dispatched.
+    pub thread_root_id: String,
+}
+
 /// Fields repeated by every event in one operation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobCommon {
@@ -61,6 +94,9 @@ pub struct JobCommon {
     pub coordinator_epoch: u32,
     /// Project address and home channel.
     pub project: JobProject,
+    /// Ordinary authenticated conversation used for human-facing task updates.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<JobConversation>,
     /// GitHub/repository/checkout scope.
     pub repository: JobRepository,
     /// Signed event actor, repeated for body/tag consistency checks.
@@ -81,6 +117,12 @@ pub struct JobRequest {
     pub common: JobCommon,
     /// Stable capability name required from the recipient.
     pub capability: String,
+    /// Optional compact presentation title; execution authority never depends on it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Optional initiating conversation for human-facing result routing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<JobOrigin>,
     /// Short human-readable task summary.
     pub summary: String,
     /// Falsifiable acceptance criteria.

@@ -15,9 +15,12 @@ use tokio_util::sync::CancellationToken;
 
 use super::tools::{prepare_handoff, publish_prepared_handoff};
 use super::{
-    cancel, dispatch, git, inbox, peers, send_chat, status, A2aCancelParams, A2aDispatchParams,
-    A2aHandoffParams, A2aInboxParams, A2aPeersParams, A2aStatusParams, ChatSendParams,
-    JobPrivilegeGate, PrivilegedGitOperationReceipt, PrivilegedOperationOutcome,
+    ask_peer, cancel, create_thread, dispatch, git, inbox, organization_apply, organization_read,
+    peers, read_chat, reply_to_peer, send_chat, status, wait_for_peer, A2aCancelParams,
+    A2aDispatchParams, A2aHandoffParams, A2aInboxParams, A2aPeersParams, A2aStatusParams,
+    ChatReadParams, ChatSendParams, ChatThreadCreateParams, JobPrivilegeGate,
+    OrganizationApplyParams, OrganizationReadParams, PeerAskParams, PeerReplyParams,
+    PeerWaitParams, PrivilegedGitOperationReceipt, PrivilegedOperationOutcome,
     ProjectGitCommitParams, ProjectGitOperation, ProjectGitParams, TrustedRelay,
 };
 
@@ -207,7 +210,7 @@ impl TrustedSessionMcp {
 
     #[tool(
         name = "buzz_chat_send",
-        description = "Send a normal Buzz message to this ACP session's fixed channel and thread."
+        description = "Send a Buzz message. By default it stays in the current task thread; an optional verified channel, thread root, and enrolled recipients can place an addressed message elsewhere."
     )]
     async fn buzz_chat_send(
         &self,
@@ -216,6 +219,111 @@ impl TrustedSessionMcp {
     ) -> Result<CallToolResult, ErrorData> {
         let cancellation = combine_cancellation(&self.session_cancellation, context.ct);
         let result = send_chat(&self.relay, params, cancellation.clone()).await;
+        cancellation.cancel();
+        Ok(result)
+    }
+
+    #[tool(
+        name = "buzz_chat_thread_create",
+        description = "Create a visible Buzz discussion thread in the current or another existing shared channel, optionally addressing enrolled agents. Returns the new thread root."
+    )]
+    async fn buzz_chat_thread_create(
+        &self,
+        Parameters(params): Parameters<ChatThreadCreateParams>,
+        context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let cancellation = combine_cancellation(&self.session_cancellation, context.ct);
+        let result = create_thread(&self.relay, params, cancellation.clone()).await;
+        cancellation.cancel();
+        Ok(result)
+    }
+
+    #[tool(
+        name = "buzz_chat_read",
+        description = "Read a bounded, signed history for the current task thread or a verified thread in an existing shared channel."
+    )]
+    async fn buzz_chat_read(
+        &self,
+        Parameters(params): Parameters<ChatReadParams>,
+        context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let cancellation = combine_cancellation(&self.session_cancellation, context.ct);
+        let result = read_chat(&self.relay, params, cancellation.clone()).await;
+        cancellation.cancel();
+        Ok(result)
+    }
+
+    #[tool(
+        name = "buzz_peer_ask",
+        description = "Ask one enrolled agent a visible question in the current task thread and wait up to 60 seconds for its signed answer. A timeout returns a request_event_id for buzz_peer_wait."
+    )]
+    async fn buzz_peer_ask(
+        &self,
+        Parameters(params): Parameters<PeerAskParams>,
+        context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let cancellation = combine_cancellation(&self.session_cancellation, context.ct);
+        let result = ask_peer(&self.relay, params, cancellation.clone()).await;
+        cancellation.cancel();
+        Ok(result)
+    }
+
+    #[tool(
+        name = "buzz_peer_wait",
+        description = "Wait up to 60 seconds for the signed answer to one exact peer question previously created by this agent."
+    )]
+    async fn buzz_peer_wait(
+        &self,
+        Parameters(params): Parameters<PeerWaitParams>,
+        context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let cancellation = combine_cancellation(&self.session_cancellation, context.ct);
+        let result = wait_for_peer(&self.relay, params, cancellation.clone()).await;
+        cancellation.cancel();
+        Ok(result)
+    }
+
+    #[tool(
+        name = "buzz_peer_reply",
+        description = "Answer one exact visible peer question addressed to this agent, preserving its task thread and correlation."
+    )]
+    async fn buzz_peer_reply(
+        &self,
+        Parameters(params): Parameters<PeerReplyParams>,
+        context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let cancellation = combine_cancellation(&self.session_cancellation, context.ct);
+        let result = reply_to_peer(&self.relay, params, cancellation.clone()).await;
+        cancellation.cancel();
+        Ok(result)
+    }
+
+    #[tool(
+        name = "buzz_organization_read",
+        description = "Read or search a bounded page of signed conversation history or reversible organization changes in the current or another accessible channel."
+    )]
+    async fn buzz_organization_read(
+        &self,
+        Parameters(params): Parameters<OrganizationReadParams>,
+        context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let cancellation = combine_cancellation(&self.session_cancellation, context.ct);
+        let result = organization_read(&self.relay, params, cancellation.clone()).await;
+        cancellation.cancel();
+        Ok(result)
+    }
+
+    #[tool(
+        name = "buzz_organization_apply",
+        description = "Apply one user-requested reversible grouping, title, summary, hide, restore, or undo change while preserving the original signed messages."
+    )]
+    async fn buzz_organization_apply(
+        &self,
+        Parameters(params): Parameters<OrganizationApplyParams>,
+        context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let cancellation = combine_cancellation(&self.session_cancellation, context.ct);
+        let result = organization_apply(&self.relay, params, cancellation.clone()).await;
         cancellation.cancel();
         Ok(result)
     }
@@ -322,10 +430,30 @@ impl TrustedSessionMcp {
 }
 
 impl TrustedSessionMcp {
+    /// Verify one inbound peer identity against the same signed enrollment
+    /// evidence used by the trusted peer tools.
+    pub async fn is_enrolled_peer(
+        &self,
+        pubkey: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<bool, String> {
+        self.relay.is_enrolled_peer(pubkey, cancellation).await
+    }
+
     /// Update the harness-owned reply destination before dispatching a turn.
     /// This mutates no model-visible authority or A2A scope.
     pub fn set_chat_thread_root_id(&self, thread_root_id: Option<&str>) -> Result<(), String> {
         self.relay.set_chat_thread_root_id(thread_root_id)
+    }
+
+    /// Atomically update the harness-owned channel and thread reply destination.
+    /// Provider, signer, project, repository and A2A scope remain immutable.
+    pub fn set_chat_destination(
+        &self,
+        channel_id: &str,
+        thread_root_id: Option<&str>,
+    ) -> Result<(), String> {
+        self.relay.set_chat_destination(channel_id, thread_root_id)
     }
 
     async fn begin_privileged_operation(

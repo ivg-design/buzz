@@ -1,8 +1,11 @@
 //! Trusted, typed relay operations kept outside the model shell boundary.
 
+mod chat;
 mod credentials;
 mod git;
 mod media;
+#[path = "../organization.rs"]
+mod organization;
 mod peers;
 mod privilege;
 mod relay;
@@ -10,9 +13,17 @@ mod scope;
 mod service;
 mod tools;
 
+pub use chat::{
+    ask_peer, create_thread, read_chat, reply_to_peer, send_chat, wait_for_peer, ChatReadParams,
+    ChatSendParams, ChatThreadCreateParams, PeerAskParams, PeerReplyParams, PeerWaitParams,
+};
 pub(crate) use credentials::scrub_harness_environment;
 pub use credentials::{HarnessTrustedIdentity, TrustedConfig, TrustedSessionScope};
 pub use git::{ProjectGitCommitParams, ProjectGitParams};
+pub use organization::{
+    organization_apply, organization_read, OrganizationApplyParams, OrganizationReadParams,
+};
+pub use peers::VerifiedPeer;
 pub use privilege::{
     JobPrivilegeGate, PrivilegeFuture, PrivilegedGitDisposition, PrivilegedGitOperationReceipt,
     PrivilegedOperationOutcome, ProjectGitOperation, TrustedGitOperationLease,
@@ -21,8 +32,8 @@ pub use relay::{PublishedEvent, TrustedRelay};
 pub use scope::{GrantMatch, GrantSet};
 pub use service::TrustedSessionMcp;
 pub use tools::{
-    cancel, dispatch, inbox, peers, send_chat, status, A2aCancelParams, A2aDispatchParams,
-    A2aHandoffParams, A2aInboxParams, A2aPeersParams, A2aStatusParams, ChatSendParams,
+    cancel, dispatch, inbox, peers, status, A2aCancelParams, A2aDispatchParams, A2aHandoffParams,
+    A2aInboxParams, A2aPeersParams, A2aStatusParams,
 };
 
 /// Environment names that belong to the harness boundary and must never reach

@@ -1,3 +1,4 @@
+use super::emitter::publish_lifecycle_mirror;
 use super::ledger::{ReceiptKind, StoredClaim, StoredDecline};
 use super::{JobReceiver, ReceiverError};
 
@@ -39,6 +40,9 @@ pub(super) async fn publish_decline(
         .rest
         .submit_event_confirmed(&decline.declined)
         .await?;
+    publish_lifecycle_mirror(&receiver.rest, &decline.declined, &receiver.keys)
+        .await
+        .map_err(|error| ReceiverError::Receipt(error.to_string()))?;
     receiver.ledger.mark_decline_acked(decline).await?;
     Ok(())
 }
@@ -76,6 +80,9 @@ async fn submit(
         ReceiptKind::Accepted => &claim.accepted,
     };
     receiver.rest.submit_event_confirmed(event).await?;
+    publish_lifecycle_mirror(&receiver.rest, event, &receiver.keys)
+        .await
+        .map_err(|error| ReceiverError::Receipt(error.to_string()))?;
     receiver.ledger.mark_receipt_acked(claim, kind).await?;
     Ok(())
 }

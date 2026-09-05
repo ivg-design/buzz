@@ -1,7 +1,7 @@
-import {
-  formatTimelineMessages,
-  isTimelineContentEvent,
-} from "@/features/messages/lib/formatTimelineMessages";
+import type { formatTimelineMessages } from "@/features/messages/lib/formatTimelineMessages";
+import { formatOrganizedMessages } from "@/features/messages/organization/formatOrganizedMessages";
+import { ORGANIZATION_KIND } from "@/features/messages/organization/projection";
+import { isTimelineContentEvent } from "@/features/messages/lib/formatTimelineMessages";
 import { buildThreadPanelData } from "@/features/messages/lib/threadPanel";
 import type { RelayEvent } from "@/shared/api/types";
 import {
@@ -74,7 +74,13 @@ export function buildIndependentThreadPanel(
       )
     : [];
   const events = head ? [head, ...headAux, ...replyEvents] : replyEvents;
-  const messages = formatTimelineMessages(events, ...formatArgs);
+  const messages = formatOrganizedMessages(
+    [
+      ...events,
+      ...channelEvents.filter((event) => event.kind === ORGANIZATION_KIND),
+    ],
+    ...formatArgs,
+  );
   return {
     ...buildThreadPanelData(messages, rootId, replyTargetId, expandedReplyIds),
     messages,
@@ -87,3 +93,30 @@ type Tail<T extends readonly unknown[]> = T extends readonly [
 ]
   ? R
   : never;
+
+/** An original deep link remains readable even when organization hides its target. */
+export function buildIndependentThreadPanelForLink(
+  revealMessageId: string | null | undefined,
+  ...args: Parameters<typeof buildIndependentThreadPanel>
+) {
+  const projected = buildIndependentThreadPanel(...args);
+  const target = revealMessageId ?? args[2];
+  if (!target || projected.messages.some((message) => message.id === target))
+    return projected;
+  const [channelEvents, ...rest] = args;
+  if (!channelEvents.some((event) => event.kind === ORGANIZATION_KIND))
+    return projected;
+  const original = buildIndependentThreadPanel(
+    channelEvents.filter((event) => event.kind !== ORGANIZATION_KIND),
+    ...rest,
+  );
+  if (
+    !original.threadHead ||
+    !original.messages.some((message) => message.id === target)
+  )
+    return projected;
+  return {
+    ...original,
+    threadHead: { ...original.threadHead, organizationHiddenMessageId: target },
+  };
+}

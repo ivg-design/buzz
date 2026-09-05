@@ -121,6 +121,9 @@ export function countTopLevelTimelineRows(events: RelayEvent[]): number {
     }
     seenEventIds.add(event.id);
     const jobProjection = projectJobConversation(event);
+    if (jobProjection?.hidden) {
+      continue;
+    }
     if (jobProjection?.requestEventId) {
       continue;
     }
@@ -320,6 +323,9 @@ export function formatTimelineMessages(
     ) {
       return false;
     }
+    if (projectJobConversation(event)?.hidden) {
+      return false;
+    }
     visibleEventIds.add(event.id);
     return true;
   });
@@ -512,6 +518,24 @@ export function formatTimelineMessages(
     const role = roleByPubkey.get(authorPubkey.toLowerCase());
     const authorProfile = profiles?.[authorPubkey.toLowerCase()];
     const isAgent = role === "bot" || authorProfile?.isAgent === true;
+    const hasTaskRootMarker =
+      event.kind === KIND_STREAM_MESSAGE &&
+      event.tags.some(
+        (tag) =>
+          tag[0] === "buzz-task" &&
+          (tag[1] === "root" || tag[1] === "assignment"),
+      );
+    const addressesKnownAgent =
+      event.kind === KIND_STREAM_MESSAGE &&
+      thread.parentId == null &&
+      event.tags.some((tag) => {
+        if (tag[0] !== "p" || typeof tag[1] !== "string") return false;
+        const recipient = tag[1].toLowerCase();
+        return (
+          roleByPubkey.get(recipient) === "bot" ||
+          profiles?.[recipient]?.isAgent === true
+        );
+      });
     const ownerPubkey = isAgent ? (authorProfile?.ownerPubkey ?? null) : null;
     return {
       id: event.id,
@@ -549,6 +573,10 @@ export function formatTimelineMessages(
       pending: event.pending,
       edited: edit !== undefined,
       kind: event.kind,
+      taskThread:
+        jobProjection?.taskRoot === true ||
+        hasTaskRootMarker ||
+        addressesKnownAgent,
       // When edited, swap the original event's imeta tags for the edit's
       // imeta tags. All non-imeta tags on the original are preserved.
       // Logic lives in `applyEditTagOverlay.mjs` so prod and tests share

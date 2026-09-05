@@ -1,7 +1,5 @@
 use super::super::project_git_exec::build_test_git_auth_config;
-use super::super::project_git_file_content::{
-    read_local_preview_content, validate_repo_file_path,
-};
+use super::super::project_git_file_content::{read_local_preview_content, validate_repo_file_path};
 use super::*;
 
 #[test]
@@ -80,7 +78,12 @@ fn parse_ls_tree_never_reads_blob_previews() {
 
     let files = parse_ls_tree(&output, &std::collections::HashMap::new());
 
-    assert_eq!(files.last().and_then(|file| file.preview_content.as_deref()), None);
+    assert_eq!(
+        files
+            .last()
+            .and_then(|file| file.preview_content.as_deref()),
+        None
+    );
     assert_eq!(files.last().and_then(|file| file.size), None);
 }
 
@@ -115,10 +118,13 @@ fn selected_local_branch_snapshot_and_content_do_not_move_the_worktree() {
     run_git(&["init", "--", checkout_path], None, &auth).expect("initialize checkout");
 
     std::fs::write(checkout.join("shared.txt"), "main committed\n").expect("write main file");
-    std::fs::write(checkout.join("main-only.txt"), "main only\n")
-        .expect("write main-only file");
-    run_git(&["add", "shared.txt", "main-only.txt"], Some(&checkout), &auth)
-        .expect("stage main files");
+    std::fs::write(checkout.join("main-only.txt"), "main only\n").expect("write main-only file");
+    run_git(
+        &["add", "shared.txt", "main-only.txt"],
+        Some(&checkout),
+        &auth,
+    )
+    .expect("stage main files");
     run_git(
         &[
             "-c",
@@ -135,10 +141,8 @@ fn selected_local_branch_snapshot_and_content_do_not_move_the_worktree() {
     .expect("commit main content");
     run_git(&["branch", "-M", "main"], Some(&checkout), &auth).expect("name main branch");
 
-    run_git(&["checkout", "-b", "feature"], Some(&checkout), &auth)
-        .expect("create feature branch");
-    std::fs::write(checkout.join("shared.txt"), "feature committed\n")
-        .expect("write feature file");
+    run_git(&["checkout", "-b", "feature"], Some(&checkout), &auth).expect("create feature branch");
+    std::fs::write(checkout.join("shared.txt"), "feature committed\n").expect("write feature file");
     std::fs::remove_file(checkout.join("main-only.txt")).expect("remove main-only file");
     std::fs::write(checkout.join("feature-only.txt"), "feature only\n")
         .expect("write feature-only file");
@@ -171,8 +175,8 @@ fn selected_local_branch_snapshot_and_content_do_not_move_the_worktree() {
         .expect("read main head")
         .trim()
         .to_string();
-    let status_before = run_git(&["status", "--porcelain"], Some(&checkout), &auth)
-        .expect("read main status");
+    let status_before =
+        run_git(&["status", "--porcelain"], Some(&checkout), &auth).expect("read main status");
 
     let feature = snapshot_from_worktree(&checkout, &auth, Some("feature"), Some("main"))
         .expect("snapshot feature branch");
@@ -183,8 +187,14 @@ fn selected_local_branch_snapshot_and_content_do_not_move_the_worktree() {
             .map(|commit| commit.hash.as_str()),
         Some(feature_head.as_str())
     );
-    assert!(feature.files.iter().any(|file| file.path == "feature-only.txt"));
-    assert!(!feature.files.iter().any(|file| file.path == "main-only.txt"));
+    assert!(feature
+        .files
+        .iter()
+        .any(|file| file.path == "feature-only.txt"));
+    assert!(!feature
+        .files
+        .iter()
+        .any(|file| file.path == "main-only.txt"));
     assert_eq!(
         read_local_preview_content(&checkout, "shared.txt", Some("feature"), &auth)
             .expect("read feature content")
@@ -201,7 +211,10 @@ fn selected_local_branch_snapshot_and_content_do_not_move_the_worktree() {
     let main = snapshot_from_worktree(&checkout, &auth, Some("main"), Some("main"))
         .expect("snapshot current main branch");
     assert!(main.files.iter().any(|file| file.path == "main-only.txt"));
-    assert!(!main.files.iter().any(|file| file.path == "feature-only.txt"));
+    assert!(!main
+        .files
+        .iter()
+        .any(|file| file.path == "feature-only.txt"));
     assert_eq!(
         main.files
             .iter()
@@ -229,8 +242,7 @@ fn selected_local_branch_snapshot_and_content_do_not_move_the_worktree() {
         head_before
     );
     assert_eq!(
-        run_git(&["status", "--porcelain"], Some(&checkout), &auth)
-            .expect("read unchanged status"),
+        run_git(&["status", "--porcelain"], Some(&checkout), &auth).expect("read unchanged status"),
         status_before
     );
 }
@@ -357,11 +369,22 @@ fn sync_and_pull_preserve_full_history_beyond_one_hundred_commits() {
         .expect("create history");
     }
     run_git(&["branch", "-M", "main"], Some(&checkout), &auth).expect("rename branch");
-    run_git(&["remote", "add", "origin", remote_path], Some(&checkout), &auth)
-        .expect("add remote");
+    run_git(
+        &["remote", "add", "origin", remote_path],
+        Some(&checkout),
+        &auth,
+    )
+    .expect("add remote");
     run_git(&["push", "origin", "main"], Some(&checkout), &auth).expect("seed remote");
     run_git(
-        &["clone", "--branch", "main", "--", remote_path, upstream_path],
+        &[
+            "clone",
+            "--branch",
+            "main",
+            "--",
+            remote_path,
+            upstream_path,
+        ],
         None,
         &auth,
     )
@@ -388,7 +411,14 @@ fn sync_and_pull_preserve_full_history_beyond_one_hundred_commits() {
     assert_eq!(status.behind_count, 1);
     assert!(!checkout.join(".git/shallow").exists());
     run_git(
-        &["pull", "--ff-only", "--no-tags", "--end-of-options", "origin", "main"],
+        &[
+            "pull",
+            "--ff-only",
+            "--no-tags",
+            "--end-of-options",
+            "origin",
+            "main",
+        ],
         Some(&checkout),
         &auth,
     )

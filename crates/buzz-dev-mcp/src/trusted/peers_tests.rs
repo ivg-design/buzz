@@ -82,6 +82,9 @@ fn cross_owner_discovery_does_not_require_home_roster_rows() {
     let peers = resolve_policies(&policies, &owners);
     assert_eq!(peers.len(), 2);
     assert!(peers.iter().all(|peer| peer.name == "Worker"));
+    assert!(peers.iter().all(|peer| !peer.owner_pubkey.is_empty()));
+    let encoded = serde_json::to_string(&peers).unwrap();
+    assert!(!encoded.contains("owner_pubkey"));
     assert_ne!(
         peers[0].pubkey, peers[1].pubkey,
         "duplicate names stay explicit"

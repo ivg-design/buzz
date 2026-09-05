@@ -90,6 +90,7 @@ pub(super) fn fixture(
                 address: format!("30621:{}:nemo", sender.public_key().to_hex()),
                 home_channel: channel.to_string(),
             },
+            conversation: None,
             repository: JobRepository {
                 canonical: repository.into(),
                 github_issue: None,
@@ -111,6 +112,8 @@ pub(super) fn fixture(
                 .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         },
         capability: "rust".into(),
+        title: None,
+        origin: None,
         summary: summary.into(),
         acceptance: vec!["Tests pass".into()],
         supersedes_event_id: None,
@@ -206,7 +209,14 @@ fn managed_setup_failure(
     git(&["commit", "--quiet", "-m", "fixture"]);
     git(&["remote", "add", "origin", buzz_core::nemo::REPOSITORY]);
     let base_sha = git(&["rev-parse", "HEAD"]);
-    git(&["config", "credential.helper", "!/tmp/untrusted-helper"]);
+    // Ordinary native agents may use host credential helpers. A mismatched
+    // repository identity remains a genuine preparation failure.
+    git(&[
+        "remote",
+        "set-url",
+        "origin",
+        "https://github.com/mysteropodes/other.git",
+    ]);
 
     let channel = Uuid::parse_str(buzz_core::nemo::HOME_CHANNEL).expect("Nemo home");
     let (mut request, _) = fixture(

@@ -3,6 +3,7 @@ mod cancel;
 mod emitter;
 mod git_receipt_journal;
 mod grants;
+mod human_report;
 mod lease;
 mod ledger;
 mod lifecycle;
@@ -32,13 +33,16 @@ use emitter::{build_claim_receipts, build_declined_receipt};
 use git_receipt_journal::GitEffect;
 pub(crate) use grants::prepare_job_sources;
 use grants::{GrantError, GrantSet};
+pub use human_report::HumanJobReport;
 use lease::ReceiverLease;
 use ledger::{
     ClaimDecision, DeclineDecision, DeclineLookup, JobLedger, LedgerError, StoredClaim,
     StoredDecline,
 };
 use lifecycle::LifecycleError;
-pub use outcome::{parse_terminal_outcome, TerminalDisposition};
+pub use outcome::{
+    parse_terminal_outcome, parse_terminal_outcome_with_report, TerminalDisposition,
+};
 pub(crate) use privilege::{JobPrivilege, JobPrivilegeRegistry};
 pub use prompt::format_job_prompt;
 
@@ -370,6 +374,10 @@ pub struct JobReceiver {
 }
 
 impl JobReceiver {
+    pub(crate) fn notification_path(&self) -> PathBuf {
+        self.ledger.notification_path()
+    }
+
     pub fn has_configured_grants(
         cwd: &Path,
         sources: &ReceiverSources,
@@ -519,6 +527,32 @@ impl JobReceiver {
                 let _ = receipts::publish(self, &claim, false).await?;
                 let lifecycle = self.ledger.lifecycle_store(&claim);
                 if lifecycle.exists() {
+                    let durable_common = verified_durable_response_common(
+                        &claim,
+                        &self.agent_pubkey,
+                        &self.sponsor.pubkey,
+                    )?;
+                    let JobEvent::Request(request) = JobEvent::parse(&claim.request_event)
+                        .map_err(|error| ReceiverError::Receipt(error.to_string()))?
+                    else {
+                        return Err(ReceiverError::Receipt(
+                            "stored claim is not a job request".into(),
+                        ));
+                    };
+                    let emitter = JobEmitter::new(
+                        &request,
+                        claim.request_event_id.clone(),
+                        self.keys.clone(),
+                        self.rest.clone(),
+                        lifecycle.clone(),
+                        self.grants.capabilities_for(&request).unwrap_or_default(),
+                        claim.digest.clone(),
+                        durable_common.sponsor,
+                    );
+                    emitter
+                        .retry_human_report_outbox()
+                        .await
+                        .map_err(|error| ReceiverError::Receipt(error.to_string()))?;
                     if !self.ledger.prompt_started(&claim).await? {
                         git_receipt_journal::initialize_for_unstarted_lifecycle(
                             &lifecycle,
@@ -529,18 +563,20 @@ impl JobReceiver {
                         .map_err(|error| ReceiverError::Privilege(error.to_string()))?;
                     }
                     let (head, pending, _) = lifecycle.snapshot().await?;
-                    if let Some(event) = pending {
+                    if let Some(event) = pending.as_ref() {
                         validate_pending_terminal_git_effect(
                             &lifecycle,
-                            &event,
+                            event,
                             &head,
                             &claim,
                             &self.agent_pubkey,
                             &self.sponsor,
                         )?;
-                        self.rest.submit_event_confirmed(&event).await?;
-                        lifecycle.confirm(event.id.to_hex()).await?;
                     }
+                    emitter
+                        .retry_lifecycle_outbox()
+                        .await
+                        .map_err(|error| ReceiverError::Receipt(error.to_string()))?;
                 }
                 Ok::<(), ReceiverError>(())
             }
@@ -578,6 +614,31 @@ impl JobReceiver {
                 }
                 lifecycle.initialize(claim.accepted.id.to_hex()).await?;
             }
+            let durable_common =
+                verified_durable_response_common(&claim, &self.agent_pubkey, &self.sponsor.pubkey)?;
+            let JobEvent::Request(report_request) = JobEvent::parse(&claim.request_event)
+                .map_err(|error| ReceiverError::Receipt(error.to_string()))?
+            else {
+                return Err(ReceiverError::Receipt(
+                    "stored claim is not a job request".into(),
+                ));
+            };
+            let emitter = JobEmitter::new(
+                &report_request,
+                claim.request_event_id.clone(),
+                self.keys.clone(),
+                self.rest.clone(),
+                lifecycle.clone(),
+                self.grants
+                    .capabilities_for(&report_request)
+                    .unwrap_or_default(),
+                claim.digest.clone(),
+                durable_common.sponsor,
+            );
+            emitter
+                .retry_human_report_outbox()
+                .await
+                .map_err(|error| ReceiverError::Receipt(error.to_string()))?;
             let prompt_started = self.ledger.prompt_started(&claim).await?;
             if !prompt_started {
                 git_receipt_journal::initialize_for_unstarted_lifecycle(
@@ -589,18 +650,20 @@ impl JobReceiver {
                 .map_err(|error| ReceiverError::Privilege(error.to_string()))?;
             }
             let (head, pending, _) = lifecycle.snapshot().await?;
-            if let Some(event) = pending {
+            if let Some(event) = pending.as_ref() {
                 validate_pending_terminal_git_effect(
                     &lifecycle,
-                    &event,
+                    event,
                     &head,
                     &claim,
                     &self.agent_pubkey,
                     &self.sponsor,
                 )?;
-                self.rest.submit_event_confirmed(&event).await?;
-                lifecycle.confirm(event.id.to_hex()).await?;
             }
+            emitter
+                .retry_lifecycle_outbox()
+                .await
+                .map_err(|error| ReceiverError::Receipt(error.to_string()))?;
             let (_, _, terminal) = lifecycle.snapshot().await?;
             let pending_cancel = lifecycle.pending_cancel().await?.is_some();
             if !terminal && (pending_cancel || prompt_started) {

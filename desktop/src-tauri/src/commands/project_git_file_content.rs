@@ -120,19 +120,25 @@ pub(crate) fn read_local_preview_content(
         Some(repo_dir),
         auth,
     )?;
-    let Some(tree_entry) = tree_entry.strip_suffix('\0').filter(|entry| !entry.contains('\0')) else {
+    let Some(tree_entry) = tree_entry
+        .strip_suffix('\0')
+        .filter(|entry| !entry.contains('\0'))
+    else {
         return Ok(None);
     };
-    let Some(object) = tree_entry.split_once('\t').and_then(|(metadata, listed_path)| {
-        if listed_path != path {
-            return None;
-        }
-        let mut parts = metadata.split_whitespace();
-        let mode = parts.next()?;
-        let kind = parts.next()?;
-        let object = parts.next()?;
-        (matches!(mode, "100644" | "100755") && kind == "blob").then_some(object)
-    }) else {
+    let Some(object) = tree_entry
+        .split_once('\t')
+        .and_then(|(metadata, listed_path)| {
+            if listed_path != path {
+                return None;
+            }
+            let mut parts = metadata.split_whitespace();
+            let mode = parts.next()?;
+            let kind = parts.next()?;
+            let object = parts.next()?;
+            (matches!(mode, "100644" | "100755") && kind == "blob").then_some(object)
+        })
+    else {
         return Ok(None);
     };
     let size = run_git(&["cat-file", "-s", object], Some(repo_dir), auth)?
@@ -177,8 +183,7 @@ pub(crate) fn checkout_project_repo(
     let explicit_target = target_ref.or(target_commit);
 
     if let Some(fetch_ref) = explicit_target {
-        let clone_args =
-            bounded_remote_clone_args(clone_url, repo_path, None, true, blob_filter);
+        let clone_args = bounded_remote_clone_args(clone_url, repo_path, None, true, blob_filter);
         run_git_in_request(&clone_args, None, auth, budget)?;
         run_git_in_request(
             &[
@@ -196,10 +201,10 @@ pub(crate) fn checkout_project_repo(
         if let Some(expected_commit) = target_commit {
             let fetched_commit =
                 run_git_in_request(&["rev-parse", "FETCH_HEAD"], Some(repo_dir), auth, budget)
-                .ok()
-                .and_then(|output| first_output_line(&output))
-                .map(|commit| commit.to_ascii_lowercase())
-                .ok_or_else(|| "Could not resolve the requested repository ref.".to_string())?;
+                    .ok()
+                    .and_then(|output| first_output_line(&output))
+                    .map(|commit| commit.to_ascii_lowercase())
+                    .ok_or_else(|| "Could not resolve the requested repository ref.".to_string())?;
             if fetched_commit != expected_commit {
                 return Err(
                     "The requested repository ref changed. Refresh and try again.".to_string(),

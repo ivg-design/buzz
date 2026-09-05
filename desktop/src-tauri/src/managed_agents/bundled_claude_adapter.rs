@@ -42,9 +42,12 @@ fn write_bundled_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     if std::fs::read(path).is_ok_and(|existing| existing == bytes) {
         return Ok(());
     }
-    let parent = path
-        .parent()
-        .ok_or_else(|| format!("bundled Claude adapter path has no parent: {}", path.display()))?;
+    let parent = path.parent().ok_or_else(|| {
+        format!(
+            "bundled Claude adapter path has no parent: {}",
+            path.display()
+        )
+    })?;
     std::fs::create_dir_all(parent)
         .map_err(|error| format!("create bundled Claude adapter directory: {error}"))?;
     let temp = parent.join(format!(
@@ -89,9 +92,9 @@ pub(crate) fn materialize_bundled_claude_acp() -> Result<PathBuf, String> {
     let prefix = super::buzz_managed_npm_prefix().ok_or_else(|| {
         "failed to resolve Buzz app-data directory for bundled Claude adapter".to_string()
     })?;
-    let directory = prefix
-        .join(".bundled")
-        .join(format!("claude-agent-acp-{BUNDLED_CLAUDE_ACP_VERSION}-nemo"));
+    let directory = prefix.join(".bundled").join(format!(
+        "claude-agent-acp-{BUNDLED_CLAUDE_ACP_VERSION}-nemo"
+    ));
     let tarball = directory.join(TARBALL_NAME);
     let patch = directory.join("nemo-job-policy.patch");
     let provenance = directory.join("PROVENANCE.json");
@@ -306,9 +309,15 @@ mod tests {
         std::fs::write(dist.join("index.js"), b"index").unwrap();
         let original = runtime_tree_sha256(&dist).unwrap();
         std::fs::write(dist.join("index.js"), b"tampered").unwrap();
-        assert_ne!(runtime_tree_sha256(&dist).as_deref(), Some(original.as_str()));
+        assert_ne!(
+            runtime_tree_sha256(&dist).as_deref(),
+            Some(original.as_str())
+        );
         std::fs::write(dist.join("extra.js"), b"extra").unwrap();
-        assert_ne!(runtime_tree_sha256(&dist).as_deref(), Some(original.as_str()));
+        assert_ne!(
+            runtime_tree_sha256(&dist).as_deref(),
+            Some(original.as_str())
+        );
     }
 
     #[test]

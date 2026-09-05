@@ -321,7 +321,13 @@ impl EventQueue {
         let queue = self.queues.entry(scope.clone()).or_default();
         // Enforce per-scope depth cap: drop oldest in this partition.
         if queue.len() >= MAX_PENDING_PER_SCOPE {
-            queue.pop_front();
+            let Some(index) = queue
+                .iter()
+                .position(|entry| !entry.prompt_tag.starts_with("delegated-result:"))
+            else {
+                return false;
+            };
+            queue.remove(index);
             tracing::warn!(
                 channel_id = %channel_id,
                 scope = %scope.telemetry_label(),
@@ -333,6 +339,27 @@ impl EventQueue {
         // Enforce the aggregate per-channel cap across all scopes so thread
         // partitioning cannot multiply the admitted backlog.
         self.enforce_channel_cap(channel_id);
+        true
+    }
+
+    /// A returned result must survive a busy requester, including Drop mode.
+    /// Existing delivery receipts deduplicate it again when the turn is rendered.
+    pub(crate) fn push_notification(&mut self, event: QueuedEvent) -> bool {
+        if self.in_flight_scopes.contains(&event.scope) {
+            return false;
+        }
+        if self.queues.get(&event.scope).is_some_and(|pending| {
+            pending
+                .iter()
+                .any(|existing| existing.event.id == event.event.id)
+        }) {
+            return true;
+        }
+        if self.channel_event_total(event.channel_id) >= MAX_PENDING_PER_CHANNEL {
+            return false;
+        }
+        let pending = self.queues.entry(event.scope.clone()).or_default();
+        pending.push_back(event);
         true
     }
 
@@ -406,12 +433,19 @@ impl EventQueue {
             let victim = self
                 .queues
                 .iter()
-                .filter(|(s, q)| s.channel_id() == channel_id && !s.is_job() && !q.is_empty())
-                .min_by_key(|(_, q)| q.front().unwrap().received_at)
-                .map(|(s, _)| s.clone());
-            let Some(scope) = victim else { break };
+                .filter(|(s, _)| s.channel_id() == channel_id && !s.is_job())
+                .filter_map(|(s, q)| {
+                    q.iter()
+                        .enumerate()
+                        .find(|(_, entry)| !entry.prompt_tag.starts_with("delegated-result:"))
+                        .map(|(index, entry)| (s.clone(), index, entry.received_at))
+                })
+                .min_by_key(|(_, _, received_at)| *received_at);
+            let Some((scope, index, _)) = victim else {
+                break;
+            };
             if let Some(q) = self.queues.get_mut(&scope) {
-                q.pop_front();
+                q.remove(index);
                 if q.is_empty() {
                     self.queues.remove(&scope);
                 }
@@ -1494,6 +1528,9 @@ fn resolve_turn_reply_anchor(
     reply_placement: ReplyPlacement,
     profile_lookup: Option<&PromptProfileLookup>,
 ) -> Option<String> {
+    if let Some(root) = &thread_tags.root_event_id {
+        return Some(root.clone());
+    }
     if is_dm {
         return thread_tags.root_event_id.clone().or_else(|| {
             (reply_placement == ReplyPlacement::Thread).then(|| last_event.event.id.to_hex())
@@ -1522,10 +1559,39 @@ pub(crate) fn trusted_chat_thread_root(
     // nesting for ordinary chat, but a worker's job-run update must stay on
     // the canonical request thread so humans and agents see one conversation.
     if batch.scope.is_job() {
+        if let Some(conversation) = batch.events.iter().find_map(|entry| {
+            match buzz_core::job::JobEvent::parse(&entry.event).ok()? {
+                buzz_core::job::JobEvent::Request(request) => request.common.conversation,
+                _ => None,
+            }
+        }) {
+            return Some(conversation.thread_root_id);
+        }
         return batch.scope.root_event_id().map(str::to_owned);
     }
     let last_event = batch.events.last()?;
-    let thread_tags = parse_thread_tags(&last_event.event);
+    if let Some((_, root)) =
+        crate::job_notifications::parse_reply_destination(&last_event.prompt_tag)
+    {
+        return root;
+    }
+    if matches!(
+        last_event.prompt_tag.as_str(),
+        "peer-question" | "peer-message" | "task-message"
+    ) || crate::peer_conversation::is_scheduled_instruction(&last_event.event)
+    {
+        return batch.scope.root_event_id().map(str::to_owned);
+    }
+    let thread_tags = if let Some((_, root)) =
+        crate::job_notifications::parse_reply_destination(&last_event.prompt_tag)
+    {
+        ThreadTags {
+            root_event_id: root,
+            ..Default::default()
+        }
+    } else {
+        parse_thread_tags(&last_event.event)
+    };
     let is_dm = args
         .channel_info
         .is_some_and(|channel| channel.channel_type == "dm");
@@ -1536,6 +1602,31 @@ pub(crate) fn trusted_chat_thread_root(
         args.reply_placement,
         args.profile_lookup,
     )
+    .map(|root| root.to_ascii_lowercase())
+}
+
+/// Chat placement can move while the provider continues its original session.
+pub(crate) fn trusted_chat_channel(batch: &FlushBatch) -> Uuid {
+    if let Some((channel, _)) = batch
+        .events
+        .last()
+        .and_then(|event| crate::job_notifications::parse_reply_destination(&event.prompt_tag))
+    {
+        return channel;
+    }
+    if batch.scope.is_job() {
+        if let Some(channel) = batch.events.iter().find_map(|entry| {
+            let buzz_core::job::JobEvent::Request(request) =
+                buzz_core::job::JobEvent::parse(&entry.event).ok()?
+            else {
+                return None;
+            };
+            Uuid::parse_str(&request.common.conversation?.channel_id).ok()
+        }) {
+            return channel;
+        }
+    }
+    batch.channel_id
 }
 
 /// Maximum length (in characters) of a channel description rendered into `<context>`.
@@ -1754,15 +1845,16 @@ fn format_context_hints(
             if let Some(event_id) = reply_anchor {
                 append_thread_instruction(&mut s, event_id);
             }
-        } else if reply_placement == ReplyPlacement::Timeline {
-            append_timeline_instruction(&mut s);
         } else if let Some(event_id) = reply_anchor {
             append_new_thread_instruction(&mut s, event_id);
+        } else {
+            append_timeline_instruction(&mut s);
         }
         crate::prompt_framing::semantic_section("context", &s)
     } else if let Some(root) = scope
         .root_event_id()
         .or(thread_tags.root_event_id.as_deref())
+        .map(|root| reply_anchor.unwrap_or(root))
     {
         let ctx_hint = if complete_conversation_context {
             "Thread context included below."
@@ -1796,15 +1888,14 @@ fn format_context_hints(
         s.push_str(&format!("\n{ctx_hint}"));
         if scope.is_job() {
             append_thread_instruction(&mut s, root);
-        } else if thread_tags.root_event_id.is_none() && reply_placement == ReplyPlacement::Timeline
-        {
-            append_timeline_instruction(&mut s);
         } else if let Some(event_id) = reply_anchor {
             if thread_tags.root_event_id.is_some() {
                 append_thread_instruction(&mut s, event_id);
             } else {
                 append_new_thread_instruction(&mut s, event_id);
             }
+        } else {
+            append_timeline_instruction(&mut s);
         }
         crate::prompt_framing::semantic_section("context", &s)
     } else {
@@ -2111,7 +2202,16 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
             return Vec::new();
         }
     };
-    let thread_tags = parse_thread_tags(&last_event.event);
+    let thread_tags = if let Some((_, root)) =
+        crate::job_notifications::parse_reply_destination(&last_event.prompt_tag)
+    {
+        ThreadTags {
+            root_event_id: root,
+            ..Default::default()
+        }
+    } else {
+        parse_thread_tags(&last_event.event)
+    };
     let is_dm = args
         .channel_info
         .map(|ci| ci.channel_type == "dm")
@@ -2147,16 +2247,18 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
     // Agent↔agent turns get no forced anchor — deep nesting is intentional
     // there. DMs follow the configured top-level placement, while explicit DM
     // threads stay anchored to their canonical root.
-    let reply_anchor = resolve_turn_reply_anchor(
-        last_event,
-        &thread_tags,
-        is_dm,
-        args.reply_placement,
-        args.profile_lookup,
-    );
+    let reply_anchor = trusted_chat_thread_root(batch, args);
+    let reply_channel = trusted_chat_channel(batch);
+    let mut display_scope = batch.scope.clone();
+    match &mut display_scope {
+        SessionScope::Conversation { channel_id }
+        | SessionScope::Thread { channel_id, .. }
+        | SessionScope::Job { channel_id, .. } => *channel_id = reply_channel,
+    }
     sections.push(format_context_hints(
-        &batch.scope,
-        args.channel_info,
+        &display_scope,
+        args.channel_info
+            .filter(|_| reply_channel == batch.channel_id),
         &thread_tags,
         is_dm,
         conversation_context_status(
@@ -2251,6 +2353,18 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
         )
     };
     sections.push(event_section);
+
+    for event in &batch.events {
+        if event.prompt_tag.starts_with("delegated-result:") {
+            sections.push(crate::job_notifications::instruction().into());
+        }
+        if event.prompt_tag == "peer-question" {
+            if let Some(instruction) = crate::peer_conversation::question_instruction(&event.event)
+            {
+                sections.push(instruction);
+            }
+        }
+    }
 
     // 4c. Closing note for cancel + re-prompt.
     if has_cancelled {
@@ -2427,6 +2541,28 @@ mod tests {
     }
 
     #[test]
+    fn returned_result_waits_for_requester_and_deduplicates_without_eviction() {
+        let channel_id = Uuid::new_v4();
+        let mut queue = EventQueue::new(DedupMode::Drop);
+        let mut event = make_queued(channel_id, "Teammate finished");
+        event.prompt_tag = format!("delegated-result:{channel_id}:");
+        queue.in_flight_scopes.insert(conv(channel_id));
+        assert!(!queue.push_notification(event.clone()));
+        queue.in_flight_scopes.clear();
+        assert!(queue.push_notification(event.clone()));
+        assert!(queue.push_notification(event));
+        assert_eq!(queue.queued_event_count(&conv(channel_id)), 1);
+        for index in 0..=MAX_PENDING_PER_CHANNEL {
+            queue.push(make_queued(channel_id, &format!("chat-{index}")));
+        }
+        let batch = queue.flush_next().unwrap();
+        assert!(batch
+            .events
+            .iter()
+            .any(|event| event.prompt_tag.starts_with("delegated-result:")));
+    }
+
+    #[test]
     fn durable_job_chat_and_prompt_are_bound_to_request_thread() {
         let channel_id = Uuid::new_v4();
         let job_scope = job(channel_id, "a");
@@ -2455,7 +2591,7 @@ mod tests {
     }
 
     #[test]
-    fn human_task_thread_reply_keeps_root_without_changing_nonjob_agent_policy() {
+    fn human_and_agent_task_thread_replies_keep_the_same_root() {
         let channel_id = Uuid::new_v4();
         let root = "b".repeat(64);
         let event = make_event_with_tags(
@@ -2487,7 +2623,7 @@ mod tests {
                     ..Default::default()
                 }
             ),
-            Some(root)
+            Some(root.clone())
         );
 
         let agent = HashMap::from([(
@@ -2505,8 +2641,8 @@ mod tests {
                     ..Default::default()
                 }
             ),
-            None,
-            "ordinary agent-only threads retain their existing placement policy"
+            Some(root),
+            "agent replies stay in the same visible task thread"
         );
     }
 
@@ -4330,11 +4466,7 @@ mod tests {
                             prompt.contains("This is a new top-level message"),
                             !is_reply
                         );
-                        let anchor = if is_reply {
-                            root.to_uppercase()
-                        } else {
-                            root.clone()
-                        };
+                        let anchor = root.clone();
                         assert!(prompt.contains("Trusted reply destination:"));
                         assert!(prompt.contains(&anchor));
                     }
@@ -5529,8 +5661,8 @@ mod tests {
             "channel thread reply should describe reply-to as the default"
         );
         assert!(
-            prompt.contains("this turn is scope-bound"),
-            "channel thread reply should explain its trusted destination boundary"
+            prompt.contains("explicitly requested different destination"),
+            "channel thread reply should explain when an explicit destination is appropriate"
         );
         assert!(
             !prompt.contains("Do not broadcast to the channel"),
@@ -5730,8 +5862,8 @@ mod tests {
             "instruction should identify an explicit destination change"
         );
         assert!(
-            prompt.contains("owner or operator"),
-            "instruction should route destination changes to an authenticated operator"
+            prompt.contains("buzz_chat_thread_create"),
+            "agent can select a new task thread without asking a human to relay it"
         );
     }
 

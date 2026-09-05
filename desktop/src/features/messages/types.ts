@@ -41,12 +41,18 @@ export type TimelineMessage = {
   body: string;
   parentId?: string | null;
   rootId?: string | null;
+  /** Display-only organization override; original signed tags remain intact. */
+  organizationMoved?: boolean;
+  /** Original-link view reveals hidden content with a direct restore action. */
+  organizationHiddenMessageId?: string;
   depth: number;
   accent?: boolean;
   pending?: boolean;
   edited?: boolean;
   highlighted?: boolean;
   kind?: number;
+  /** Job request roots expose their task thread before the first reply arrives. */
+  taskThread?: boolean;
   tags?: string[][];
   reactions?: TimelineReaction[];
 };

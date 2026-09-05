@@ -1,3 +1,5 @@
+import { OrganizationThreadIntro } from "@/features/messages/organization/OrganizationHistory";
+import type { ThreadMetadata } from "@/features/messages/organization/projection";
 import * as React from "react";
 import { ArrowDown } from "lucide-react";
 
@@ -54,6 +56,8 @@ import { selectThreadRowHighlight } from "@/features/messages/lib/threadReplyHig
 
 type MessageThreadPanelProps = ThreadPanelLayoutProps & {
   channel: Channel | null;
+  organizationMetadata?: ThreadMetadata;
+  onRestoreOrganizationMessage?: (messageId: string) => Promise<void>;
   channelId: string | null;
   channelName: string;
   currentPubkey?: string;
@@ -144,6 +148,8 @@ const THREAD_PANEL_SUMMARY_INDENT_OFFSET_REM = 0;
 
 export function MessageThreadPanel({
   channel,
+  organizationMetadata,
+  onRestoreOrganizationMessage,
   channelId,
   channelName,
   columnMaxWidthPx,
@@ -534,6 +540,26 @@ export function MessageThreadPanel({
             className={cn(THREAD_PANEL_MESSAGE_GUTTER_CLASS, "pb-1 pt-0")}
             data-testid="message-thread-head"
           >
+            {threadHead.organizationHiddenMessageId ? (
+              <div className="mb-2 flex items-center justify-between gap-2 text-xs text-muted-foreground">
+                <span>Original message · hidden from the channel</span>
+                {onRestoreOrganizationMessage ? (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => {
+                      if (threadHead.organizationHiddenMessageId)
+                        void onRestoreOrganizationMessage(
+                          threadHead.organizationHiddenMessageId,
+                        ).catch(() => {});
+                    }}
+                  >
+                    Restore
+                  </Button>
+                ) : null}
+              </div>
+            ) : null}
+            <OrganizationThreadIntro metadata={organizationMetadata} />
             <div className="rounded-2xl">
               <MessageThreadRow
                 actionBarPlacement="inside"

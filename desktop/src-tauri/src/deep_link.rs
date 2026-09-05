@@ -33,10 +33,7 @@ impl fmt::Debug for PendingCommunityDeepLink {
             .field("id", &self.id)
             .field("kind", &self.kind)
             .field("relay_url", &self.relay_url)
-            .field(
-                "code",
-                &self.code.as_ref().map(|_| "[redacted]"),
-            )
+            .field("code", &self.code.as_ref().map(|_| "[redacted]"))
             .field(
                 "policy_receipt",
                 &self.policy_receipt.as_ref().map(|_| "[redacted]"),
@@ -537,9 +534,8 @@ fn valid_community_link_envelope(url: &Url, allowed_params: &[&str]) -> bool {
         return false;
     }
     let mut seen = std::collections::HashSet::new();
-    url.query_pairs().all(|(key, _)| {
-        allowed_params.contains(&key.as_ref()) && seen.insert(key.into_owned())
-    })
+    url.query_pairs()
+        .all(|(key, _)| allowed_params.contains(&key.as_ref()) && seen.insert(key.into_owned()))
 }
 
 fn canonical_base64url(value: &str, expected_len: Option<usize>) -> bool {
@@ -779,14 +775,7 @@ pub(crate) fn handle_deep_link_url(app: &tauri::AppHandle, url_str: &str) {
             let relay_url = payload["relayUrl"].as_str().unwrap_or_default().to_owned();
             let code = payload["code"].as_str().map(str::to_owned);
             let policy_receipt = payload["policyReceipt"].as_str().map(str::to_owned);
-            if queue_community_deep_link(
-                app,
-                "join",
-                relay_url,
-                code,
-                policy_receipt,
-                None,
-            ) {
+            if queue_community_deep_link(app, "join", relay_url, code, policy_receipt, None) {
                 let _ = app.emit("deep-link-join", payload);
             }
         }

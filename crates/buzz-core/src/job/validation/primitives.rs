@@ -60,7 +60,7 @@ pub(super) fn validate_branch(value: &str) -> Result<(), JobValidationError> {
     Ok(())
 }
 
-pub(super) fn validate_uuid(name: &str, value: &str) -> Result<(), JobValidationError> {
+pub(crate) fn validate_uuid(name: &str, value: &str) -> Result<(), JobValidationError> {
     let parsed = Uuid::parse_str(value)
         .map_err(|_| JobValidationError::new(format!("{name} must be a UUID")))?;
     if parsed.is_nil() || parsed.to_string() != value {

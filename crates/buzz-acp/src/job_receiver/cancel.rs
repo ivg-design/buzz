@@ -200,13 +200,6 @@ pub(super) async fn handle(
     // it. The terminal is resolved from the receipt journal only after the
     // caller has proven every privileged child reaped.
     privileges.revoke(&scope);
-    match lifecycle
-        .observe_cancel(event_id, prior_event_id.to_owned())
-        .await?
-    {
-        CancelDecision::AlreadyTerminal => return Ok(CancelOutcome::Consumed),
-        CancelDecision::Observed | CancelDecision::Replay => {}
-    }
     let emitter = JobEmitter::new(
         &request,
         claim.request_event_id.clone(),
@@ -220,6 +213,21 @@ pub(super) async fn handle(
         claim.digest.clone(),
         receiver.sponsor.clone(),
     );
+    if pending_is_predecessor {
+        // The relay-stored Cancel proves this frozen event won as its exact
+        // predecessor. Finish its ordinary-chat mirror before adopting Cancel.
+        emitter
+            .retry_lifecycle_outbox()
+            .await
+            .map_err(|error| ReceiverError::Receipt(error.to_string()))?;
+    }
+    match lifecycle
+        .observe_cancel(event_id, prior_event_id.to_owned())
+        .await?
+    {
+        CancelDecision::AlreadyTerminal => return Ok(CancelOutcome::Consumed),
+        CancelDecision::Observed | CancelDecision::Replay => {}
+    }
     Ok(CancelOutcome::Cancel(Box::new(JobCancel {
         scope,
         request_event_id: claim.request_event_id.clone(),

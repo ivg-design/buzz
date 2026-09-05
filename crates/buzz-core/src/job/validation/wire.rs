@@ -124,11 +124,11 @@ pub(in crate::job) fn validate_wire_keys(kind: u32, raw: &Value) -> Result<(), J
         "expires_at",
     ];
     let mut required = COMMON.to_vec();
-    let mut optional = Vec::new();
+    let mut optional = vec!["conversation"];
     match kind {
         KIND_JOB_REQUEST => {
             required.extend(["capability", "summary", "acceptance"]);
-            optional.push("supersedes_event_id");
+            optional.extend(["title", "origin", "supersedes_event_id"]);
         }
         KIND_JOB_ACCEPTED => {
             required.extend(["request_event_id", "claim"]);
@@ -165,6 +165,14 @@ pub(in crate::job) fn validate_wire_keys(kind: u32, raw: &Value) -> Result<(), J
         &["address", "home_channel"],
         &[],
     )?;
+    if raw.get("conversation").is_some() {
+        validate_object_keys(
+            "conversation",
+            &raw["conversation"],
+            &["channel_id", "thread_root_id"],
+            &[],
+        )?;
+    }
     validate_object_keys(
         "repository",
         &raw["repository"],
@@ -178,6 +186,18 @@ pub(in crate::job) fn validate_wire_keys(kind: u32, raw: &Value) -> Result<(), J
         ],
         &["github_issue", "github_pr", "github_run"],
     )?;
+    if raw.get("origin").is_some() {
+        validate_object_keys(
+            "origin",
+            &raw["origin"],
+            &["channel_id"],
+            &[
+                "thread_root_id",
+                "session_channel_id",
+                "session_thread_root_id",
+            ],
+        )?;
+    }
     validate_object_keys("sponsor", &raw["sponsor"], &["pubkey", "github_login"], &[])?;
     if kind == KIND_JOB_ACCEPTED {
         validate_object_keys(

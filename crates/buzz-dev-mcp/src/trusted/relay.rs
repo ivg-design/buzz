@@ -5,6 +5,11 @@ use sha2::{Digest, Sha256};
 use std::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
+struct ChatDestination {
+    channel_id: Option<String>,
+    thread_root_id: Option<String>,
+}
+
 use buzz_core::job::{build_job_tags, JobEvent};
 use buzz_core::{CommunityContext, COMMUNITY_CONTEXT_SCHEMA_VERSION};
 
@@ -33,8 +38,13 @@ pub struct TrustedRelay {
     pub(super) owner_github_login: Option<String>,
     pub(super) grants: super::GrantSet,
     pub(super) a2a_channel_id: Option<String>,
-    pub(super) session_channel_id: Option<String>,
-    pub(super) session_thread_root_id: RwLock<Option<String>>,
+    /// Immutable provider-session channel captured at construction. Chat
+    /// reply placement may change independently during later turns.
+    pub(super) provider_channel_id: Option<String>,
+    /// Immutable provider-session root captured at construction. Conversation
+    /// reply placement may change independently during later turns.
+    pub(super) provider_thread_root_id: Option<String>,
+    chat_destination: RwLock<ChatDestination>,
     pub(super) job_operation_id: Option<String>,
     pub(super) job_request_event_id: Option<String>,
     pub(super) session_working_directory: Option<std::path::PathBuf>,
@@ -67,6 +77,12 @@ impl TrustedRelay {
             "BUZZ_MCP_JOB_REQUEST_EVENT_ID",
             config.job_request_event_id.as_deref(),
         )?;
+        let provider_channel_id = config.session_channel_id.clone();
+        let provider_thread_root_id = config.session_thread_root_id.clone();
+        let chat_destination = ChatDestination {
+            channel_id: config.session_channel_id.clone(),
+            thread_root_id: config.session_thread_root_id.clone(),
+        };
         Ok(Self {
             http,
             base_url,
@@ -78,8 +94,9 @@ impl TrustedRelay {
             owner_github_login: config.owner_github_login,
             grants: config.grants,
             a2a_channel_id: config.a2a_channel_id,
-            session_channel_id: config.session_channel_id,
-            session_thread_root_id: RwLock::new(config.session_thread_root_id),
+            provider_channel_id,
+            provider_thread_root_id,
+            chat_destination: RwLock::new(chat_destination),
             job_operation_id: config.job_operation_id,
             job_request_event_id: config.job_request_event_id,
             session_working_directory: config.session_working_directory,
@@ -89,6 +106,25 @@ impl TrustedRelay {
 
     pub fn signer_pubkey(&self) -> String {
         self.keys.public_key().to_hex()
+    }
+
+    /// Verify that a public key is a currently enrolled peer in this trusted
+    /// session's community. This reuses the same signed three-layer directory
+    /// evidence as the model-facing peer list.
+    pub async fn is_enrolled_peer(
+        &self,
+        pubkey: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<bool, String> {
+        let parsed =
+            nostr::PublicKey::parse(pubkey).map_err(|_| "peer pubkey is invalid".to_owned())?;
+        if parsed.to_hex() != pubkey {
+            return Err("peer pubkey must be canonical lowercase hexadecimal".into());
+        }
+        Ok(super::peers::discover(self, cancellation)
+            .await?
+            .iter()
+            .any(|peer| peer.pubkey == pubkey))
     }
 
     pub async fn fresh_context(
@@ -213,28 +249,91 @@ impl TrustedRelay {
         content: &str,
         cancellation: &CancellationToken,
     ) -> Result<PublishedEvent, String> {
+        let (channel, thread_root_id) = self.current_chat_destination()?;
+        let event =
+            self.build_chat_event_for_destination(channel, thread_root_id.as_deref(), content)?;
+        self.publish_chat_event(event, cancellation).await
+    }
+
+    pub(super) async fn publish_chat_event(
+        &self,
+        event: Event,
+        cancellation: &CancellationToken,
+    ) -> Result<PublishedEvent, String> {
         self.fresh_context(cancellation).await?;
-        let channel = self.session_channel_id.as_deref().ok_or_else(|| {
+        self.submit(event, PublishClass::Chat, cancellation).await
+    }
+
+    /// Publish one self-signed, validated organization change after refreshing
+    /// this session's authenticated community binding.
+    pub(super) async fn publish_organization_event(
+        &self,
+        event: Event,
+        cancellation: &CancellationToken,
+    ) -> Result<PublishedEvent, String> {
+        buzz_core::verify_event(&event)
+            .map_err(|_| "organization event signature is invalid".to_owned())?;
+        if event.pubkey != self.keys.public_key() {
+            return Err("organization event signer does not match this session".into());
+        }
+        buzz_core::organization::parse_change(&event)?;
+        self.fresh_context(cancellation).await?;
+        self.submit(event, PublishClass::Organization, cancellation)
+            .await
+    }
+
+    pub(super) fn bound_chat_channel(&self) -> Result<uuid::Uuid, String> {
+        self.current_chat_destination().map(|(channel, _)| channel)
+    }
+
+    pub(super) fn current_chat_thread_root(&self) -> Result<Option<String>, String> {
+        self.chat_destination
+            .read()
+            .map(|destination| destination.thread_root_id.clone())
+            .map_err(|_| "session chat destination is unavailable".to_owned())
+    }
+
+    pub(super) fn current_chat_destination_parts(
+        &self,
+    ) -> Result<(Option<String>, Option<String>), String> {
+        self.chat_destination
+            .read()
+            .map(|destination| {
+                (
+                    destination.channel_id.clone(),
+                    destination.thread_root_id.clone(),
+                )
+            })
+            .map_err(|_| "session chat destination is unavailable".to_owned())
+    }
+
+    pub(super) fn current_chat_destination(&self) -> Result<(uuid::Uuid, Option<String>), String> {
+        let (channel_id, thread_root_id) = self.current_chat_destination_parts()?;
+        let channel = channel_id.as_deref().ok_or_else(|| {
             "typed chat is unavailable outside a channel-bound session".to_owned()
         })?;
         let channel = uuid::Uuid::parse_str(channel)
             .map_err(|_| "session channel binding is invalid".to_owned())?;
-        let event = self.build_session_chat_event(channel, content)?;
-        self.submit(event, PublishClass::Chat, cancellation).await
+        Ok((channel, thread_root_id))
     }
 
+    #[cfg(test)]
     fn build_session_chat_event(
         &self,
         channel: uuid::Uuid,
         content: &str,
     ) -> Result<Event, String> {
-        let thread_root_id = self
-            .session_thread_root_id
-            .read()
-            .map_err(|_| "session chat destination is unavailable".to_owned())?
-            .clone();
+        let thread_root_id = self.current_chat_thread_root()?;
+        self.build_chat_event_for_destination(channel, thread_root_id.as_deref(), content)
+    }
+
+    fn build_chat_event_for_destination(
+        &self,
+        channel: uuid::Uuid,
+        thread_root_id: Option<&str>,
+        content: &str,
+    ) -> Result<Event, String> {
         let thread = thread_root_id
-            .as_deref()
             .map(|root| {
                 let event = nostr::EventId::parse(root)
                     .map_err(|_| "session thread binding is invalid".to_owned())?;
@@ -247,18 +346,55 @@ impl TrustedRelay {
         self.build_chat_event(channel, content, thread.as_ref())
     }
 
-    /// Replace only the conversational reply destination for the next turn.
-    /// The immutable channel, signer, repository and A2A scope remain fixed.
+    pub(super) fn build_scoped_chat_event(
+        &self,
+        channel: uuid::Uuid,
+        content: &str,
+        thread: Option<&buzz_sdk::ThreadRef>,
+        mentions: &[&str],
+        extra_tags: &[Tag],
+    ) -> Result<Event, String> {
+        let mut builder =
+            buzz_sdk::build_message(channel, content, thread, mentions, false, &[], &[])
+                .map_err(|error| format!("invalid chat message: {error}"))?;
+        for tag in extra_tags {
+            builder = builder.tag(tag.clone());
+        }
+        self.sign(builder)
+    }
+
+    /// Atomically replace the conversational reply destination for the next turn.
+    /// The immutable provider scope, signer, repository and A2A scope remain fixed.
+    pub(super) fn set_chat_destination(
+        &self,
+        channel_id: &str,
+        thread_root_id: Option<&str>,
+    ) -> Result<(), String> {
+        validate_optional_uuid("session channel", Some(channel_id))?;
+        validate_optional_hex("session thread root", thread_root_id)?;
+        let mut destination = self
+            .chat_destination
+            .write()
+            .map_err(|_| "session chat destination is unavailable".to_owned())?;
+        destination.channel_id = Some(channel_id.to_owned());
+        destination.thread_root_id = thread_root_id.map(str::to_owned);
+        Ok(())
+    }
+
+    /// Replace only the thread while retaining the current destination channel.
     pub(super) fn set_chat_thread_root_id(
         &self,
         thread_root_id: Option<&str>,
     ) -> Result<(), String> {
         validate_optional_hex("session thread root", thread_root_id)?;
         let mut destination = self
-            .session_thread_root_id
+            .chat_destination
             .write()
             .map_err(|_| "session chat destination is unavailable".to_owned())?;
-        *destination = thread_root_id.map(str::to_owned);
+        if destination.channel_id.is_none() && thread_root_id.is_some() {
+            return Err("session thread root requires a channel destination".into());
+        }
+        destination.thread_root_id = thread_root_id.map(str::to_owned);
         Ok(())
     }
 
@@ -385,7 +521,7 @@ impl TrustedRelay {
         let channel = self
             .a2a_channel_id
             .as_deref()
-            .or(self.session_channel_id.as_deref())
+            .or(self.provider_channel_id.as_deref())
             .ok_or_else(|| {
                 "A2A reads are unavailable outside a channel-bound session".to_owned()
             })?;
@@ -417,9 +553,7 @@ impl TrustedRelay {
         content: &str,
         thread: Option<&buzz_sdk::ThreadRef>,
     ) -> Result<Event, String> {
-        let builder = buzz_sdk::build_message(channel, content, thread, &[], false, &[], &[])
-            .map_err(|error| format!("invalid chat message: {error}"))?;
-        self.sign(builder)
+        self.build_scoped_chat_event(channel, content, thread, &[], &[])
     }
 
     async fn submit(
@@ -526,6 +660,7 @@ pub(super) async fn send_bounded_cancellable(
 enum PublishClass {
     ModelJob,
     Chat,
+    Organization,
 }
 
 impl PublishClass {
@@ -533,6 +668,7 @@ impl PublishClass {
         match self {
             Self::ModelJob => matches!(kind, 43001 | 43005),
             Self::Chat => kind == buzz_core::kind::KIND_STREAM_MESSAGE,
+            Self::Organization => kind == buzz_core::kind::KIND_CONVERSATION_ORGANIZATION,
         }
     }
 }

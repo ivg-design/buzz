@@ -666,8 +666,8 @@ pub(super) fn managed_codex_acp_install_command() -> Result<Option<String>, Box<
 
 /// Build the app-private install command for Buzz's checksum-pinned Claude
 /// adapter with the immutable JobPolicyV1 extension.
-pub(super) fn managed_claude_acp_install_command(
-) -> Result<Option<String>, Box<InstallStepResult>> {
+pub(super) fn managed_claude_acp_install_command() -> Result<Option<String>, Box<InstallStepResult>>
+{
     let tarball = crate::managed_agents::materialize_bundled_claude_acp().map_err(|error| {
         Box::new(InstallStepResult {
             step: "adapter".to_string(),

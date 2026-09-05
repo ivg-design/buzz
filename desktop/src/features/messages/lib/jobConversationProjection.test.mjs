@@ -47,7 +47,7 @@ function request() {
 
 test("projects every signed job lifecycle kind into human-readable conversation text", () => {
   const cases = [
-    [request(), "Review the reconnect path"],
+    [request(), "Task: Review the reconnect path"],
     [
       followup(43002, "b".repeat(64), {
         claim: { status: "processed", scope_digest: "d".repeat(64) },
@@ -68,7 +68,7 @@ test("projects every signed job lifecycle kind into human-readable conversation 
           reason: "workspace_setup_failed",
         },
       }),
-      "Declined the task. I couldn't set up the workspace needed for this task.",
+      "Declined the task. I couldn't set up the workspace needed for this task. Check repository access and the agent's runtime log for details.",
     ],
     [
       followup(43002, "7".repeat(64), {
@@ -159,7 +159,7 @@ test("keeps technical contract fields out of conversational rows", () => {
     }),
   );
 
-  assert.equal(requestProjection?.body, "Review the reconnect path");
+  assert.equal(requestProjection?.body, "Task: Review the reconnect path");
   assert.equal(resultProjection?.body, "Completed successfully.");
   assert.equal(
     errorProjection?.body,
@@ -273,6 +273,11 @@ test("renders the request in the channel and real agent updates in its one task 
       },
     ],
   );
+  assert.equal(messages[0].taskThread, true);
+  assert.equal(
+    messages.slice(1).some((message) => message.taskThread),
+    false,
+  );
   assert.equal(
     messages.some((message) => message.body.includes(WORKER)),
     false,
@@ -300,6 +305,158 @@ test("renders the request in the channel and real agent updates in its one task 
     "Completed successfully.\n\nThe provider session resumed without replaying the prompt.\n\nEvidence:\n- contract:tests-pass",
   );
   assert.equal(thread.visibleReplies.at(-1)?.message.author, "Clauditron");
+});
+
+test("exposes an empty task thread before the first lifecycle receipt arrives", () => {
+  const messages = formatTimelineMessages([request()], null, undefined, null);
+  const main = buildMainTimelineEntries(messages);
+
+  assert.equal(messages[0].body, "Task: Review the reconnect path");
+  assert.equal(messages[0].taskThread, true);
+  assert.deepEqual(main[0].summary, {
+    threadHeadId: REQUEST_ID,
+    replyCount: 0,
+    lastReplyAt: null,
+    participants: [],
+  });
+  assert.deepEqual(
+    buildThreadPanelData(messages, REQUEST_ID, REQUEST_ID, new Set())
+      .visibleReplies,
+    [],
+  );
+});
+
+test("uses optional task title with the concise summary and omits acceptance internals", () => {
+  const titled = event(43001, REQUEST_ID, {
+    title: "Reconnect recovery",
+    summary: "Verify the provider resumes without replaying the prompt.",
+    acceptance: ["Internal criterion that belongs in Activity"],
+  });
+  const projection = projectJobConversation(titled);
+
+  assert.equal(
+    projection?.body,
+    "Task: Reconnect recovery\n\nVerify the provider resumes without replaying the prompt.",
+  );
+  assert.doesNotMatch(projection?.body ?? "", /Internal criterion/);
+  assert.equal(projection?.taskRoot, true);
+});
+
+test("renders a worker-signed human report as an ordinary reply in the task thread", () => {
+  const report = event(9, "9".repeat(64), "Implemented and verified.", {
+    pubkey: WORKER,
+    tags: [
+      ["h", CHANNEL_ID],
+      ["e", REQUEST_ID, "", "reply"],
+      ["buzz-task", "report", REQUEST_ID],
+    ],
+  });
+  const profiles = {
+    [WORKER]: { displayName: "Clauditron", isAgent: true },
+  };
+  const messages = formatTimelineMessages(
+    [request(), report],
+    null,
+    undefined,
+    null,
+    profiles,
+    [{ pubkey: WORKER, role: "bot", isAgent: true }],
+  );
+  const thread = buildThreadPanelData(
+    messages,
+    REQUEST_ID,
+    REQUEST_ID,
+    new Set(),
+  );
+
+  assert.equal(thread.visibleReplies.length, 1);
+  assert.equal(
+    thread.visibleReplies[0].message.body,
+    "Implemented and verified.",
+  );
+  assert.equal(thread.visibleReplies[0].message.author, "Clauditron");
+  assert.equal(thread.visibleReplies[0].message.isAgent, true);
+});
+
+test("keeps new machine lifecycle payloads in Activity and shows ordinary task-thread mirrors", () => {
+  const taskRootId = "8".repeat(64);
+  const conversation = {
+    channel_id: CHANNEL_ID,
+    thread_root_id: taskRootId,
+  };
+  const taskRoot = event(9, taskRootId, "Task: Reconnect recovery", {
+    pubkey: REQUESTER,
+    tags: [
+      ["h", CHANNEL_ID],
+      ["buzz-task", "root"],
+    ],
+  });
+  const machineRequest = event(43001, REQUEST_ID, {
+    conversation,
+    summary: "Review the reconnect path",
+    acceptance: ["Recovery test passes"],
+  });
+  const machineAccepted = followup(43002, "b".repeat(64), {
+    conversation,
+    claim: { status: "accepted", scope_digest: "d".repeat(64) },
+  });
+  const started = event(9, "7".repeat(64), "Started the task.", {
+    pubkey: WORKER,
+    tags: [
+      ["h", CHANNEL_ID],
+      ["e", taskRootId, "", "reply"],
+      ["buzz-task", "lifecycle", machineAccepted.id],
+    ],
+  });
+
+  assert.equal(projectJobConversation(machineRequest)?.hidden, true);
+  assert.equal(projectJobConversation(machineAccepted)?.hidden, true);
+  const messages = formatTimelineMessages(
+    [taskRoot, machineRequest, machineAccepted, started],
+    null,
+    undefined,
+    null,
+  );
+  assert.deepEqual(
+    messages.map((message) => message.id),
+    [taskRootId, started.id],
+  );
+  assert.equal(messages[0].taskThread, true);
+  assert.equal(messages[1].body, "Started the task.");
+  assert.equal(messages[1].rootId, taskRootId);
+  assert.equal(countTopLevelTimelineRows([taskRoot, machineRequest]), 1);
+});
+
+test("opens task roots from stable markers or a top-level known-agent address", () => {
+  const markedRoot = event(9, "3".repeat(64), "Assigned task", {
+    tags: [
+      ["h", CHANNEL_ID],
+      ["buzz-task", "assignment", "operation-id"],
+    ],
+  });
+  const addressedRoot = event(9, "4".repeat(64), "Please investigate", {
+    tags: [
+      ["h", CHANNEL_ID],
+      ["p", WORKER],
+    ],
+  });
+  const ordinaryMention = event(9, "5".repeat(64), "Hello", {
+    tags: [
+      ["h", CHANNEL_ID],
+      ["p", "6".repeat(64)],
+    ],
+  });
+  const messages = formatTimelineMessages(
+    [markedRoot, addressedRoot, ordinaryMention],
+    null,
+    undefined,
+    null,
+    { [WORKER]: { displayName: "Clauditron", isAgent: true } },
+  );
+
+  assert.equal(messages[0].taskThread, true);
+  assert.equal(messages[1].taskThread, true);
+  assert.equal(messages[2].taskThread, false);
 });
 
 test("deduplicates reconnect deliveries without inventing another task or update", () => {

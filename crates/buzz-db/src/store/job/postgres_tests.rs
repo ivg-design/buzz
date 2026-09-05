@@ -50,6 +50,7 @@ fn job_common(requester: &Keys, worker: &Keys, channel_id: Uuid, operation_id: U
             address: format!("30621:{}:thread-test", requester.public_key().to_hex()),
             home_channel: channel_id.to_string(),
         },
+        conversation: None,
         repository: JobRepository {
             canonical: "https://github.com/example/thread-test".into(),
             github_issue: None,
@@ -95,6 +96,8 @@ fn job_sequence(requester: &Keys, worker: &Keys, channel_id: Uuid) -> Vec<(JobEv
     let request_job = JobEvent::Request(JobRequest {
         common: request_common.clone(),
         capability: "rust".into(),
+        title: None,
+        origin: None,
         summary: "Index this job as a conversation".into(),
         acceptance: vec!["One flat task thread".into()],
         supersedes_event_id: None,

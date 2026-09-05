@@ -63,26 +63,6 @@ pub(super) async fn terminate_channel(
             )
             .map_err(|error| ReceiverError::Privilege(error.to_string()))?;
         }
-        let pending = snapshot.pending_outbox;
-        if let Some(event) = pending {
-            super::validate_pending_terminal_git_effect(
-                &lifecycle,
-                &event,
-                &snapshot.head_event_id,
-                &claim,
-                &receiver.agent_pubkey,
-                &receiver.sponsor,
-            )?;
-            if let Err(error) = receiver.rest.submit_event_confirmed(&event).await {
-                first_error.get_or_insert_with(|| error.to_string());
-                continue;
-            }
-            lifecycle.confirm(event.id.to_hex()).await?;
-            if lifecycle.snapshot().await?.2 {
-                continue;
-            }
-        }
-        let pending_cancel = lifecycle.pending_cancel().await?.is_some();
         let emitter = JobEmitter::new(
             &request,
             claim.request_event_id.clone(),
@@ -96,6 +76,25 @@ pub(super) async fn terminate_channel(
             claim.digest.clone(),
             receiver.sponsor.clone(),
         );
+        let pending = snapshot.pending_outbox;
+        if let Some(event) = pending.as_ref() {
+            super::validate_pending_terminal_git_effect(
+                &lifecycle,
+                event,
+                &snapshot.head_event_id,
+                &claim,
+                &receiver.agent_pubkey,
+                &receiver.sponsor,
+            )?;
+            if let Err(error) = emitter.retry_lifecycle_outbox().await {
+                first_error.get_or_insert_with(|| error.to_string());
+                continue;
+            }
+            if lifecycle.snapshot().await?.2 {
+                continue;
+            }
+        }
+        let pending_cancel = lifecycle.pending_cancel().await?.is_some();
         let result = if pending_cancel {
             (if prompt_started {
                 super::cancel::CancellationTerminal::interrupted_full_host_turn()

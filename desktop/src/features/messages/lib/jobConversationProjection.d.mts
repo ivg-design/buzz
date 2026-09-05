@@ -7,6 +7,8 @@ export type JobConversationEvent = {
 export type JobConversationProjection = {
   body: string;
   requestEventId: string | null;
+  taskRoot: boolean;
+  hidden: boolean;
   malformed: boolean;
 };
 

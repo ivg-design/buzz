@@ -10,8 +10,7 @@ use super::bundled_codex_manifest::verify_bundle;
 
 const EXPECTED_MANIFEST_SHA256: Option<&str> =
     option_env!("BUZZ_DESKTOP_BUNDLED_CODEX_CLI_MANIFEST_SHA256");
-const EXPECTED_TARGET: Option<&str> =
-    option_env!("BUZZ_DESKTOP_BUNDLED_CODEX_CLI_TARGET");
+const EXPECTED_TARGET: Option<&str> = option_env!("BUZZ_DESKTOP_BUNDLED_CODEX_CLI_TARGET");
 
 static RESOURCE_DIR: OnceLock<PathBuf> = OnceLock::new();
 static VERIFIED_CLI: OnceLock<CliState> = OnceLock::new();
@@ -89,8 +88,8 @@ pub(crate) fn configure_command(command: &mut Command) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{configure_command_from_state, CliState, CODEX_PATH_ENV};
-    use std::{ffi::OsString, process::Command};
     use std::path::Path;
+    use std::{ffi::OsString, process::Command};
 
     fn command_env(command: &Command, key: &str) -> Option<Option<OsString>> {
         command
@@ -119,8 +118,8 @@ mod tests {
         let mut command = Command::new("codex-acp");
         command.env(CODEX_PATH_ENV, "/tmp/ambient-codex");
 
-        let error = configure_command_from_state(&mut command, &CliState::NotConfigured)
-            .unwrap_err();
+        let error =
+            configure_command_from_state(&mut command, &CliState::NotConfigured).unwrap_err();
 
         assert!(error.contains("unavailable"), "{error}");
         assert_eq!(command_env(&command, CODEX_PATH_ENV), Some(None));

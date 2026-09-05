@@ -251,6 +251,10 @@ pub async fn search(pool: &PgPool, query: &SearchQuery) -> Result<SearchResult, 
     qb.push(" AS query) AS search_query WHERE community_id = ");
     qb.push_bind(*query.community.as_uuid());
     qb.push(" AND deleted_at IS NULL AND search_tsv @@ search_query.query");
+    // Existing populated relays may retain the broad pre-0008 generated FTS
+    // column. Organization JSON is change history, never readable chat content.
+    qb.push(" AND kind <> ");
+    qb.push_bind(buzz_core::kind::KIND_CONVERSATION_ORGANIZATION as i32);
 
     // Channel scope — see `ChannelScope` doc for the four-case mapping. The
     // emitted SQL fragments are identical to the legacy 2x2 tuple for the

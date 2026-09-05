@@ -105,17 +105,15 @@ mod tests {
         let mut env = BTreeMap::new();
         env.insert("CODEX_PATH".to_string(), "/tmp/ambient-codex".to_string());
 
-        let error = super::run_agent_models_command(
-            acp,
-            "codex-acp".to_string(),
-            Vec::new(),
-            None,
-            env,
-        )
-        .await
-        .unwrap_err();
+        let error =
+            super::run_agent_models_command(acp, "codex-acp".to_string(), Vec::new(), None, env)
+                .await
+                .unwrap_err();
 
         assert!(error.contains("bundled Codex CLI"), "{error}");
-        assert!(!marker.exists(), "the unbound models helper must never execute");
+        assert!(
+            !marker.exists(),
+            "the unbound models helper must never execute"
+        );
     }
 }

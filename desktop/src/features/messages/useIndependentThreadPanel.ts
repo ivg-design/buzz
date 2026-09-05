@@ -1,6 +1,6 @@
 import * as React from "react";
 
-import { buildIndependentThreadPanel } from "@/features/messages/lib/independentThreadPanel";
+import { buildIndependentThreadPanelForLink } from "@/features/messages/lib/independentThreadPanel";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import type {
   Channel,
@@ -14,6 +14,7 @@ export function useIndependentThreadPanel(args: {
   channelEvents: RelayEvent[];
   threadReplyEvents: RelayEvent[];
   rootId: string | null;
+  revealMessageId?: string | null;
   replyTargetId: string | null;
   expandedReplyIds: ReadonlySet<string>;
   currentPubkey: string | undefined;
@@ -35,7 +36,8 @@ export function useIndependentThreadPanel(args: {
   // memoization of the same formatter (ChannelScreen `timelineMessages`).
   return React.useMemo(
     () =>
-      buildIndependentThreadPanel(
+      buildIndependentThreadPanelForLink(
+        args.revealMessageId,
         args.channelEvents,
         args.threadReplyEvents,
         args.rootId,
@@ -55,6 +57,7 @@ export function useIndependentThreadPanel(args: {
       args.channelEvents,
       args.threadReplyEvents,
       args.rootId,
+      args.revealMessageId,
       args.replyTargetId,
       args.expandedReplyIds,
       args.activeChannel,

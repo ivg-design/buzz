@@ -56,6 +56,7 @@ mod tests {
                     address: format!("30621:{}:nemo", sender.public_key().to_hex()),
                     home_channel: Uuid::new_v4().to_string(),
                 },
+                conversation: None,
                 repository: JobRepository {
                     canonical: "https://github.com/mysteropodes/nemo".into(),
                     github_issue: None,
@@ -76,6 +77,8 @@ mod tests {
                 expires_at: "2030-01-01T00:00:00Z".into(),
             },
             capability: "rust".into(),
+            title: None,
+            origin: None,
             summary: "path test".into(),
             acceptance: vec!["contained".into()],
             supersedes_event_id: None,

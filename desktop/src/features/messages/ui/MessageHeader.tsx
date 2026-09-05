@@ -115,6 +115,7 @@ export function MessageAuthorIdentity({
   role,
   displayName,
   channelId,
+  originEventId,
   children,
 }: {
   pubkey?: string | null;
@@ -122,6 +123,7 @@ export function MessageAuthorIdentity({
   role?: string;
   displayName: string;
   channelId?: string | null;
+  originEventId?: string | null;
   children: React.ReactNode;
 }) {
   return (
@@ -129,6 +131,7 @@ export function MessageAuthorIdentity({
       {pubkey ? (
         <UserProfilePopover
           channelId={channelId}
+          originEventId={originEventId}
           pubkey={pubkey}
           role={role}
           botIdenticonValue={displayName}

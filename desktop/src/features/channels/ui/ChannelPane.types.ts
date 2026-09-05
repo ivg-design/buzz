@@ -1,3 +1,4 @@
+import type { ConversationOrganization } from "@/features/messages/organization/OrganizationHistory";
 import type * as React from "react";
 import type { BotActivityAgent } from "@/features/channels/ui/BotActivityBar";
 import type { ChannelAgentSessionAgent } from "@/features/channels/ui/useChannelAgentSessions";
@@ -16,6 +17,7 @@ import type { Channel } from "@/shared/api/types";
 import type { IdleAuxiliaryHeaderControls } from "./IdleAuxiliaryPanel";
 export type ChannelPaneProps = {
   activeChannel: Channel | null;
+  organization?: ConversationOrganization;
   activityAgents?: BotActivityAgent[];
   agentPubkeys?: ReadonlySet<string>;
   agentPubkeysPending?: boolean;

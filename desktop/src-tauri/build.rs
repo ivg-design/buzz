@@ -29,8 +29,8 @@ fn embed_bundled_codex_cli_manifest() {
         }
         return;
     }
-    let cargo_target = std::env::var("TARGET")
-        .unwrap_or_else(|error| panic!("Cargo TARGET must be set: {error}"));
+    let cargo_target =
+        std::env::var("TARGET").unwrap_or_else(|error| panic!("Cargo TARGET must be set: {error}"));
     let (_, manifest_sha256) = bundled_codex_manifest::verify_bundle(
         std::path::Path::new("bundle-resources/codex-cli"),
         None,

@@ -1,6 +1,6 @@
 use super::*;
 
-use buzz_core::job::{build_job_tags, JobControl, JobFollowup};
+use buzz_core::job::{build_job_tags, JobControl, JobFollowup, JobProgress};
 use nostr::{EventBuilder, Keys, Kind};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1597,9 +1597,27 @@ async fn stored_cancel_after_pending_marker_prevents_privileged_start() {
         .for_session(&scope, &admitted.dispatch.checkout_root)
         .expect("registry lookup")
         .expect("job gate");
-    let marker = EventBuilder::new(Kind::TextNote, "relay-acknowledged marker")
-        .sign_with_keys(&Keys::generate())
-        .expect("sign marker fixture");
+    let marker_body = JobEvent::Progress(JobProgress {
+        followup: JobFollowup {
+            common: response_common(
+                &admitted.request,
+                &admitted.receiver.as_ref().expect("receiver").agent_pubkey,
+                &admitted.receiver.as_ref().expect("receiver").sponsor,
+            ),
+            request_event_id: admitted.request_event.id.to_hex(),
+            prior_event_id: Some(admitted.dispatch.claim.accepted.id.to_hex()),
+        },
+        status: JobProgressStatus::Progress,
+        message: "relay-acknowledged marker".into(),
+        evidence: Vec::new(),
+    });
+    let marker = EventBuilder::new(
+        Kind::Custom(buzz_core::kind::KIND_JOB_PROGRESS as u16),
+        marker_body.canonical_json().expect("marker JSON"),
+    )
+    .tags(build_job_tags(&marker_body).expect("marker tags"))
+    .sign_with_keys(&admitted.receiver.as_ref().expect("receiver").keys)
+    .expect("sign marker fixture");
     admitted
         .dispatch
         .privilege
@@ -1671,5 +1689,10 @@ async fn stored_cancel_after_pending_marker_prevents_privileged_start() {
         )
         .await
         .is_err());
+    let replayed_marker = admitted
+        .published
+        .try_recv()
+        .expect("pending machine marker replayed before Cancel adoption");
+    assert_eq!(replayed_marker.id, marker.id);
     assert!(admitted.published.try_recv().is_err());
 }

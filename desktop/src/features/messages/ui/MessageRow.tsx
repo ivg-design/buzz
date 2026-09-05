@@ -525,6 +525,7 @@ export const MessageRow = React.memo(
     ) : message.pubkey ? (
       <UserProfilePopover
         channelId={channelId}
+        originEventId={message.id}
         pubkey={message.pubkey}
         role={profilePopoverRole}
         botIdenticonValue={message.author}
@@ -646,6 +647,7 @@ export const MessageRow = React.memo(
         {message.pubkey ? (
           <MessageAuthorWithIndicators
             channelId={channelId}
+            originEventId={message.id}
             authorName={message.author}
             ownerPubkey={message.ownerPubkey}
             pubkey={message.pubkey}

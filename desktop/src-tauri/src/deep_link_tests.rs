@@ -564,7 +564,10 @@ fn parse_join_deep_link_rejects_noncanonical_duplicate_and_unknown_fields() {
         format!("buzz://join/path?relay=wss%3A%2F%2Frelay.example&code={code}"),
         format!("buzz://join?relay=wss%3A%2F%2Frelay.example&code={code}#fragment"),
     ] {
-        assert!(parse_join_deep_link(&Url::parse(&raw).unwrap()).is_none(), "{raw}");
+        assert!(
+            parse_join_deep_link(&Url::parse(&raw).unwrap()).is_none(),
+            "{raw}"
+        );
     }
 }
 

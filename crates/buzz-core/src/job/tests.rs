@@ -19,6 +19,7 @@ fn common(sender: &Keys, recipient: &Keys) -> JobCommon {
             address: format!("30621:{}:nemo", sender.public_key().to_hex()),
             home_channel: "3580ca9b-47b4-4af9-b22a-1068778f26c6".into(),
         },
+        conversation: None,
         repository: JobRepository {
             canonical: "https://github.com/example/repo".into(),
             github_issue: Some("1".into()),
@@ -44,6 +45,8 @@ fn request_event(sender: &Keys, recipient: &Keys) -> Event {
     let job = JobEvent::Request(JobRequest {
         common: common(sender, recipient),
         capability: "rust".into(),
+        title: None,
+        origin: None,
         summary: "Implement the seam".into(),
         acceptance: vec!["Tests pass".into()],
         supersedes_event_id: None,
@@ -67,6 +70,141 @@ fn request_round_trips_strict_canonical_json() {
 }
 
 #[test]
+fn request_round_trips_optional_presentation_origin_without_changing_route_tags() {
+    let sender = Keys::generate();
+    let recipient = Keys::generate();
+    let mut request_common = common(&sender, &recipient);
+    request_common.conversation = Some(JobConversation {
+        channel_id: "6df3d942-e730-4b1c-9742-184bf292fa71".into(),
+        thread_root_id: "c".repeat(64),
+    });
+    let job = JobEvent::Request(JobRequest {
+        common: request_common,
+        capability: "rust".into(),
+        title: Some("Fix task visibility".into()),
+        origin: Some(JobOrigin {
+            channel_id: "0be7a777-728b-48d2-8164-d777f9046ec4".into(),
+            thread_root_id: Some("b".repeat(64)),
+            session_channel_id: Some("58a2e1cc-91e4-4701-b3d1-d7001889c5de".into()),
+            session_thread_root_id: Some("d".repeat(64)),
+        }),
+        summary: "Publish the worker report in the initiating conversation".into(),
+        acceptance: vec!["Report remains durable".into()],
+        supersedes_event_id: None,
+    });
+    let event = EventBuilder::new(
+        Kind::Custom(KIND_JOB_REQUEST as u16),
+        job.canonical_json().expect("json"),
+    )
+    .tags(build_job_tags(&job).expect("tags"))
+    .sign_with_keys(&sender)
+    .expect("sign");
+
+    let JobEvent::Request(parsed) = JobEvent::parse(&event).expect("parse") else {
+        panic!("request");
+    };
+    assert_eq!(parsed.title.as_deref(), Some("Fix task visibility"));
+    assert_eq!(
+        parsed.common.conversation.as_ref().map(|conversation| (
+            conversation.channel_id.as_str(),
+            conversation.thread_root_id.as_str(),
+        )),
+        Some((
+            "6df3d942-e730-4b1c-9742-184bf292fa71",
+            "c".repeat(64).as_str(),
+        ))
+    );
+    assert_eq!(
+        parsed
+            .origin
+            .as_ref()
+            .and_then(|origin| origin.session_channel_id.as_deref()),
+        Some("58a2e1cc-91e4-4701-b3d1-d7001889c5de")
+    );
+    assert_eq!(
+        parsed
+            .origin
+            .as_ref()
+            .and_then(|origin| origin.thread_root_id.as_deref()),
+        Some("b".repeat(64).as_str())
+    );
+    assert_eq!(
+        parsed
+            .origin
+            .as_ref()
+            .and_then(|origin| origin.session_thread_root_id.as_deref()),
+        Some("d".repeat(64).as_str())
+    );
+    assert!(event.tags.iter().all(|tag| {
+        !matches!(
+            tag.as_slice().first().map(String::as_str),
+            Some("origin") | Some("title") | Some("conversation")
+        )
+    }));
+}
+
+#[test]
+fn request_rejects_invalid_optional_presentation_metadata() {
+    let sender = Keys::generate();
+    let recipient = Keys::generate();
+    let event = request_event(&sender, &recipient);
+    for mutate in [
+        |body: &mut Value| body["title"] = Value::String(String::new()),
+        |body: &mut Value| body["origin"] = serde_json::json!({ "channel_id": "not-a-uuid" }),
+        |body: &mut Value| {
+            body["origin"] = serde_json::json!({
+                "channel_id": "0be7a777-728b-48d2-8164-d777f9046ec4",
+                "thread_root_id": "not-an-event"
+            })
+        },
+        |body: &mut Value| {
+            body["origin"] = serde_json::json!({
+                "channel_id": "0be7a777-728b-48d2-8164-d777f9046ec4",
+                "session_channel_id": "not-a-uuid"
+            })
+        },
+        |body: &mut Value| {
+            body["origin"] = serde_json::json!({
+                "channel_id": "0be7a777-728b-48d2-8164-d777f9046ec4",
+                "session_thread_root_id": "not-an-event"
+            })
+        },
+        |body: &mut Value| {
+            body["conversation"] = serde_json::json!({
+                "channel_id": "not-a-uuid",
+                "thread_root_id": "c".repeat(64)
+            })
+        },
+        |body: &mut Value| {
+            body["conversation"] = serde_json::json!({
+                "channel_id": "6df3d942-e730-4b1c-9742-184bf292fa71",
+                "thread_root_id": "not-an-event"
+            })
+        },
+        |body: &mut Value| {
+            body["conversation"] = serde_json::json!({
+                "channel_id": "6df3d942-e730-4b1c-9742-184bf292fa71"
+            })
+        },
+        |body: &mut Value| {
+            body["conversation"] = serde_json::json!({
+                "channel_id": "6df3d942-e730-4b1c-9742-184bf292fa71",
+                "thread_root_id": "c".repeat(64),
+                "unexpected": true
+            })
+        },
+    ] {
+        let mut body: Value = serde_json::from_str(&event.content).expect("body");
+        mutate(&mut body);
+        let forged = EventBuilder::new(Kind::Custom(KIND_JOB_REQUEST as u16), body.to_string())
+            .tags(event.tags.clone().to_vec())
+            .sign_with_keys(&sender)
+            .expect("sign");
+        assert!(JobEvent::parse(&forged).is_err());
+    }
+}
+
+#[test]
 fn information_only_request_round_trips_with_no_repository_paths() {
     let sender = Keys::generate();
     let recipient = Keys::generate();
@@ -75,6 +213,8 @@ fn information_only_request_round_trips_with_no_repository_paths() {
     let job = JobEvent::Request(JobRequest {
         common: request_common,
         capability: "consultation".into(),
+        title: None,
+        origin: None,
         summary: "Report current implementation status".into(),
         acceptance: vec!["Return a concise status report".into()],
         supersedes_event_id: None,
@@ -349,6 +489,8 @@ fn semantic_request_digest_is_cross_language_stable() {
     let request = JobRequest {
         common: common(&requester, &worker),
         capability: "rust".into(),
+        title: None,
+        origin: None,
         summary: "Implement the seam".into(),
         acceptance: vec!["Tests pass".into()],
         supersedes_event_id: None,

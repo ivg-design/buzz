@@ -151,6 +151,10 @@ impl JobLedger {
         Self { root }
     }
 
+    pub(super) fn notification_path(&self) -> PathBuf {
+        self.root.join("requester-notifications.state")
+    }
+
     pub fn lifecycle_store(&self, claim: &StoredClaim) -> LifecycleStore {
         LifecycleStore::new(
             &self.root,

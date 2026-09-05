@@ -617,8 +617,7 @@ mod tests {
             format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display()),
         )
         .expect("write helper");
-        fs::set_permissions(&acp_path, fs::Permissions::from_mode(0o755))
-            .expect("chmod helper");
+        fs::set_permissions(&acp_path, fs::Permissions::from_mode(0o755)).expect("chmod helper");
         let adapter_path = temp.path().join("codex-acp");
         let runtime = crate::managed_agents::known_acp_runtime_exact("codex")
             .expect("built-in Codex runtime");
@@ -634,7 +633,10 @@ mod tests {
         .unwrap_err();
 
         assert!(error.contains("bundled Codex CLI"), "{error}");
-        assert!(!marker.exists(), "the unbound auth helper must never execute");
+        assert!(
+            !marker.exists(),
+            "the unbound auth helper must never execute"
+        );
     }
 
     #[test]

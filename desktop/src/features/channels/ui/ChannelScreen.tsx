@@ -1,4 +1,5 @@
 // biome-ignore-all format: line-count ratchet requires compact forwarding in this legacy component
+import { OrganizationHistory } from "@/features/messages/organization/OrganizationHistory";
 import * as React from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useAppShell } from "@/app/AppShellContext";
@@ -43,7 +44,9 @@ import {
   useToggleReactionMutation,
 } from "@/features/messages/hooks";
 import { buildMessageComposerEditTarget } from "@/features/messages/lib/draftMentionRefs";
-import { formatTimelineMessages } from "@/features/messages/lib/formatTimelineMessages";
+import { formatOrganizedMessages } from "@/features/messages/organization/formatOrganizedMessages";
+import { useConversationOrganization } from "@/features/messages/organization/useConversationOrganization";
+import { mergeOrganizationEvents } from "@/features/messages/organization/history";
 import { DeleteMessageConfirmDialog } from "@/features/messages/ui/DeleteMessageConfirmDialog";
 import {
   getThreadReference,
@@ -274,7 +277,9 @@ export function ChannelScreen({
     messages: messagesQuery.data,
     resolvedMessages,
   });
-  const threadReplyEvents = threadRepliesQuery.data ?? EMPTY_RELAY_EVENTS;
+  const organization = useConversationOrganization(activeChannel, activeCommunity?.relayUrl, currentPubkey);
+  const organizedChannelEvents = React.useMemo(() => mergeOrganizationEvents(resolvedMessages, [...organization.events, ...organization.supplementalEvents]), [resolvedMessages, organization.events, organization.supplementalEvents]);
+  const threadReplyEvents = React.useMemo(() => mergeOrganizationEvents(threadRepliesQuery.data ?? EMPTY_RELAY_EVENTS, organization.supplementalEvents), [threadRepliesQuery.data, organization.supplementalEvents]);
   const {
     entranceMessageId: welcomeEntranceMessageId,
     handleEntranceComplete: handleWelcomeEntranceComplete,
@@ -403,8 +408,8 @@ export function ChannelScreen({
   }, [managedAgentsQuery.data, personasQuery.data]);
   const timelineMessages = React.useMemo(
     () =>
-      formatTimelineMessages(
-        resolvedMessages,
+      formatOrganizedMessages(
+        organizedChannelEvents,
         activeChannel,
         currentPubkey,
         currentProfile?.avatarUrl ?? null,
@@ -425,14 +430,15 @@ export function ChannelScreen({
       personaLookup,
       relaySelfPubkey,
       respondToLookup,
-      resolvedMessages,
+      organizedChannelEvents,
     ],
   );
   const threadPanelData = useIndependentThreadPanel({
     activeChannel,
-    channelEvents: resolvedMessages,
+    channelEvents: organizedChannelEvents,
     threadReplyEvents,
     rootId: effectiveOpenThreadHeadId,
+    revealMessageId: threadScrollTargetId,
     replyTargetId: threadReplyTargetId,
     expandedReplyIds: expandedThreadReplyIds,
     currentPubkey,
@@ -749,7 +755,8 @@ export function ChannelScreen({
         activeDmHeaderParticipants={activeDmHeaderParticipants}
         activeDmPresenceStatus={activeDmPresenceStatus}
         chromeWrapperRef={channelHeaderChromeRef}
-        {...{ currentPubkey, headerEndActions }}
+        currentPubkey={currentPubkey}
+        headerEndActions={<>{headerEndActions}<OrganizationHistory organization={organization} profiles={messageProfiles} currentPubkey={currentPubkey} channelId={activeChannel?.id} /></>}
         isAddBotOpen={isAddBotOpen}
         isJoining={joinChannelMutation.isPending}
         onAddBotOpenChange={setIsAddBotOpen}
@@ -771,6 +778,8 @@ export function ChannelScreen({
       channelHeaderChromeRef,
       currentPubkey,
       headerEndActions,
+      organization,
+      messageProfiles,
       isAddBotOpen,
       joinChannelMutation.isPending,
       joinChannelMutation.mutateAsync,
@@ -813,6 +822,7 @@ export function ChannelScreen({
             activeChannel.channelType === "forum" ? (
               searchForwarding.renderSearchAwareForum(
                 <ForumChannelContent
+                organization={organization}
                 canResetPanelWidth={canResetThreadPanelWidth} channel={activeChannel}
                 currentPubkey={currentPubkey}
                 header={channelHeader}
@@ -884,6 +894,7 @@ export function ChannelScreen({
                   isSinglePanelView={isSinglePanelView}
                   isTimelineError={messagesQuery.isError} isTimelineLoading={isTimelineLoading}
                   onRetryTimeline={() => void messagesQuery.refetch()} messages={timelineMessages}
+                  organization={organization}
                   threadSummaries={threadSummaries}
                   huddleThreadRepliesError={huddleThreadRepliesError}
                   onRetryHuddleThreadReplies={onRetryHuddleThreadReplies}

@@ -59,15 +59,19 @@ function requestRootFromTags(tags) {
 
 function requestBody(payload) {
   const summary = nonEmptyString(payload.summary);
+  const hasTitle = Object.hasOwn(payload, "title");
+  const title = hasTitle ? nonEmptyString(payload.title) : null;
   const acceptance = stringList(payload.acceptance);
-  if (!summary || !acceptance?.length) return null;
-  return summary;
+  if (!summary || !acceptance?.length || (hasTitle && !title)) return null;
+  return title && title !== summary
+    ? `Task: ${title}\n\n${summary}`
+    : `Task: ${summary}`;
 }
 
 const DECLINE_EXPLANATIONS = new Map([
   [
     "workspace_setup_failed",
-    "I couldn't set up the workspace needed for this task.",
+    "I couldn't set up the workspace needed for this task. Check repository access and the agent's runtime log for details.",
   ],
 ]);
 
@@ -199,6 +203,8 @@ export function projectJobConversation(event) {
   return {
     body: body ?? malformedBody(event.kind),
     requestEventId,
+    taskRoot: event.kind === JOB_REQUEST,
+    hidden: isRecord(payload?.conversation),
     malformed: body === null,
   };
 }

@@ -1,3 +1,4 @@
+import { OrganizationThreadIntro } from "@/features/messages/organization/OrganizationHistory";
 import * as React from "react";
 import { LogIn } from "lucide-react";
 import { AnimatePresence } from "motion/react";
@@ -77,6 +78,7 @@ const HUDDLE_TRANSCRIPT_ROOT_STYLE = {
 } as React.CSSProperties;
 export const ChannelPane = React.memo(function ChannelPane({
   activeChannel,
+  organization,
   agentPubkeys,
   agentPubkeysPending = false,
   agentSessionAgents,
@@ -668,6 +670,19 @@ export const ChannelPane = React.memo(function ChannelPane({
               onEntranceMessageComplete={onEntranceMessageComplete}
               mainEntries={mainTimelineEntries}
               threadSummaries={threadSummaries}
+              messageFooters={
+                organization
+                  ? Object.fromEntries(
+                      [...organization.state.metadata].map(([id, metadata]) => [
+                        id,
+                        <OrganizationThreadIntro
+                          key={id}
+                          metadata={metadata}
+                        />,
+                      ]),
+                    )
+                  : undefined
+              }
               messages={visibleMessages}
               firstUnreadMessageId={firstUnreadMessageId}
               unreadCount={unreadCount}
@@ -881,6 +896,21 @@ export const ChannelPane = React.memo(function ChannelPane({
                 scrollTargetHighlights={!layoutScrollTargetId}
                 scrollTargetId={layoutScrollTargetId ?? threadScrollTargetId}
                 {...searchHighlightProps.thread}
+                onRestoreOrganizationMessage={
+                  organization
+                    ? (messageId) =>
+                        organization
+                          .apply({
+                            type: "hide",
+                            message_ids: [messageId],
+                            hidden: false,
+                          })
+                          .then(() => {})
+                    : undefined
+                }
+                organizationMetadata={organization?.state.metadata.get(
+                  threadHeadMessage.id,
+                )}
                 threadHead={threadHeadMessage}
                 videoReviewPresentation={threadVideoReviewPresentation}
                 widthPx={threadPanelWidthPx}

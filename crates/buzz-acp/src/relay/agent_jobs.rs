@@ -268,6 +268,133 @@ fn unix_now_secs() -> u64 {
 }
 
 #[cfg(test)]
+impl super::RestClient {
+    /// Test transport that observes event bodies but returns a transient error
+    /// for the first complete submit attempt, modeling a lost acknowledgement.
+    pub(crate) async fn uncertain_then_accepting_job_test_pair(
+        keys: nostr::Keys,
+    ) -> (
+        Self,
+        tokio::sync::mpsc::Receiver<nostr::Event>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind uncertain event test server");
+        let base_url = format!("http://{}", listener.local_addr().expect("test address"));
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(64);
+        let server = tokio::spawn(async move {
+            let mut uncertain_submits = 4_usize;
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = Vec::with_capacity(4096);
+                let mut chunk = [0_u8; 4096];
+                let header_end = loop {
+                    let read = socket.read(&mut chunk).await.unwrap_or_default();
+                    if read == 0 {
+                        break None;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                    if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                        break Some(end + 4);
+                    }
+                };
+                let Some(header_end) = header_end else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let first_line = headers.lines().next().unwrap_or_default().to_owned();
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                while request.len() < header_end + content_length {
+                    let read = socket.read(&mut chunk).await.unwrap_or_default();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                }
+                let body = &request[header_end..header_end.saturating_add(content_length)];
+                if first_line.contains(" /api/jobs/authorize ") {
+                    let Ok(authorization) = serde_json::from_slice::<
+                        buzz_core::job_authorization::JobAuthorizationRequest,
+                    >(body) else {
+                        continue;
+                    };
+                    let now = chrono::Utc::now();
+                    let response = buzz_core::job_authorization::JobAuthorizationResponse {
+                        schema_version:
+                            buzz_core::job_authorization::JOB_AUTHORIZATION_SCHEMA_VERSION.into(),
+                        authorized: true,
+                        authorization_id: uuid::Uuid::new_v4().to_string(),
+                        issued_at: now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                        expires_at: (now + chrono::Duration::seconds(5))
+                            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                        binding: buzz_core::job_authorization::JobAuthorizationBinding::from(
+                            &authorization,
+                        ),
+                        project_head_event_id: "a".repeat(64),
+                        repository_coordinate: format!(
+                            "30617:{}:nemo",
+                            authorization.requester_pubkey
+                        ),
+                        repository_announcement_event_id: "b".repeat(64),
+                        requester_owner_pubkey: authorization.requester_pubkey.clone(),
+                        recipient_owner_pubkey: authorization.recipient_pubkey.clone(),
+                    };
+                    let body = serde_json::to_string(&response).expect("authorization JSON");
+                    write_test_response(&mut socket, "200 OK", &body).await;
+                    continue;
+                }
+                let Ok(event) = serde_json::from_slice::<nostr::Event>(body) else {
+                    continue;
+                };
+                let _ = event_tx.send(event.clone()).await;
+                if uncertain_submits > 0 {
+                    uncertain_submits -= 1;
+                    write_test_response(&mut socket, "503 Service Unavailable", "").await;
+                } else {
+                    let body = serde_json::json!({
+                        "event_id": event.id.to_hex(),
+                        "accepted": true,
+                        "message": ""
+                    })
+                    .to_string();
+                    write_test_response(&mut socket, "200 OK", &body).await;
+                }
+            }
+        });
+        (
+            Self {
+                http: reqwest::Client::new(),
+                base_url,
+                keys,
+                auth_tag_json: None,
+            },
+            event_rx,
+            server,
+        )
+    }
+}
+
+#[cfg(test)]
+async fn write_test_response(socket: &mut tokio::net::TcpStream, status: &str, body: &str) {
+    use tokio::io::AsyncWriteExt;
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = socket.write_all(response.as_bytes()).await;
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

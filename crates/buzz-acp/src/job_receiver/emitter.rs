@@ -31,6 +31,31 @@ pub struct FrozenReceipts {
     pub accepted: Event,
 }
 
+pub fn build_declined_receipt(
+    request: &JobRequest,
+    request_event_id: &str,
+    scope_digest: &str,
+    keys: &Keys,
+    sponsor: &JobSponsor,
+    reason: &str,
+) -> Result<Event, EmitError> {
+    sign_job(
+        JobEvent::Accepted(JobAccepted {
+            followup: JobFollowup {
+                common: response_common(request, keys, sponsor),
+                request_event_id: request_event_id.into(),
+                prior_event_id: None,
+            },
+            claim: JobClaim {
+                status: JobClaimStatus::Declined,
+                scope_digest: scope_digest.into(),
+                reason: Some(reason.into()),
+            },
+        }),
+        keys,
+    )
+}
+
 pub fn build_claim_receipts(
     request: &JobRequest,
     request_event_id: &str,

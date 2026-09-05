@@ -67,10 +67,71 @@ impl StoredClaim {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoredDecline {
+    version: u32,
+    pub community: String,
+    pub requester: String,
+    pub idempotency_key: String,
+    pub digest: String,
+    pub request_event_id: String,
+    pub request_event: Event,
+    pub declined: Event,
+}
+
+impl StoredDecline {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        community: String,
+        requester: String,
+        idempotency_key: String,
+        digest: String,
+        request_event_id: String,
+        request_event: Event,
+        declined: Event,
+    ) -> Self {
+        Self {
+            version: LEDGER_VERSION,
+            community,
+            requester,
+            idempotency_key,
+            digest,
+            request_event_id,
+            request_event,
+            declined,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum StoredRecord {
+    Claim(StoredClaim),
+    Decline(StoredDecline),
+}
+
 #[derive(Debug, Clone)]
 pub enum ClaimDecision {
     New(StoredClaim),
     Replay(StoredClaim),
+    Declined(StoredDecline),
+    Conflict { existing_digest: String },
+}
+
+#[derive(Debug, Clone)]
+pub enum DeclineDecision {
+    New(StoredDecline),
+    Replay(StoredDecline),
+    Claimed,
+    Conflict { existing_digest: String },
+}
+
+#[derive(Debug, Clone)]
+pub enum DeclineLookup {
+    Absent,
+    Claimed,
+    Replay(StoredDecline),
     Conflict { existing_digest: String },
 }
 
@@ -100,6 +161,29 @@ impl JobLedger {
     pub async fn claim(&self, candidate: StoredClaim) -> Result<ClaimDecision, LedgerError> {
         let ledger = self.clone();
         tokio::task::spawn_blocking(move || ledger.claim_blocking(candidate)).await?
+    }
+
+    pub async fn decline(&self, candidate: StoredDecline) -> Result<DeclineDecision, LedgerError> {
+        let ledger = self.clone();
+        tokio::task::spawn_blocking(move || ledger.decline_blocking(candidate)).await?
+    }
+
+    pub async fn lookup_decline(
+        &self,
+        community: &str,
+        requester: &str,
+        idempotency_key: &str,
+        digest: &str,
+    ) -> Result<DeclineLookup, LedgerError> {
+        let ledger = self.clone();
+        let community = community.to_owned();
+        let requester = requester.to_owned();
+        let idempotency_key = idempotency_key.to_owned();
+        let digest = digest.to_owned();
+        tokio::task::spawn_blocking(move || {
+            ledger.lookup_decline_blocking(&community, &requester, &idempotency_key, &digest)
+        })
+        .await?
     }
 
     pub async fn mark_prompt_started(&self, claim: &StoredClaim) -> Result<bool, LedgerError> {
@@ -135,6 +219,18 @@ impl JobLedger {
         tokio::task::spawn_blocking(move || ledger.receipt_acked_blocking(&claim, kind)).await?
     }
 
+    pub async fn mark_decline_acked(&self, decline: &StoredDecline) -> Result<(), LedgerError> {
+        let ledger = self.clone();
+        let decline = decline.clone();
+        tokio::task::spawn_blocking(move || ledger.mark_decline_acked_blocking(&decline)).await?
+    }
+
+    pub async fn decline_acked(&self, decline: &StoredDecline) -> Result<bool, LedgerError> {
+        let ledger = self.clone();
+        let decline = decline.clone();
+        tokio::task::spawn_blocking(move || ledger.decline_acked_blocking(&decline)).await?
+    }
+
     pub async fn pending_claims(&self) -> Result<Vec<StoredClaim>, LedgerError> {
         let ledger = self.clone();
         tokio::task::spawn_blocking(move || ledger.pending_claims_blocking()).await?
@@ -143,6 +239,11 @@ impl JobLedger {
     pub async fn claims(&self) -> Result<Vec<StoredClaim>, LedgerError> {
         let ledger = self.clone();
         tokio::task::spawn_blocking(move || ledger.claims_blocking()).await?
+    }
+
+    pub async fn declines(&self) -> Result<Vec<StoredDecline>, LedgerError> {
+        let ledger = self.clone();
+        tokio::task::spawn_blocking(move || ledger.declines_blocking()).await?
     }
 
     pub async fn claim_for_request(
@@ -205,6 +306,74 @@ impl JobLedger {
                 Err(error.into())
             }
         }
+    }
+
+    fn decline_blocking(&self, candidate: StoredDecline) -> Result<DeclineDecision, LedgerError> {
+        self.prepare_root()?;
+        let key = ledger_key(
+            &candidate.community,
+            &candidate.requester,
+            &candidate.idempotency_key,
+        );
+        let path = self.root.join(format!("{key}.json"));
+        if path.exists() {
+            return compare_existing_decline(&path, &candidate);
+        }
+        if count_records(&self.root)? >= MAX_LEDGER_RECORDS {
+            return Err(LedgerError::Invalid(format!(
+                "ledger contains the maximum {MAX_LEDGER_RECORDS} records"
+            )));
+        }
+
+        let temporary = self.root.join(format!(".{key}.{}.tmp", Uuid::new_v4()));
+        write_private_file(&temporary, &serde_json::to_vec(&candidate)?)?;
+        match std::fs::hard_link(&temporary, &path) {
+            Ok(()) => {
+                sync_directory(&self.root)?;
+                std::fs::remove_file(&temporary)?;
+                sync_directory(&self.root)?;
+                Ok(DeclineDecision::New(candidate))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                std::fs::remove_file(&temporary)?;
+                compare_existing_decline(&path, &candidate)
+            }
+            Err(error) => {
+                let _ = std::fs::remove_file(&temporary);
+                Err(error.into())
+            }
+        }
+    }
+
+    fn lookup_decline_blocking(
+        &self,
+        community: &str,
+        requester: &str,
+        idempotency_key: &str,
+        digest: &str,
+    ) -> Result<DeclineLookup, LedgerError> {
+        self.prepare_root()?;
+        let key = ledger_key(community, requester, idempotency_key);
+        let path = self.root.join(format!("{key}.json"));
+        let record = match read_record(&path) {
+            Ok(record) => record,
+            Err(LedgerError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(DeclineLookup::Absent)
+            }
+            Err(error) => return Err(error),
+        };
+        validate_record_key(&record, community, requester, idempotency_key)?;
+        let (existing_digest, decline) = match record {
+            StoredRecord::Claim(claim) => (claim.digest, None),
+            StoredRecord::Decline(decline) => (decline.digest.clone(), Some(decline)),
+        };
+        if existing_digest != digest {
+            return Ok(DeclineLookup::Conflict { existing_digest });
+        }
+        Ok(match decline {
+            Some(decline) => DeclineLookup::Replay(decline),
+            None => DeclineLookup::Claimed,
+        })
     }
 
     fn reload_claim_blocking(&self, frozen: &StoredClaim) -> Result<StoredClaim, LedgerError> {
@@ -288,6 +457,42 @@ impl JobLedger {
         }
     }
 
+    fn mark_decline_acked_blocking(&self, decline: &StoredDecline) -> Result<(), LedgerError> {
+        self.prepare_root()?;
+        let path = self.decline_ack_path(decline);
+        let event_id = decline.declined.id.to_hex();
+        match create_private_new(&path) {
+            Ok(mut file) => {
+                file.write_all(event_id.as_bytes())?;
+                file.sync_all()?;
+                sync_directory(&self.root)?;
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if read_private_string(&path)? == event_id {
+                    Ok(())
+                } else {
+                    Err(LedgerError::Invalid(
+                        "decline acknowledgement marker has the wrong event id".into(),
+                    ))
+                }
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn decline_acked_blocking(&self, decline: &StoredDecline) -> Result<bool, LedgerError> {
+        let path = self.decline_ack_path(decline);
+        match read_private_string(&path) {
+            Ok(stored) if stored == decline.declined.id.to_hex() => Ok(true),
+            Ok(_) => Err(LedgerError::Invalid(
+                "decline acknowledgement marker has the wrong event id".into(),
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     fn receipt_ack_path(&self, claim: &StoredClaim, kind: ReceiptKind) -> PathBuf {
         let key = ledger_key(&claim.community, &claim.requester, &claim.idempotency_key);
         let suffix = match kind {
@@ -295,6 +500,15 @@ impl JobLedger {
             ReceiptKind::Accepted => "accepted-acked",
         };
         self.root.join(format!("{key}.{suffix}"))
+    }
+
+    fn decline_ack_path(&self, decline: &StoredDecline) -> PathBuf {
+        let key = ledger_key(
+            &decline.community,
+            &decline.requester,
+            &decline.idempotency_key,
+        );
+        self.root.join(format!("{key}.declined-acked"))
     }
 
     fn pending_claims_blocking(&self) -> Result<Vec<StoredClaim>, LedgerError> {
@@ -316,15 +530,26 @@ impl JobLedger {
             if !is_claim_record_path(&path) {
                 continue;
             }
-            let claim: StoredClaim = serde_json::from_slice(&read_private_bytes(&path)?)?;
-            if claim.version != LEDGER_VERSION {
-                return Err(LedgerError::Invalid(
-                    "unsupported ledger record version".into(),
-                ));
+            if let StoredRecord::Claim(claim) = read_record(&path)? {
+                claims.push(claim);
             }
-            claims.push(claim);
         }
         Ok(claims)
+    }
+
+    fn declines_blocking(&self) -> Result<Vec<StoredDecline>, LedgerError> {
+        self.prepare_root()?;
+        let mut declines = Vec::new();
+        for entry in std::fs::read_dir(&self.root)?.take(MAX_LEDGER_RECORDS + 1) {
+            let path = entry?.path();
+            if !is_claim_record_path(&path) {
+                continue;
+            }
+            if let StoredRecord::Decline(decline) = read_record(&path)? {
+                declines.push(decline);
+            }
+        }
+        Ok(declines)
     }
 
     fn prepare_root(&self) -> Result<(), LedgerError> {
@@ -355,23 +580,94 @@ fn claims_match_exactly(left: &StoredClaim, right: &StoredClaim) -> bool {
 }
 
 fn compare_existing(path: &Path, candidate: &StoredClaim) -> Result<ClaimDecision, LedgerError> {
-    let raw = read_private_bytes(path)?;
-    let existing: StoredClaim = serde_json::from_slice(&raw)?;
-    if existing.version != LEDGER_VERSION
-        || existing.community != candidate.community
-        || existing.requester != candidate.requester
-        || existing.idempotency_key != candidate.idempotency_key
-    {
+    let record = read_record(path)?;
+    validate_record_key(
+        &record,
+        &candidate.community,
+        &candidate.requester,
+        &candidate.idempotency_key,
+    )?;
+    match record {
+        StoredRecord::Claim(existing) if existing.digest == candidate.digest => {
+            Ok(ClaimDecision::Replay(existing))
+        }
+        StoredRecord::Decline(existing) if existing.digest == candidate.digest => {
+            Ok(ClaimDecision::Declined(existing))
+        }
+        StoredRecord::Claim(existing) => Ok(ClaimDecision::Conflict {
+            existing_digest: existing.digest,
+        }),
+        StoredRecord::Decline(existing) => Ok(ClaimDecision::Conflict {
+            existing_digest: existing.digest,
+        }),
+    }
+}
+
+fn compare_existing_decline(
+    path: &Path,
+    candidate: &StoredDecline,
+) -> Result<DeclineDecision, LedgerError> {
+    let record = read_record(path)?;
+    validate_record_key(
+        &record,
+        &candidate.community,
+        &candidate.requester,
+        &candidate.idempotency_key,
+    )?;
+    match record {
+        StoredRecord::Decline(existing) if existing.digest == candidate.digest => {
+            Ok(DeclineDecision::Replay(existing))
+        }
+        StoredRecord::Claim(existing) if existing.digest == candidate.digest => {
+            Ok(DeclineDecision::Claimed)
+        }
+        StoredRecord::Claim(existing) => Ok(DeclineDecision::Conflict {
+            existing_digest: existing.digest,
+        }),
+        StoredRecord::Decline(existing) => Ok(DeclineDecision::Conflict {
+            existing_digest: existing.digest,
+        }),
+    }
+}
+
+fn read_record(path: &Path) -> Result<StoredRecord, LedgerError> {
+    let record: StoredRecord = serde_json::from_slice(&read_private_bytes(path)?)?;
+    let version = match &record {
+        StoredRecord::Claim(claim) => claim.version,
+        StoredRecord::Decline(decline) => decline.version,
+    };
+    if version != LEDGER_VERSION {
         return Err(LedgerError::Invalid(
-            "record key fields do not match its file name".into(),
+            "unsupported ledger record version".into(),
         ));
     }
-    if existing.digest == candidate.digest {
-        Ok(ClaimDecision::Replay(existing))
+    Ok(record)
+}
+
+fn validate_record_key(
+    record: &StoredRecord,
+    community: &str,
+    requester: &str,
+    idempotency_key: &str,
+) -> Result<(), LedgerError> {
+    let matches = match record {
+        StoredRecord::Claim(claim) => {
+            claim.community == community
+                && claim.requester == requester
+                && claim.idempotency_key == idempotency_key
+        }
+        StoredRecord::Decline(decline) => {
+            decline.community == community
+                && decline.requester == requester
+                && decline.idempotency_key == idempotency_key
+        }
+    };
+    if matches {
+        Ok(())
     } else {
-        Ok(ClaimDecision::Conflict {
-            existing_digest: existing.digest,
-        })
+        Err(LedgerError::Invalid(
+            "record key fields do not match its file name".into(),
+        ))
     }
 }
 
@@ -488,6 +784,18 @@ mod tests {
         )
     }
 
+    fn decline_from(claim: &StoredClaim) -> StoredDecline {
+        StoredDecline::new(
+            claim.community.clone(),
+            claim.requester.clone(),
+            claim.idempotency_key.clone(),
+            claim.digest.clone(),
+            claim.request_event_id.clone(),
+            claim.request_event.clone(),
+            claim.accepted.clone(),
+        )
+    }
+
     fn temp_root() -> PathBuf {
         std::env::temp_dir().join(format!("buzz-acp-job-ledger-{}", Uuid::new_v4()))
     }
@@ -531,6 +839,58 @@ mod tests {
             .mark_prompt_started(&stored)
             .await
             .expect("already marked"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn decline_is_immutable_replayable_and_excludes_claim() {
+        let root = temp_root();
+        let (ledger, claim) = claim(&root, &"a".repeat(64));
+        let decline = decline_from(&claim);
+        assert!(matches!(
+            ledger.decline(decline.clone()).await.expect("decline"),
+            DeclineDecision::New(_)
+        ));
+        assert!(matches!(
+            ledger
+                .lookup_decline(
+                    &decline.community,
+                    &decline.requester,
+                    &decline.idempotency_key,
+                    &decline.digest,
+                )
+                .await
+                .expect("lookup"),
+            DeclineLookup::Replay(_)
+        ));
+        assert!(matches!(
+            ledger.claim(claim).await.expect("claim excluded"),
+            ClaimDecision::Declined(_)
+        ));
+        assert!(ledger.claims().await.expect("claims").is_empty());
+        assert_eq!(ledger.declines().await.expect("declines").len(), 1);
+        assert!(!ledger.decline_acked(&decline).await.expect("unacked"));
+        ledger
+            .mark_decline_acked(&decline)
+            .await
+            .expect("mark acked");
+        assert!(ledger.decline_acked(&decline).await.expect("acked"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn claim_and_changed_decline_keep_one_atomic_outcome() {
+        let root = temp_root();
+        let (ledger, claim) = claim(&root, &"a".repeat(64));
+        ledger.claim(claim.clone()).await.expect("claim");
+        let mut decline = decline_from(&claim);
+        decline.digest = "b".repeat(64);
+        assert!(matches!(
+            ledger.decline(decline).await.expect("conflict"),
+            DeclineDecision::Conflict { .. }
+        ));
+        assert_eq!(ledger.claims().await.expect("claims").len(), 1);
+        assert!(ledger.declines().await.expect("declines").is_empty());
         std::fs::remove_dir_all(root).ok();
     }
 

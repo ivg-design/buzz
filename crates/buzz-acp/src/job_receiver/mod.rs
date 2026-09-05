@@ -27,17 +27,22 @@ use nostr::{Event, Keys};
 use thiserror::Error;
 use uuid::Uuid;
 
-use emitter::build_claim_receipts;
 pub use emitter::JobEmitter;
+use emitter::{build_claim_receipts, build_declined_receipt};
 use git_receipt_journal::GitEffect;
 pub(crate) use grants::prepare_job_sources;
 use grants::{GrantError, GrantSet};
 use lease::ReceiverLease;
-use ledger::{ClaimDecision, JobLedger, LedgerError, StoredClaim};
+use ledger::{
+    ClaimDecision, DeclineDecision, DeclineLookup, JobLedger, LedgerError, StoredClaim,
+    StoredDecline,
+};
 use lifecycle::LifecycleError;
 pub use outcome::{parse_terminal_outcome, TerminalDisposition};
 pub(crate) use privilege::{JobPrivilege, JobPrivilegeRegistry};
 pub use prompt::format_job_prompt;
+
+const SETUP_FAILURE_REASON: &str = "workspace_setup_failed";
 
 pub(crate) fn guard_terminal_with_git_effect(
     disposition: TerminalDisposition,
@@ -153,6 +158,62 @@ fn verified_durable_response_common(
         ));
     }
     Ok(response_common)
+}
+
+fn verified_durable_decline(
+    decline: &StoredDecline,
+    agent_pubkey: &str,
+    current_sponsor_pubkey: &str,
+) -> Result<JobCommon, ReceiverError> {
+    decline
+        .request_event
+        .verify()
+        .map_err(|error| ReceiverError::Receipt(format!("stored request signature: {error}")))?;
+    decline
+        .declined
+        .verify()
+        .map_err(|error| ReceiverError::Receipt(format!("stored Declined signature: {error}")))?;
+    let JobEvent::Request(request) = JobEvent::parse(&decline.request_event)
+        .map_err(|error| ReceiverError::Receipt(format!("stored request event: {error}")))?
+    else {
+        return Err(ReceiverError::Receipt(
+            "stored decline root is not a job request".into(),
+        ));
+    };
+    let JobEvent::Accepted(receipt) = JobEvent::parse(&decline.declined)
+        .map_err(|error| ReceiverError::Receipt(format!("stored Declined event: {error}")))?
+    else {
+        return Err(ReceiverError::Receipt(
+            "stored Declined receipt is not kind 43002".into(),
+        ));
+    };
+
+    let request_id = decline.request_event.id.to_hex();
+    let digest = semantic_request_digest(&request)
+        .map_err(|error| ReceiverError::Receipt(error.to_string()))?;
+    let mut expected_common = request.common.clone();
+    expected_common.sender_pubkey = agent_pubkey.to_owned();
+    expected_common.recipient_pubkey = request.common.sender_pubkey.clone();
+    expected_common.sponsor = receipt.followup.common.sponsor.clone();
+    if decline.request_event_id != request_id
+        || decline.requester != request.common.sender_pubkey
+        || decline.idempotency_key != request.common.idempotency_key
+        || decline.digest != digest
+        || decline.declined.pubkey.to_hex() != agent_pubkey
+        || receipt.followup.common != expected_common
+        || receipt.followup.common.sponsor.pubkey != current_sponsor_pubkey
+        || receipt.followup.request_event_id != request_id
+        || receipt.followup.prior_event_id.is_some()
+        || receipt.claim.status != JobClaimStatus::Declined
+        || receipt.claim.scope_digest != digest
+        || receipt.claim.reason.as_deref() != Some(SETUP_FAILURE_REASON)
+    {
+        return Err(ReceiverError::Receipt(
+            "stored Declined receipt does not match its exact request and current key bindings"
+                .into(),
+        ));
+    }
+    Ok(receipt.followup.common)
 }
 
 /// A terminal already frozen in the lifecycle outbox predates the current
@@ -421,6 +482,20 @@ impl JobReceiver {
     /// Retry every frozen durable receipt/outbox event using its exact signed ID.
     pub async fn retry_outboxes(&self) -> Result<(), ReceiverError> {
         let mut first_error = None;
+        for decline in self.ledger.declines().await? {
+            if decline.community != self.tenant.community_id {
+                continue;
+            }
+            if let Err(error) = receipts::publish_decline(self, &decline, false).await {
+                tracing::warn!(
+                    request_event_id = %decline.request_event_id,
+                    "durable agent-job decline retry remains pending: {error}"
+                );
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
         for claim in self.ledger.claims().await? {
             if claim.community != self.tenant.community_id {
                 continue;
@@ -666,6 +741,31 @@ impl JobReceiver {
             self.allow_insecure_loopback,
         )
         .await?;
+        match self
+            .ledger
+            .lookup_decline(
+                &self.tenant.community_id,
+                &request.common.sender_pubkey,
+                &request.common.idempotency_key,
+                &candidate.digest,
+            )
+            .await?
+        {
+            DeclineLookup::Replay(decline) => {
+                verified_durable_decline(&decline, &self.agent_pubkey, &self.sponsor.pubkey)?;
+                receipts::publish_decline(self, &decline, true).await?;
+                return Ok(HandleOutcome::Consumed);
+            }
+            DeclineLookup::Conflict { existing_digest } => {
+                tracing::warn!(
+                    request_event_id = %event.id,
+                    existing_digest = %existing_digest,
+                    "rejecting changed agent job body for an existing idempotency key"
+                );
+                return Ok(HandleOutcome::Consumed);
+            }
+            DeclineLookup::Claimed | DeclineLookup::Absent => {}
+        }
         let grant_match = match self.grants.authorize_request(&request) {
             Ok(Some(grant_match)) => grant_match,
             Ok(None) => {
@@ -680,8 +780,42 @@ impl JobReceiver {
                 tracing::warn!(
                     channel_id = %channel_id,
                     request_event_id = %event.id,
-                    "dropping agent job because its Nemo worktree could not be prepared: {error}"
+                    "declining agent job because its Nemo worktree could not be prepared: {error}"
                 );
+                let declined = build_declined_receipt(
+                    &request,
+                    &event.id.to_hex(),
+                    &candidate.digest,
+                    &self.keys,
+                    &self.sponsor,
+                    SETUP_FAILURE_REASON,
+                )
+                .map_err(|error| ReceiverError::Receipt(error.to_string()))?;
+                let decline = StoredDecline::new(
+                    self.tenant.community_id.clone(),
+                    request.common.sender_pubkey.clone(),
+                    request.common.idempotency_key.clone(),
+                    candidate.digest.clone(),
+                    event.id.to_hex(),
+                    event.clone(),
+                    declined,
+                );
+                match self.ledger.decline(decline).await? {
+                    DeclineDecision::New(stored) => {
+                        receipts::publish_decline(self, &stored, false).await?;
+                    }
+                    DeclineDecision::Replay(stored) => {
+                        receipts::publish_decline(self, &stored, true).await?;
+                    }
+                    DeclineDecision::Claimed => {}
+                    DeclineDecision::Conflict { existing_digest } => {
+                        tracing::warn!(
+                            request_event_id = %event.id,
+                            existing_digest = %existing_digest,
+                            "rejecting changed agent job body for an existing idempotency key"
+                        );
+                    }
+                }
                 return Ok(HandleOutcome::Consumed);
             }
         };
@@ -696,6 +830,10 @@ impl JobReceiver {
         let (stored, force_receipt_replay) = match self.ledger.claim(candidate).await? {
             ClaimDecision::New(stored) => (stored, false),
             ClaimDecision::Replay(stored) => (stored, true),
+            ClaimDecision::Declined(stored) => {
+                receipts::publish_decline(self, &stored, true).await?;
+                return Ok(HandleOutcome::Consumed);
+            }
             ClaimDecision::Conflict { existing_digest } => {
                 tracing::warn!(
                     request_event_id = %event.id,

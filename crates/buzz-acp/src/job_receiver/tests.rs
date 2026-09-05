@@ -115,15 +115,19 @@ pub(super) fn fixture(
         acceptance: vec!["Tests pass".into()],
         supersedes_event_id: None,
     };
+    let event = sign_request(&request, sender);
+    (request, event)
+}
+
+fn sign_request(request: &JobRequest, sender: &Keys) -> Event {
     let body = JobEvent::Request(request.clone());
-    let event = EventBuilder::new(
+    EventBuilder::new(
         Kind::Custom(buzz_core::kind::KIND_JOB_REQUEST as u16),
         body.canonical_json().expect("json"),
     )
     .tags(build_job_tags(&body).expect("tags"))
     .sign_with_keys(sender)
-    .expect("sign");
-    (request, event)
+    .expect("sign")
 }
 
 pub(super) fn project(request: &JobRequest) -> PromptProjectInfo {
@@ -164,6 +168,66 @@ pub(super) fn grants_with_git_operations(
 
 pub(super) fn root() -> PathBuf {
     std::env::temp_dir().join(format!("buzz-acp-receiver-{}", Uuid::new_v4()))
+}
+
+fn managed_setup_failure(
+    sender: &Keys,
+    worker: &Keys,
+    idempotency_key: &str,
+) -> (
+    tempfile::TempDir,
+    PathBuf,
+    JobRequest,
+    Event,
+    PromptProjectInfo,
+    GrantSet,
+) {
+    let harness = tempfile::tempdir().expect("harness");
+    let checkout = harness.path().join("REPOS/nemo");
+    std::fs::create_dir_all(&checkout).expect("checkout");
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&checkout)
+            .args(args)
+            .output()
+            .expect("Git fixture");
+        assert!(output.status.success(), "Git fixture failed: {args:?}");
+        String::from_utf8(output.stdout)
+            .expect("Git output")
+            .trim()
+            .to_owned()
+    };
+    git(&["init", "--quiet"]);
+    git(&["config", "user.name", "Buzz Test"]);
+    git(&["config", "user.email", "buzz-test@example.invalid"]);
+    std::fs::write(checkout.join("fixture.txt"), "fixture\n").expect("fixture");
+    git(&["add", "fixture.txt"]);
+    git(&["commit", "--quiet", "-m", "fixture"]);
+    git(&["remote", "add", "origin", buzz_core::nemo::REPOSITORY]);
+    let base_sha = git(&["rev-parse", "HEAD"]);
+    git(&["config", "credential.helper", "!/tmp/untrusted-helper"]);
+
+    let channel = Uuid::parse_str(buzz_core::nemo::HOME_CHANNEL).expect("Nemo home");
+    let (mut request, _) = fixture(
+        sender,
+        worker,
+        channel,
+        buzz_core::nemo::REPOSITORY,
+        idempotency_key,
+        "bounded work",
+    );
+    request.common.project.address = buzz_core::nemo::PROJECT_ADDRESS.into();
+    request.common.project.home_channel = buzz_core::nemo::HOME_CHANNEL.into();
+    request.common.repository.base_sha = base_sha;
+    request.common.repository.branch = format!("codex/{idempotency_key}");
+    request.common.repository.worktree_id = idempotency_key.into();
+    request.common.repository.paths = vec!["new/file.rs".into()];
+    let event = sign_request(&request, sender);
+    let project = project(&request);
+    let grants =
+        GrantSet::load_with_nemo(harness.path(), None, None, true).expect("managed Nemo grants");
+    (harness, checkout, request, event, project, grants)
 }
 
 #[tokio::test]
@@ -292,6 +356,167 @@ async fn duplicate_delivery_replays_frozen_receipts_without_duplicate_prompt() {
         .await
         .expect("acknowledged receipts need no background retry");
     assert!(published.try_recv().is_err());
+    server.abort();
+    std::fs::remove_dir_all(ledger_root).ok();
+}
+
+#[tokio::test]
+async fn setup_failure_is_declined_once_and_exactly_replayed() {
+    let sender = Keys::generate();
+    let worker = Keys::generate();
+    let (_harness, checkout, request, event, project, grants) =
+        managed_setup_failure(&sender, &worker, "setup-decline");
+    let channel = Uuid::parse_str(&request.common.project.home_channel).expect("Nemo home");
+    let (rest, mut published, server) = RestClient::accepting_test_pair(worker.clone()).await;
+    let ledger_root = root();
+    let worker_sponsor = sponsor(&worker);
+    let receiver = JobReceiver::for_test(
+        context(&worker),
+        worker,
+        rest,
+        worker_sponsor,
+        grants,
+        ledger_root.clone(),
+    );
+
+    assert!(matches!(
+        receiver
+            .handle_request(channel, event.clone(), Some(&project))
+            .await
+            .expect("decline setup failure"),
+        HandleOutcome::Consumed
+    ));
+    let first = published.recv().await.expect("declined receipt");
+    assert!(matches!(
+        JobEvent::parse(&first).expect("valid receipt"),
+        JobEvent::Accepted(receipt)
+            if receipt.claim.status == JobClaimStatus::Declined
+                && receipt.claim.reason.as_deref() == Some(SETUP_FAILURE_REASON)
+                && receipt.followup.prior_event_id.is_none()
+    ));
+    assert!(receiver.ledger.claims().await.expect("claims").is_empty());
+    assert_eq!(receiver.ledger.declines().await.expect("declines").len(), 1);
+    assert!(!checkout
+        .parent()
+        .expect("checkout parent")
+        .join("nemo-worktrees/setup-decline")
+        .exists());
+
+    assert!(matches!(
+        receiver
+            .handle_request(channel, event.clone(), Some(&project))
+            .await
+            .expect("replay decline"),
+        HandleOutcome::Consumed
+    ));
+    let replay = published.recv().await.expect("declined replay");
+    assert_eq!(first.id, replay.id);
+    receiver
+        .retry_outboxes()
+        .await
+        .expect("acknowledged decline needs no retry");
+    assert!(published.try_recv().is_err());
+
+    let mut changed = request;
+    changed.summary = "changed body".into();
+    assert!(matches!(
+        receiver
+            .handle_request(channel, sign_request(&changed, &sender), Some(&project))
+            .await
+            .expect("reject changed body"),
+        HandleOutcome::Consumed
+    ));
+    assert!(published.try_recv().is_err());
+    server.abort();
+    std::fs::remove_dir_all(ledger_root).ok();
+}
+
+#[tokio::test]
+async fn uncertain_decline_publish_survives_restart_and_replays_exact_event() {
+    let sender = Keys::generate();
+    let worker = Keys::generate();
+    let (_harness, checkout, request, event, project, grants) =
+        managed_setup_failure(&sender, &worker, "setup-crash");
+    let channel = Uuid::parse_str(&request.common.project.home_channel).expect("Nemo home");
+    let (rest, mut observed, server) =
+        RestClient::uncertain_then_accepting_job_test_pair(worker.clone()).await;
+    let ledger_root = root();
+    let tenant = context(&worker);
+    let worker_sponsor = sponsor(&worker);
+    let receiver = JobReceiver::for_test(
+        tenant.clone(),
+        worker.clone(),
+        rest.clone(),
+        worker_sponsor.clone(),
+        grants.clone(),
+        ledger_root.clone(),
+    );
+
+    assert!(receiver
+        .handle_request(channel, event.clone(), Some(&project))
+        .await
+        .is_err());
+    let mut uncertain_ids = Vec::new();
+    for _ in 0..4 {
+        uncertain_ids.push(
+            observed
+                .recv()
+                .await
+                .expect("relay observed uncertain submit")
+                .id,
+        );
+    }
+    assert!(uncertain_ids.windows(2).all(|pair| pair[0] == pair[1]));
+    assert_eq!(receiver.ledger.declines().await.expect("declines").len(), 1);
+    assert!(!receiver
+        .ledger
+        .decline_acked(&receiver.ledger.declines().await.expect("decline")[0])
+        .await
+        .expect("unacked"));
+    drop(receiver);
+
+    let reopened = JobReceiver::for_test(
+        tenant,
+        worker,
+        rest,
+        worker_sponsor,
+        grants,
+        ledger_root.clone(),
+    );
+    reopened
+        .retry_outboxes()
+        .await
+        .expect("restart retries frozen decline");
+    let confirmed = observed.recv().await.expect("confirmed retry");
+    assert_eq!(confirmed.id, uncertain_ids[0]);
+    let decline = reopened
+        .ledger
+        .declines()
+        .await
+        .expect("declines")
+        .remove(0);
+    assert!(reopened
+        .ledger
+        .decline_acked(&decline)
+        .await
+        .expect("acked"));
+
+    assert!(matches!(
+        reopened
+            .handle_request(channel, event, Some(&project))
+            .await
+            .expect("duplicate replay"),
+        HandleOutcome::Consumed
+    ));
+    assert_eq!(
+        observed.recv().await.expect("duplicate receipt").id,
+        confirmed.id
+    );
+    assert!(!checkout
+        .parent()
+        .expect("checkout parent")
+        .join("nemo-worktrees/setup-crash")
+        .exists());
     server.abort();
     std::fs::remove_dir_all(ledger_root).ok();
 }

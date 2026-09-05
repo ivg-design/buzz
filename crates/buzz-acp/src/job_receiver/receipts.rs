@@ -1,4 +1,4 @@
-use super::ledger::{ReceiptKind, StoredClaim};
+use super::ledger::{ReceiptKind, StoredClaim, StoredDecline};
 use super::{JobReceiver, ReceiverError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -24,6 +24,23 @@ pub(super) async fn publish(
     }
     submit(receiver, claim, ReceiptKind::Accepted, force_replay).await?;
     Ok(PublishOutcome::Accepted)
+}
+
+pub(super) async fn publish_decline(
+    receiver: &JobReceiver,
+    decline: &StoredDecline,
+    force_replay: bool,
+) -> Result<(), ReceiverError> {
+    if !force_replay && receiver.ledger.decline_acked(decline).await? {
+        return Ok(());
+    }
+    super::verified_durable_decline(decline, &receiver.agent_pubkey, &receiver.sponsor.pubkey)?;
+    receiver
+        .rest
+        .submit_event_confirmed(&decline.declined)
+        .await?;
+    receiver.ledger.mark_decline_acked(decline).await?;
+    Ok(())
 }
 
 async fn cancelled_before_accept(

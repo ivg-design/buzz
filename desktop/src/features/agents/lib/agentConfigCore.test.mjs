@@ -136,7 +136,35 @@ for (const scope of ["global", "onboarding"]) {
   });
 }
 
-// Per-agent scopes (definition/instance) intentionally keep effort on the
+for (const scope of ["definition", "instance", "global", "onboarding"]) {
+  test(`Claude effort reads its native override rather than a legacy value at ${scope} scope`, () => {
+    const model = deriveAgentConfigFieldModel({
+      config: {
+        ...config,
+        env_vars: {
+          BUZZ_AGENT_THINKING_EFFORT: "low",
+          CLAUDE_CODE_EFFORT_LEVEL: "xhigh",
+        },
+      },
+      runtime: runtime("claude", {
+        thinkingEnvVar: "CLAUDE_CODE_EFFORT_LEVEL",
+        effortCanonicalValues: ["low", "medium", "high", "xhigh", "max"],
+      }),
+      scope,
+    });
+    const effort = field(model, "effort");
+    assert.equal(effort.render, "control");
+    assert.equal(effort.value, "xhigh");
+    assert.deepEqual(effort.currentPersistence, {
+      kind: "envVar", key: "CLAUDE_CODE_EFFORT_LEVEL",
+    });
+    assert.deepEqual(effort.targetApplication, effort.currentPersistence);
+    assert.deepEqual(structuredEnvKeys([effort]), ["CLAUDE_CODE_EFFORT_LEVEL"]);
+    assert.deepEqual(model.omissions, []);
+  });
+}
+
+// Per-agent scopes (definition/instance) intentionally keep Goose effort on the
 // generic legacy BUZZ_AGENT_THINKING_EFFORT row until PR 2.7 migrates Goose —
 // currentPersistence/value stay legacy while targetApplication is native
 // (agents/AGENTS.md rule 2). The scope gate must not broaden to these scopes.

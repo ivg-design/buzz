@@ -46,11 +46,12 @@ with a TypeScript lookup table or an id comparison in a component.
    descriptor's `currentPersistence` key — never a raw
    `BUZZ_AGENT_THINKING_EFFORT` literal in UI code. `currentPersistence` is
    where the value lives *today*; `targetApplication` is how the harness
-   *should* receive it. They intentionally differ until PR 2.7 migrates
-   Goose/Claude — do not "fix" one to match the other without doing the
-   migration work.
+   receives it. Claude's environment effort control now persists its catalog
+   native key at every scope. Goose's per-agent legacy persistence still differs
+   until its migration; do not change that mapping as part of Claude work.
 3. **Field absence has a named reason, not a boolean.** Codex effort is
-   `ownedByModelId`; Claude effort is `deferredUntilNativeOptionsAvailable`.
+   `ownedByModelId`; Claude effort is `deferredUntilNativeOptionsAvailable` only
+   when its catalog does not advertise an effort environment variable.
    New absences get new named reasons in `AgentConfigOmission` /
    `render` — never a `showX` prop.
 4. **The clearing policy is the named types.** `onContextChange:

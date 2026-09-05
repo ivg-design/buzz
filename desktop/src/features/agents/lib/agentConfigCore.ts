@@ -204,18 +204,12 @@ export function deriveAgentConfigFieldModel({
   });
 
   if (runtime?.thinkingEnvVar) {
-    // targetApplication is always the runtime's native key — how the harness
-    // should receive effort. currentPersistence (where the value lives today)
-    // is scope-split until PR 2.7 migrates per-agent Goose/Claude:
-    //   - global/onboarding: native key, matching the launch projection's global
-    //     tier (native-only; the legacy alias is record/persona scope), so a
-    //     selection actually reaches the spawn rather than persisting a key the
-    //     projection ignores. For buzz-agent this IS BUZZ_AGENT_THINKING_EFFORT.
-    //   - definition/instance: still the generic legacy BUZZ_AGENT_THINKING_EFFORT
-    //     row, unchanged pending the per-agent migration.
+    // Claude's setup and edit controls persist the native environment key.
+    // Global/onboarding already use native keys. Other per-agent runtimes keep
+    // their existing legacy persistence until their own migration.
     const nativeKey = runtime.thinkingEnvVar;
     const persistenceKey =
-      scope === "global" || scope === "onboarding"
+      runtime.id === "claude" || scope === "global" || scope === "onboarding"
         ? nativeKey
         : BUZZ_AGENT_THINKING_EFFORT;
     fields.push({

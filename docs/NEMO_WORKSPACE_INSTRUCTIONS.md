@@ -103,8 +103,10 @@ request body, and never execute a replayed job twice. A changed task needs a new
 After a handoff, the coordinator advances the job epoch as the tool contract requires.
 
 Do not call a wait tool without a live operation or session identifier. Avoid busy polling
-and repeated status messages. Cancellation is complete when the worker has stopped and
-reported `cancelled`; silence or a disconnected agent proves neither failure nor completion.
+and repeated status messages. Cancellation is settled when the worker has stopped and
+reported its terminal disposition. Interrupted execution can be `indeterminate` when its
+effects still need reconciliation; do not keep waiting for a separate `cancelled` result.
+Silence or a disconnected agent proves neither failure nor completion.
 Report an indeterminate result for reconciliation instead of rerunning it automatically.
 Native shell and configured MCP actions can have effects outside Buzz's optional Git
 journal. An empty journal does not prove that an interrupted job made no changes.

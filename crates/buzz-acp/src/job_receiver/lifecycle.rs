@@ -215,6 +215,14 @@ impl LifecycleStore {
     fn confirm_blocking(&self, event_id: &str) -> Result<(), LifecycleError> {
         self.with_lock(|| {
             let mut state = self.read()?;
+            // Submission acknowledgement can race the background outbox retry
+            // with the live emitter. Once either path confirms this exact
+            // event, the other confirmation is already satisfied. Treat that
+            // replay as success instead of reporting a permanently pending
+            // outbox after the winner has cleared it.
+            if state.head_event_id == event_id {
+                return Ok(());
+            }
             let Some(event) = state.outbox.as_ref() else {
                 return Err(LifecycleError::Invalid("lifecycle outbox is empty".into()));
             };
@@ -485,6 +493,71 @@ mod tests {
         assert!(pending.is_none());
         assert!(!terminal);
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn duplicate_confirmation_of_the_current_head_is_idempotent() {
+        for terminal_event in [false, true] {
+            let root = tempfile::tempdir().expect("root");
+            let live = LifecycleStore::new(root.path(), "job");
+            live.initialize("a".repeat(64)).await.expect("initialize");
+            let progress = event("progress or terminal");
+            live.stage(progress.clone(), terminal_event, "a".repeat(64))
+                .await
+                .expect("stage");
+            let retry = LifecycleStore::new(root.path(), "job");
+            let (first, second) = tokio::join!(
+                live.confirm(progress.id.to_hex()),
+                retry.confirm(progress.id.to_hex()),
+            );
+            first.expect("live confirmer");
+            second.expect("racing retry confirmer");
+
+            let reopened = LifecycleStore::new(root.path(), "job");
+            let (head, pending, terminal) = reopened.snapshot().await.expect("snapshot");
+            assert_eq!(head, progress.id.to_hex());
+            assert!(pending.is_none());
+            assert_eq!(terminal, terminal_event);
+            assert!(reopened.confirm("b".repeat(64)).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_head_confirmation_preserves_a_newer_terminal_outbox() {
+        let root = tempfile::tempdir().expect("root");
+        let store = LifecycleStore::new(root.path(), "job");
+        store.initialize("a".repeat(64)).await.expect("initialize");
+        let progress = event("progress");
+        store
+            .stage(progress.clone(), false, "a".repeat(64))
+            .await
+            .expect("progress");
+        store
+            .confirm(progress.id.to_hex())
+            .await
+            .expect("confirm progress");
+        let terminal_event = event("terminal");
+        store
+            .stage(terminal_event.clone(), true, progress.id.to_hex())
+            .await
+            .expect("terminal");
+        store
+            .confirm(progress.id.to_hex())
+            .await
+            .expect("late progress confirmation");
+        let (head, pending, terminal) = store.snapshot().await.expect("pending terminal");
+        assert_eq!(head, progress.id.to_hex());
+        assert_eq!(
+            pending.expect("terminal outbox retained").id,
+            terminal_event.id
+        );
+        assert!(!terminal);
+        store
+            .confirm(terminal_event.id.to_hex())
+            .await
+            .expect("confirm terminal");
+        assert!(store.confirm(progress.id.to_hex()).await.is_err());
+        assert!(store.snapshot().await.expect("terminal snapshot").2);
     }
 
     #[tokio::test]

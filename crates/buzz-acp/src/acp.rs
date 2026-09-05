@@ -493,6 +493,9 @@ pub struct AcpClient {
     /// session ID an adapter places in its callback.
     session_permission_policies: HashMap<String, SessionPermissionPolicy>,
     active_prompt_session_id: Option<String>,
+    /// Exact harness turn whose prompt write was attempted, retained after
+    /// errors and cleanup so setup failures cannot be confused with execution.
+    prompt_attempted_turn_id: Option<String>,
     /// Per-turn channel for receiving goose-native non-cancelling steer
     /// requests from the main loop. Installed by
     /// [`install_steer_rx`](Self::install_steer_rx) at dispatch and
@@ -975,6 +978,7 @@ impl AcpClient {
             job_policy_adapter_qualified: checksum_qualified_claude,
             session_permission_policies: HashMap::new(),
             active_prompt_session_id: None,
+            prompt_attempted_turn_id: None,
             steer_rx: None,
             goose_usage: UsageTracker::default(),
             standard_usage: StandardUsageTracker::default(),
@@ -993,6 +997,13 @@ impl AcpClient {
     /// Update metadata that will be attached to subsequent raw wire events.
     pub fn set_observer_context(&mut self, context: ObserverContext) {
         self.observer_context = context;
+    }
+
+    /// Prove that the current harness turn has not attempted a prompt write.
+    /// Missing or mismatched turn context is unknown and fails closed.
+    pub(crate) fn prompt_not_attempted_for_turn(&self, turn_id: &str) -> bool {
+        self.observer_context.turn_id.as_deref() == Some(turn_id)
+            && self.prompt_attempted_turn_id.as_deref() != Some(turn_id)
     }
 
     /// Return a clone of the observer handle, if attached.
@@ -1362,6 +1373,9 @@ impl AcpClient {
         // to the harness-created session policy. A malicious adapter cannot
         // escape a Job denial by writing a different sessionId in its request.
         self.active_prompt_session_id = Some(session_id.to_owned());
+        // Record before writing: an interrupted write may already have
+        // delivered the prompt. Keep this boundary after response errors.
+        self.prompt_attempted_turn_id = self.observer_context.turn_id.clone();
         self.turn_text.clear();
         self.turn_text_overflowed = false;
         let params = build_prompt_params(session_id, prompt_blocks);
@@ -3838,6 +3852,51 @@ mod tests {
         AcpClient::spawn("bash", &["-c".into(), script.into()], &[], false)
             .await
             .expect("failed to spawn test script")
+    }
+
+    #[tokio::test]
+    async fn prompt_attempt_boundary_survives_provider_error_and_is_turn_scoped() {
+        let mut client = spawn_script(
+            r#"
+            read -t 2 _REQ
+            echo '{"jsonrpc":"2.0","id":0,"error":{"code":-32603,"message":"startup failed"}}'
+            read -t 2 _REQ
+            echo '{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"turn failed"}}'
+            sleep 1
+            "#,
+        )
+        .await;
+        assert!(!client.prompt_not_attempted_for_turn("job-turn"));
+        client.set_observer_context(crate::observer::context_for(
+            None,
+            None,
+            Some("job-turn".into()),
+        ));
+        assert!(client.prompt_not_attempted_for_turn("job-turn"));
+        assert!(client
+            .session_set_config_option("job-session", "mode", "bypassPermissions")
+            .await
+            .is_err());
+        assert!(client.prompt_not_attempted_for_turn("job-turn"));
+
+        assert!(client
+            .session_prompt_with_idle_timeout(
+                "job-session",
+                "job prompt",
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            .is_err());
+        assert!(!client.has_in_flight_prompt());
+        assert!(!client.prompt_not_attempted_for_turn("job-turn"));
+        assert!(!client.prompt_not_attempted_for_turn("another-turn"));
+        client.set_observer_context(crate::observer::context_for(
+            None,
+            None,
+            Some("another-turn".into()),
+        ));
+        assert!(client.prompt_not_attempted_for_turn("another-turn"));
     }
 
     fn job_policy_capability_result() -> serde_json::Value {

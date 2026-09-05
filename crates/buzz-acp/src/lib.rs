@@ -173,6 +173,78 @@ enum DeferredJobTerminal {
     Outcome(job_receiver::TerminalDisposition),
 }
 
+fn job_terminal_disposition(
+    outcome: &PromptOutcome,
+    prompt_not_attempted: bool,
+    captured_text: Option<String>,
+    operation_id: &str,
+    request_event_id: &str,
+    scope_digest: &str,
+) -> job_receiver::TerminalDisposition {
+    match outcome {
+        PromptOutcome::Ok(_) => job_receiver::parse_terminal_outcome(
+            captured_text,
+            operation_id,
+            request_event_id,
+            scope_digest,
+        ),
+        // Only an exact pre-prompt boundary proves a setup failure. A generic
+        // ACP error after delivery cannot rule out non-Git side effects. The
+        // finisher also reconciles any applied/ambiguous durable Git effects.
+        PromptOutcome::Error(_) if prompt_not_attempted => {
+            job_receiver::TerminalDisposition::Failed {
+                code: "worker_startup_failed".into(),
+                message: "Worker setup failed before the requested prompt was sent".into(),
+                retryable: true,
+            }
+        }
+        _ => job_receiver::TerminalDisposition::Indeterminate {
+            code: "worker_turn_interrupted".into(),
+            message: "Worker turn ended without a proven terminal outcome".into(),
+        },
+    }
+}
+
+#[cfg(test)]
+mod job_terminal_disposition_tests {
+    use super::*;
+
+    #[test]
+    fn only_proven_preprompt_acp_error_is_retryable_failure() {
+        let outcome = PromptOutcome::Error(acp::AcpError::Protocol(
+            "session setup rejected permission mode".into(),
+        ));
+        let disposition = job_terminal_disposition(
+            &outcome,
+            true,
+            None,
+            "9064f66a-a18a-4f04-b85e-5c39b2b2a1ea",
+            &"4".repeat(64),
+            &"5".repeat(64),
+        );
+        assert!(matches!(
+            disposition,
+            job_receiver::TerminalDisposition::Failed {
+                ref code,
+                retryable: true,
+                ..
+            } if code == "worker_startup_failed"
+        ));
+        assert!(matches!(
+            job_terminal_disposition(
+                &outcome,
+                false,
+                None,
+                "9064f66a-a18a-4f04-b85e-5c39b2b2a1ea",
+                &"4".repeat(64),
+                &"5".repeat(64),
+            ),
+            job_receiver::TerminalDisposition::Indeterminate { ref code, .. }
+                if code == "worker_turn_interrupted"
+        ));
+    }
+}
+
 fn spawn_job_terminal_finisher(
     privileges: job_receiver::JobPrivilegeRegistry,
     scope: scope::SessionScope,
@@ -4503,19 +4575,17 @@ async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
                             DeferredJobTerminal::Cancellation(Box::new(cancellation))
                         }
                         None => {
-                            let disposition = match &result.outcome {
-                                PromptOutcome::Ok(_) => job_receiver::parse_terminal_outcome(
-                                    captured_job_text.flatten(),
-                                    operation_id,
-                                    request_event_id,
-                                    emitter.scope_digest(),
-                                ),
-                                _ => job_receiver::TerminalDisposition::Indeterminate {
-                                    code: "worker_turn_interrupted".into(),
-                                    message: "Worker turn ended without a proven terminal outcome"
-                                        .into(),
-                                },
-                            };
+                            let disposition = job_terminal_disposition(
+                                &result.outcome,
+                                result
+                                    .agent
+                                    .acp
+                                    .prompt_not_attempted_for_turn(&result.turn_id),
+                                captured_job_text.flatten(),
+                                operation_id,
+                                request_event_id,
+                                emitter.scope_digest(),
+                            );
                             DeferredJobTerminal::Outcome(disposition)
                         }
                     };

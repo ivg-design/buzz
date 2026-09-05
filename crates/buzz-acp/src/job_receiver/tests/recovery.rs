@@ -340,6 +340,176 @@ async fn membership_revocation_freezes_exactly_one_terminal() {
 }
 
 #[tokio::test]
+async fn accepted_preprompt_setup_error_survives_restart_without_redispatch() {
+    let sender = Keys::generate();
+    let worker = Keys::generate();
+    let channel = Uuid::new_v4();
+    let ledger_root = root();
+    let tenant = context(&worker);
+    let worker_sponsor = sponsor(&worker);
+    let (request, request_event) = fixture(
+        &sender,
+        &worker,
+        channel,
+        "https://github.com/mysteropodes/nemo",
+        "accepted-preprompt-setup-error",
+        "work",
+    );
+    let (rest, mut published, server) = RestClient::accepting_test_pair(worker.clone()).await;
+    let receiver = JobReceiver::for_test(
+        tenant.clone(),
+        worker.clone(),
+        rest.clone(),
+        worker_sponsor.clone(),
+        grants(&request),
+        ledger_root.clone(),
+    );
+    let HandleOutcome::Dispatch(dispatch) = receiver
+        .handle_request(channel, request_event.clone(), Some(&project(&request)))
+        .await
+        .expect("accept request")
+    else {
+        panic!("first delivery must dispatch")
+    };
+    let processed = published.recv().await.expect("Processed receipt");
+    let accepted = published.recv().await.expect("Accepted receipt");
+    // Production fences redispatch before provider setup, even when setup
+    // fails without sending the prompt to the model.
+    assert!(receiver
+        .mark_prompt_started(&dispatch.claim)
+        .await
+        .expect("durable pre-provider admission fence"));
+    let registry = JobPrivilegeRegistry::default();
+    registry
+        .register(dispatch.scope.clone(), dispatch.privilege.clone())
+        .expect("register admitted job capability");
+    let disposition = crate::job_terminal_disposition(
+        &crate::PromptOutcome::Error(crate::acp::AcpError::Protocol(
+            "session setup rejected permission mode".into(),
+        )),
+        true,
+        None,
+        &request.common.operation_id,
+        &request_event.id.to_hex(),
+        dispatch.emitter.scope_digest(),
+    );
+    crate::spawn_job_terminal_finisher(
+        registry.clone(),
+        dispatch.scope.clone(),
+        Some((
+            dispatch.emitter.clone(),
+            crate::DeferredJobTerminal::Outcome(disposition),
+        )),
+    );
+    let terminal = tokio::time::timeout(std::time::Duration::from_secs(2), published.recv())
+        .await
+        .expect("setup failure must publish a terminal")
+        .expect("Failed terminal");
+    assert_eq!(
+        terminal.kind,
+        Kind::Custom(buzz_core::kind::KIND_JOB_ERROR as u16)
+    );
+    assert!(matches!(
+        JobEvent::parse(&terminal).expect("valid terminal"),
+        JobEvent::Error(error)
+            if error.outcome == JobErrorOutcome::Failed
+                && error.code == "worker_startup_failed"
+                && error.retryable
+                && error.followup.request_event_id == request_event.id.to_hex()
+                && error.followup.prior_event_id == Some(accepted.id.to_hex())
+    ));
+    assert!(
+        registry
+            .for_session(&dispatch.scope, &dispatch.checkout_root)
+            .is_err(),
+        "terminal publication must revoke the admitted capability"
+    );
+    // The relay can expose the event before its HTTP acknowledgement returns.
+    // Wait for that acknowledgement before simulating process restart.
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !dispatch
+            .emitter
+            .is_terminal()
+            .await
+            .expect("terminal state")
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Failed terminal must be durably acknowledged");
+    assert!(receiver
+        .pending_events()
+        .await
+        .expect("pending requests")
+        .is_empty());
+    let claim = dispatch.claim.clone();
+    drop(dispatch);
+    drop(receiver);
+
+    let reopened = JobReceiver::for_test(
+        tenant,
+        worker,
+        rest,
+        worker_sponsor,
+        grants(&request),
+        ledger_root.clone(),
+    );
+    reopened
+        .recover_lifecycle()
+        .await
+        .expect("recover durable Failed terminal");
+    assert_eq!(
+        reopened
+            .ledger
+            .lifecycle_store(&claim)
+            .snapshot()
+            .await
+            .expect("reopened lifecycle"),
+        (terminal.id.to_hex(), None, true)
+    );
+    assert!(reopened
+        .pending_events()
+        .await
+        .expect("recovered pending requests")
+        .is_empty());
+    assert!(!reopened
+        .mark_prompt_started(&claim)
+        .await
+        .expect("reexecution fence survives restart"));
+    assert!(
+        published.try_recv().is_err(),
+        "recovery must not fork a terminal"
+    );
+    assert!(matches!(
+        reopened
+            .handle_request(channel, request_event, Some(&project(&request)))
+            .await
+            .expect("exact request replay"),
+        HandleOutcome::Consumed
+    ));
+    assert_eq!(
+        published.recv().await.expect("Processed replay").id,
+        processed.id
+    );
+    assert_eq!(
+        published.recv().await.expect("Accepted replay").id,
+        accepted.id
+    );
+    reopened
+        .retry_outboxes()
+        .await
+        .expect("acknowledged terminal remains settled");
+    assert!(
+        published.try_recv().is_err(),
+        "replay must not emit a second terminal"
+    );
+    server.abort();
+    drop(reopened);
+    std::fs::remove_dir_all(ledger_root).ok();
+}
+
+#[tokio::test]
 async fn panic_after_prompt_start_never_redispatches_and_freezes_one_terminal() {
     let sender = Keys::generate();
     let worker = Keys::generate();

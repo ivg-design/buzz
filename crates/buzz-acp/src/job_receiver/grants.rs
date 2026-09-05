@@ -1068,7 +1068,10 @@ fn dangerous_local_config_key(key: &str) -> bool {
     EXACT.contains(&key)
         || (key.starts_with("remote.")
             && !matches!(key, "remote.origin.url" | "remote.origin.fetch"))
-        || (key.starts_with("branch.") && !key.ends_with(".remote") && !key.ends_with(".merge"))
+        || (key.starts_with("branch.")
+            && !key.ends_with(".remote")
+            && !key.ends_with(".merge")
+            && !key.ends_with(".vscode-merge-base"))
         || [
             "credential.",
             "diff.",
@@ -1695,6 +1698,10 @@ mod tests {
                 "origin",
                 "https://github.com/mysteropodes/nemo.git",
             ],
+        );
+        run(
+            &checkout,
+            &["config", "--local", "branch.main.vscode-merge-base", "main"],
         );
         let base = git_output(&checkout, &["rev-parse", "HEAD"]).expect("base");
         let mut candidate = request();

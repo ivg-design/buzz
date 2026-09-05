@@ -126,6 +126,9 @@ impl SessionRecoveryStore {
         provider: &str,
         cwd: &str,
     ) -> Result<Option<PersistedSessionBinding>, SessionRecoveryError> {
+        if scope.is_job() {
+            return Ok(None);
+        }
         let document = self
             .document
             .lock()
@@ -190,6 +193,9 @@ impl SessionRecoveryStore {
 
     /// Remove a binding when Buzz deliberately rotates that provider session.
     pub fn remove(&self, scope: &SessionScope) -> Result<(), SessionRecoveryError> {
+        if scope.is_job() {
+            return Ok(());
+        }
         self.mutate(|document| document.bindings.retain(|binding| &binding.scope != scope))
     }
 
@@ -214,6 +220,12 @@ impl SessionRecoveryStore {
         provider_session_id: &str,
         update: impl FnOnce(&mut PersistedSessionBinding),
     ) -> Result<(), SessionRecoveryError> {
+        // Temporary job sessions use the A2A ledger's execution fence and
+        // terminal receipts. They never create resumable conversation bindings,
+        // so neither their prompt-start nor completion boundary belongs here.
+        if scope.is_job() {
+            return Ok(());
+        }
         let mut document = self
             .document
             .lock()
@@ -390,5 +402,75 @@ mod tests {
             ),
             Err(SessionRecoveryError::BindingNotFound)
         ));
+    }
+
+    #[test]
+    fn job_boundaries_preserve_interrupted_conversation_and_need_no_recovery_write() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let conversation = scope();
+        let store = SessionRecoveryStore::open(path.clone()).unwrap();
+        let binding = PersistedSessionBinding {
+            scope: conversation.clone(),
+            provider: "claude-agent-acp".into(),
+            provider_session_id: "conversation-session".into(),
+            cwd: "/workspace".into(),
+            phase: RecoveryPhase::TurnStarted {
+                turn_id: "interrupted-conversation".into(),
+                trigger_event_ids: vec!["event-1".into()],
+                started_at: "2026-09-05T00:00:00Z".into(),
+            },
+        };
+        store.record_binding(binding.clone()).unwrap();
+        let original = fs::read(&path).unwrap();
+        // Unavailable conversation storage must block normal writes, but it
+        // must not prevent an independently journaled A2A job from running.
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        let job = SessionScope::Job {
+            channel_id: conversation.channel_id(),
+            operation_id: Uuid::new_v4().to_string(),
+            request_event_id: "a".repeat(64),
+        };
+        store
+            .record_binding(PersistedSessionBinding {
+                scope: job.clone(),
+                provider_session_id: "job-session".into(),
+                ..binding.clone()
+            })
+            .unwrap();
+        store
+            .mark_turn_started(&job, "job-session", "job-turn", &[], "now")
+            .unwrap();
+        store.mark_idle(&job, "job-session").unwrap();
+        store.remove(&job).unwrap();
+        assert!(store
+            .binding(&job, "claude-agent-acp", "/workspace")
+            .unwrap()
+            .is_none());
+        assert!(matches!(
+            store.mark_idle(&conversation, "conversation-session"),
+            Err(SessionRecoveryError::Io(_))
+        ));
+        assert_eq!(
+            store
+                .binding(&conversation, "claude-agent-acp", "/workspace")
+                .unwrap(),
+            Some(binding.clone()),
+            "failed normal writes must retain the interrupted boundary"
+        );
+        fs::remove_dir(&path).unwrap();
+        fs::write(&path, original).unwrap();
+        let reopened = SessionRecoveryStore::open(path).unwrap();
+        assert_eq!(
+            reopened
+                .binding(&conversation, "claude-agent-acp", "/workspace")
+                .unwrap(),
+            Some(binding)
+        );
+        assert!(reopened
+            .binding(&job, "claude-agent-acp", "/workspace")
+            .unwrap()
+            .is_none());
     }
 }

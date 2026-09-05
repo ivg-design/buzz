@@ -1,3 +1,4 @@
+import { ThreadPeople } from "@/features/messages/organization/ThreadPeople";
 import {
   OrganizationThreadIntro,
   type ConversationOrganization,
@@ -167,6 +168,16 @@ export function ForumView({
 
     return (
       <ForumThreadPanel
+        headerActions={
+          organization && threadPost ? (
+            <ThreadPeople
+              channel={channel}
+              threadRootId={selectedPostId}
+              organization={organization}
+              profiles={profiles}
+            />
+          ) : undefined
+        }
         canDeletePost={canDeleteExpandedPost}
         currentPubkey={effectiveCurrentPubkey}
         isDeletingPost={deletePostMutation.isPending}

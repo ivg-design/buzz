@@ -56,6 +56,7 @@ export default defineConfig({
         "**/agent-control-regressions.spec.ts",
         "**/profile-active-turn.spec.ts",
         "**/timed-tasks.spec.ts",
+        "**/thread-people.spec.ts",
         "**/config-bridge-screenshots.spec.ts",
         "**/observer-feed-screenshots.spec.ts",
         "**/core-memory-screenshots.spec.ts",

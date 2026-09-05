@@ -25,6 +25,7 @@ mod scope;
 mod session_recovery;
 mod setup_mode;
 mod startup_pipe;
+mod thread_participation;
 mod trusted_mcp;
 mod usage;
 
@@ -676,25 +677,75 @@ struct NormalListenerIngress {
     prompt_tag: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParticipantRouting {
+    Normal,
+    Follow,
+    SuppressAutomatic,
+}
+
+fn participant_routing(policy: Option<bool>, directly_addressed: bool) -> ParticipantRouting {
+    match (policy, directly_addressed) {
+        (_, true) | (None, false) => ParticipantRouting::Normal,
+        (Some(true), false) => ParticipantRouting::Follow,
+        (Some(false), false) => ParticipantRouting::SuppressAutomatic,
+    }
+}
+
+#[cfg(test)]
+mod participant_routing_tests {
+    use super::{participant_routing, ParticipantRouting};
+
+    #[test]
+    fn policy_only_controls_automatic_following() {
+        assert_eq!(
+            participant_routing(Some(true), false),
+            ParticipantRouting::Follow
+        );
+        assert_eq!(
+            participant_routing(Some(false), false),
+            ParticipantRouting::SuppressAutomatic
+        );
+        assert_eq!(
+            participant_routing(Some(false), true),
+            ParticipantRouting::Normal
+        );
+        assert_eq!(participant_routing(None, false), ParticipantRouting::Normal);
+    }
+}
+
 impl AuthorizedNormalListenerEvent {
     async fn match_subscription(
         self,
         rules: &[SubscriptionRule],
         agent_pubkey_hex: &str,
+        participant_policy: Option<bool>,
     ) -> Option<NormalListenerIngress> {
         let (buzz_event, effective_author, is_dm) = self.0.into_parts();
-        let matched = filter::match_event(
+        let participant_routing = participant_routing(
+            participant_policy,
+            peer_conversation::addressed_to(&buzz_event.event, agent_pubkey_hex),
+        );
+        if participant_routing == ParticipantRouting::SuppressAutomatic {
+            return None;
+        }
+        let prompt_tag = match filter::match_event(
             &buzz_event.event,
             buzz_event.channel_id,
             rules,
             agent_pubkey_hex,
             is_dm,
         )
-        .await?;
+        .await
+        {
+            Some(matched) => matched.prompt_tag,
+            None if participant_routing == ParticipantRouting::Follow => "task-message".into(),
+            None => return None,
+        };
         Some(NormalListenerIngress {
             buzz_event,
             effective_author,
-            prompt_tag: matched.prompt_tag,
+            prompt_tag,
         })
     }
 }
@@ -2908,6 +2959,7 @@ async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
     let relay_rest_client = relay.rest_client();
     let mut author_gate_ctx =
         InboundAuthorGate::connect(&relay_rest_client, &pubkey_hex, "startup").await;
+    let mut thread_participation = thread_participation::ThreadParticipation::default();
 
     relay
         .subscribe_membership_notifications()
@@ -4046,6 +4098,25 @@ async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
                                 continue;
                             }
 
+                            if kind_u32 == buzz_core::kind::KIND_CONVERSATION_ORGANIZATION {
+                                if let Err(error) = thread_participation
+                                    .observe_change(
+                                        buzz_event.channel_id,
+                                        &buzz_event.event,
+                                        &ctx.rest_client,
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        channel_id = %buzz_event.channel_id,
+                                        "conversation participant projection remains unavailable: {error}"
+                                    );
+                                }
+                                // Organization records update future routing but never
+                                // create a provider turn themselves.
+                                continue;
+                            }
+
                             if config.ignore_self && buzz_event.event.pubkey.to_hex() == pubkey_hex {
                                 tracing::debug!(channel_id = %buzz_event.channel_id, "dropping self-authored event");
                                 continue;
@@ -4063,6 +4134,29 @@ async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
                             {
                                 continue;
                             }
+
+                            let participation = if kind_u32 == KIND_STREAM_MESSAGE {
+                                match thread_participation
+                                    .resolve_message(
+                                        buzz_event.channel_id,
+                                        &buzz_event.event,
+                                        &pubkey_hex,
+                                        &ctx.rest_client,
+                                    )
+                                    .await
+                                {
+                                    Ok(decision) => decision,
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            channel_id = %buzz_event.channel_id,
+                                            "conversation participant routing unavailable; preserving explicit routing only: {error}"
+                                        );
+                                        None
+                                    }
+                                }
+                            } else {
+                                None
+                            };
 
                             // Check: kind:9, content "!shutdown", from owner, mentions THIS agent.
                             let is_shutdown = is_owner_control_command(
@@ -4113,13 +4207,24 @@ async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
                                     // the default channel policy the scope is the
                                     // channel's sole conversation, so this is
                                     // byte-for-byte the prior behavior.
-                                    let scope = scope::SessionScope::derive(
-                                        config.session_policy,
-                                        buzz_event.channel_id,
-                                        is_dm_channel(buzz_event.channel_id, &ctx.channel_info)
+                                    let scope = match participation.as_ref() {
+                                        Some(decision) if decision.grouped => {
+                                            peer_conversation::conversation_scope_for_root(
+                                                buzz_event.channel_id,
+                                                &decision.effective_root,
+                                            )
+                                        }
+                                        _ => scope::SessionScope::derive(
+                                            config.session_policy,
+                                            buzz_event.channel_id,
+                                            is_dm_channel(
+                                                buzz_event.channel_id,
+                                                &ctx.channel_info,
+                                            )
                                             .await,
-                                        &buzz_event.event,
-                                    );
+                                            &buzz_event.event,
+                                        ),
+                                    };
                                     let fired = signal_in_flight_task_for_scope(
                                         &mut pool,
                                         &scope,
@@ -4165,13 +4270,24 @@ async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
                                     // default channel policy the scope is the
                                     // channel's sole conversation, matching the
                                     // prior channel-wide rotate.
-                                    let scope = scope::SessionScope::derive(
-                                        config.session_policy,
-                                        buzz_event.channel_id,
-                                        is_dm_channel(buzz_event.channel_id, &ctx.channel_info)
+                                    let scope = match participation.as_ref() {
+                                        Some(decision) if decision.grouped => {
+                                            peer_conversation::conversation_scope_for_root(
+                                                buzz_event.channel_id,
+                                                &decision.effective_root,
+                                            )
+                                        }
+                                        _ => scope::SessionScope::derive(
+                                            config.session_policy,
+                                            buzz_event.channel_id,
+                                            is_dm_channel(
+                                                buzz_event.channel_id,
+                                                &ctx.channel_info,
+                                            )
                                             .await,
-                                        &buzz_event.event,
-                                    );
+                                            &buzz_event.event,
+                                        ),
+                                    };
                                     let fired = signal_in_flight_task_for_scope(
                                         &mut pool,
                                         &scope,
@@ -4205,20 +4321,54 @@ async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
                             let directed_peer = kind_u32 == 9
                                 && config.respond_to != RespondTo::Nobody
                                 && peer_conversation::addressed_to(&buzz_event.event, &pubkey_hex);
-                            let enrolled_peer = if directed_peer {
+                            let enrolled_peer = if kind_u32 == 9 {
                                 match ctx.trusted_mcp_factory.as_ref() {
-                                    Some(factory) => factory
-                                        .is_enrolled_peer(&buzz_event.event.pubkey.to_hex())
-                                        .await
-                                        .unwrap_or(false),
+                                    Some(factory) => match if directed_peer {
+                                        factory
+                                            .is_enrolled_peer(&buzz_event.event.pubkey.to_hex())
+                                            .await
+                                    } else {
+                                        factory
+                                            .is_enrolled_peer_cached(
+                                                &buzz_event.event.pubkey.to_hex(),
+                                            )
+                                            .await
+                                    } {
+                                        Ok(enrolled) => enrolled,
+                                        Err(error) => {
+                                            tracing::warn!(
+                                                channel_id = %buzz_event.channel_id,
+                                                "peer enrollment lookup failed closed: {error}"
+                                            );
+                                            continue;
+                                        }
+                                    },
                                     None => false,
                                 }
                             } else {
                                 false
                             };
+                            if enrolled_peer && !directed_peer {
+                                tracing::debug!(
+                                    channel_id = %buzz_event.channel_id,
+                                    "ignoring unaddressed enrolled-peer conversation chatter"
+                                );
+                                continue;
+                            }
                             if enrolled_peer {
-                                let session_scope = peer_conversation::conversation_scope(
-                                    buzz_event.channel_id, &buzz_event.event,
+                                let session_scope = participation.as_ref().map_or_else(
+                                    || {
+                                        peer_conversation::conversation_scope(
+                                            buzz_event.channel_id,
+                                            &buzz_event.event,
+                                        )
+                                    },
+                                    |decision| {
+                                        peer_conversation::conversation_scope_for_root(
+                                            buzz_event.channel_id,
+                                            &decision.effective_root,
+                                        )
+                                    },
                                 );
                                 let effective_author = buzz_event.event.pubkey.to_hex();
                                 let prompt_tag = if peer_conversation::peer_message(
@@ -4270,7 +4420,13 @@ async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
                             };
                             let Some(mut ingress) =
                                 AuthorizedNormalListenerEvent(authorized_event)
-                                    .match_subscription(&rules, &pubkey_hex)
+                                    .match_subscription(
+                                        &rules,
+                                        &pubkey_hex,
+                                        participation
+                                            .as_ref()
+                                            .and_then(|decision| decision.included),
+                                    )
                                     .await
                             else {
                                 tracing::debug!("authorized event matched no rule — dropping");
@@ -4283,12 +4439,26 @@ async fn tokio_main(startup: Option<SecureStartup>) -> Result<()> {
                             // channel-keyed routing. Telemetry only for now —
                             // queue/pool partitioning by scope lands in a
                             // follow-up (see ticket outline steps 2–4).
+                            let participant_thread = participation.as_ref().is_some_and(|decision| {
+                                decision.grouped || decision.included == Some(true)
+                            });
                             let session_scope = if peer_conversation::requires_task_thread(
                                 &ingress.buzz_event.event, &pubkey_hex,
-                            ) {
+                            ) || participant_thread {
                                 ingress.prompt_tag = "task-message".into();
-                                peer_conversation::conversation_scope(
-                                    ingress.buzz_event.channel_id, &ingress.buzz_event.event,
+                                participation.as_ref().map_or_else(
+                                    || {
+                                        peer_conversation::conversation_scope(
+                                            ingress.buzz_event.channel_id,
+                                            &ingress.buzz_event.event,
+                                        )
+                                    },
+                                    |decision| {
+                                        peer_conversation::conversation_scope_for_root(
+                                            ingress.buzz_event.channel_id,
+                                            &decision.effective_root,
+                                        )
+                                    },
                                 )
                             } else { scope::SessionScope::derive(
                                 config.session_policy,

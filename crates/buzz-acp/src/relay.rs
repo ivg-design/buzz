@@ -3775,6 +3775,9 @@ async fn wait_for_reconnect(
 /// - `kinds` is included only when `filter.kinds` is `Some`; `None` = wildcard.
 /// - `#p` is included only when `filter.require_mention` is `true`.
 /// - `#h` is always included (channel-scoped subscription).
+/// - A second channel-scoped filter always carries organization changes and
+///   ordinary kind-9 messages without a `#p` constraint. Local participant
+///   policy decides whether an unmentioned thread message may start a turn.
 /// - On first subscribe (`since` is `None`) adds `since=now` to avoid replaying
 ///   history. On reconnect (`since` is `Some`) subtracts [`SINCE_SKEW_SECS`].
 ///
@@ -3815,7 +3818,12 @@ async fn send_subscribe(
     };
     req_filter.insert("since".into(), json!(since_ts));
 
-    let req = json!(["REQ", sub_id, Value::Object(req_filter)]);
+    let participant_filter = json!({
+        "kinds": [buzz_core::kind::KIND_CONVERSATION_ORGANIZATION, 9],
+        "#h": [channel_id.to_string()],
+        "since": since_ts,
+    });
+    let req = json!(["REQ", sub_id, Value::Object(req_filter), participant_filter]);
 
     match serde_json::to_string(&req) {
         Ok(text) => {
@@ -5285,6 +5293,71 @@ mod tests {
                 replay_since: Some(1_000),
             },
         );
+    }
+
+    fn assert_participant_filter(frame: &serde_json::Value, channel_id: Uuid, expected_since: u64) {
+        assert_eq!(frame[0], "REQ");
+        assert_eq!(frame[1], channel_sub_id(channel_id));
+        let filter = frame[3]
+            .as_object()
+            .expect("participant subscription filter");
+        assert_eq!(
+            filter.len(),
+            3,
+            "participant filter must stay channel-bound"
+        );
+        assert_eq!(
+            filter["kinds"],
+            json!([buzz_core::kind::KIND_CONVERSATION_ORGANIZATION, 9])
+        );
+        assert_eq!(filter["#h"], json!([channel_id.to_string()]));
+        assert_eq!(filter["since"], json!(expected_since));
+        assert!(!filter.contains_key("#p"));
+    }
+
+    #[tokio::test]
+    async fn mention_mode_req_and_reconnect_include_participant_events() {
+        let (mut client, mut server) = test_ws_pair().await;
+        let (_cmd_tx, mut cmd_rx) = mpsc::channel(1);
+        let mut state = BgState::new();
+        let channel_id = Uuid::new_v4();
+        let filter = ChannelFilter {
+            kinds: Some(vec![9]),
+            require_mention: true,
+        };
+
+        assert!(
+            execute_connected_command(
+                &mut client,
+                &mut state,
+                "agent-pubkey",
+                RelayCommand::Subscribe {
+                    channel_id,
+                    filter,
+                    replay_since: Some(1_000),
+                },
+            )
+            .await
+        );
+        let initial = next_test_frame(&mut server).await;
+        assert_eq!(initial[2]["#p"], json!(["agent-pubkey"]));
+        assert_participant_filter(&initial, channel_id, 995);
+
+        state.last_seen.insert(channel_id, 1_200);
+        assert!(matches!(
+            resubscribe_after_reconnect(
+                &mut client,
+                &mut cmd_rx,
+                &mut state,
+                "agent-pubkey",
+                true,
+            )
+            .await,
+            ResubscribeResult::Ok
+        ));
+        let replay = next_test_frame(&mut server).await;
+        assert_eq!(replay[2]["#p"], json!(["agent-pubkey"]));
+        assert_participant_filter(&replay, channel_id, 1_195);
     }
 
     #[tokio::test]

@@ -11,7 +11,7 @@ search uses `search_page` and preserves relevance order. A full search page may
 have a following empty page. Searches are channel scoped; inspect a result's
 thread with `thread_root_id` on a subsequent history read.
 
-`buzz_organization_apply` supports four actions:
+`buzz_organization_apply` supports five actions:
 
 - `group`: place selected message subtrees under an existing top-level message,
   optionally supplying a title and summary.
@@ -19,12 +19,44 @@ thread with `thread_root_id` on a subsequent history read.
   fields remain separate from the original author's content.
 - `hide`: hide selected messages and their replies, or restore them with
   `hidden: false`.
+- `participants`: replace a thread's complete list of enrolled agents that
+  automatically follow future human messages. An empty list removes everyone
+  from automatic following.
 - `undo`: remove the effect of one exact change event. Other changes, including
   later changes to the same messages, remain in effect.
 
 To start an empty thread, use `buzz_chat_thread_create`, then use its returned
 root ID as the grouping destination. Existing messages can also become a thread
 root directly. Neither route reposts or impersonates their authors.
+
+## Agents in a thread
+
+Open **People** in a thread header to add or remove agents. Each checkbox saves
+the complete participant list through the ordinary signed organization write;
+the control waits for the relay acknowledgement before accepting another
+change. **Remove all agents** clears automatic following. The organization history
+shows participant changes and provides Undo.
+
+Adding an agent is passive: its first future human message in that thread wakes
+it with conversation context. Adding or removing agents does not start a
+synthetic turn, replay old messages, or abort work already running. Removed
+agents can still receive explicit mentions and addressed peer requests under
+normal enrollment and channel access. Agent replies wake other agents only
+when addressed, avoiding automatic reply loops.
+
+The list changes thread participation, not community enrollment or channel
+membership. The relay requires currently enrolled agents with a current
+community sponsor. Private channels and DMs additionally require the agent's
+existing direct channel membership. Offline agents can be selected; a selected
+agent that later loses eligibility remains visible for removal. Each list can
+contain up to 100 unique agents.
+
+Agents use the `participants` action with `thread_root_id` and the complete
+desired `agent_pubkeys` list. Read the effective list with
+`buzz_organization_read` using `thread_root_id` and `include_participants: true`
+before changing it. The returned `configured` flag distinguishes no saved
+policy from an explicitly empty list. When a subtree moves to another thread,
+it follows the destination thread's participant policy.
 
 ## Storage and projection
 
@@ -53,7 +85,8 @@ support kind `40009` before organization writes work; unsupported relays reject
 the write, and the client reports the error.
 
 The relay validates every referenced event in its server-selected community and
-the exact channel. A group destination must be an original top-level message.
+the exact channel. A group destination or participant-policy root must be an
+original top-level message.
 Undo can reference an earlier non-undo organization event in that channel.
 An operation selects at most 100 explicit messages. Descendants inherit grouping
 and visibility through their original reply ancestry, including new replies
@@ -69,6 +102,13 @@ cycle protection. Metadata fields update independently when present. A blank
 summary clears it; an absent field preserves the current value. Original reply
 relationships remain available even where the organized view attaches a subtree
 to a different displayed root.
+
+Participant lists replace one another in that same event order; Undo removes
+the selected replacement before reduction. Consumers resolve the effective
+thread root before reading its participant list. The shared core organization
+projection supplies these grouping and participant rules for agent tooling and
+runtime routing. Its callers must provide complete organization history and
+the original message ancestry, including grouping destinations.
 
 Before signing, both producers read the latest channel change from the relay's
 writer and use `max(current second, latest change second + 1)`. Immediate

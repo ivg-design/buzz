@@ -39,6 +39,10 @@ export function OrganizationThreadIntro({
 }
 
 function describeAction(action: OrganizationAction) {
+  if (action.type === "participants")
+    return action.agent_pubkeys.length
+      ? `Updated thread participants · ${action.agent_pubkeys.length} ${action.agent_pubkeys.length === 1 ? "agent" : "agents"}`
+      : "Removed automatic agent participation from a thread";
   if (action.type === "group")
     return `Grouped ${action.message_ids.length} ${action.message_ids.length === 1 ? "message" : "messages"} into ${action.title ? `“${action.title}”` : "a thread"}`;
   if (action.type === "thread_metadata")

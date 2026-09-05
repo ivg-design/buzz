@@ -64,10 +64,26 @@ fn cross_owner_discovery_does_not_require_home_roster_rows() {
         policy(&revoked_owner, &revoked_agent, "Revoked", 12),
         policy(&owner_a, &self_agent, "Self", 12),
     ];
-    let candidates = policy_candidates(&policies, &direct, &self_agent.public_key().to_hex());
+    let self_pubkey = self_agent.public_key().to_hex();
+    let candidates = policy_candidates(&policies, &direct, Some(&self_pubkey));
     assert_eq!(candidates.len(), 2);
     assert!(!candidates.contains(&self_agent.public_key().to_hex()));
     assert!(!candidates.contains(&revoked_agent.public_key().to_hex()));
+    let including_self = policy_candidates(&policies, &direct, None);
+    assert_eq!(including_self.len(), 3);
+    assert!(including_self.contains(&self_agent.public_key().to_hex()));
+    let owners_including_self = verified_profile_owners(
+        &[
+            profile(&owner_a, &agent_a, 11),
+            profile(&owner_b, &agent_b, 11),
+            profile(&owner_a, &self_agent, 11),
+        ],
+        &including_self,
+        &direct,
+    );
+    assert!(resolve_policies(&policies, &owners_including_self)
+        .iter()
+        .any(|peer| peer.pubkey == self_pubkey));
     let owners = verified_profile_owners(
         &[
             profile(&owner_a, &agent_a, 11),
@@ -110,7 +126,7 @@ fn forged_or_mismatched_directory_evidence_cannot_create_a_peer() {
     let direct = direct_members(&authority, &relay.public_key().to_hex()).unwrap();
     let valid_policy = policy(&owner, &agent, "Valid", 10);
     let forged_policy = policy(&attacker, &other_agent, "Forged", 20);
-    let candidates = policy_candidates(&[valid_policy.clone(), forged_policy], &direct, "");
+    let candidates = policy_candidates(&[valid_policy.clone(), forged_policy], &direct, None);
     assert_eq!(candidates, vec![agent.public_key().to_hex()]);
 
     let owners = verified_profile_owners(&[profile(&owner, &agent, 11)], &candidates, &direct);

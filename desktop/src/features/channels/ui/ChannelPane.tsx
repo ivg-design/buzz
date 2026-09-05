@@ -1,3 +1,4 @@
+import { ThreadPeople } from "@/features/messages/organization/ThreadPeople";
 import { OrganizationThreadIntro } from "@/features/messages/organization/OrganizationHistory";
 import * as React from "react";
 import { LogIn } from "lucide-react";
@@ -855,6 +856,18 @@ export const ChannelPane = React.memo(function ChannelPane({
           (() => {
             const panel = (
               <MessageThreadPanel
+                headerActions={
+                  activeChannel && organization ? (
+                    <ThreadPeople
+                      channel={activeChannel}
+                      threadRootId={
+                        threadHeadMessage.rootId ?? threadHeadMessage.id
+                      }
+                      organization={organization}
+                      profiles={profiles}
+                    />
+                  ) : undefined
+                }
                 channel={activeChannel}
                 channelId={activeChannel?.id ?? null}
                 channelName={activeChannel?.name ?? "channel"}

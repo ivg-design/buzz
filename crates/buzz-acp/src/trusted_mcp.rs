@@ -27,8 +27,14 @@ use crate::acp::{HttpHeader, McpServer};
 use crate::job_receiver::JobPrivilegeRegistry;
 use crate::scope::SessionScope;
 
+#[path = "peer_author_cache.rs"]
+mod peer_author_cache;
+use peer_author_cache::PeerAuthorCache;
+
 pub(crate) const SERVER_NAME: &str = "buzz-trusted-session";
 const MIN_TOKEN_BYTES: usize = 32;
+const PEER_AUTHOR_CACHE_TTL: Duration = Duration::from_secs(30);
+const PEER_AUTHOR_CACHE_CAPACITY: usize = 1_024;
 
 /// Immutable harness identity used to create a fresh capability for each ACP
 /// provider session.
@@ -37,6 +43,7 @@ pub struct TrustedMcpFactory {
     identity: HarnessTrustedIdentity,
     lifetime: Duration,
     job_privileges: JobPrivilegeRegistry,
+    peer_author_cache: PeerAuthorCache,
 }
 
 impl TrustedMcpFactory {
@@ -48,6 +55,15 @@ impl TrustedMcpFactory {
         })?;
         let cancellation = CancellationToken::new();
         relay.is_enrolled_peer(pubkey, &cancellation).await
+    }
+
+    /// Classify an unaddressed message author without repeating the complete
+    /// signed-directory lookup for every post. Directed traffic uses the fresh
+    /// `is_enrolled_peer` path above.
+    pub(crate) async fn is_enrolled_peer_cached(&self, pubkey: &str) -> Result<bool, String> {
+        self.peer_author_cache
+            .get_or_try_insert_with(pubkey, || self.is_enrolled_peer(pubkey))
+            .await
     }
     /// Create a factory. `lifetime` must cover a complete maximum-length turn;
     /// callers rotate provider sessions before the remaining lifetime is short.
@@ -71,6 +87,10 @@ impl TrustedMcpFactory {
             identity,
             lifetime,
             job_privileges,
+            peer_author_cache: PeerAuthorCache::new(
+                PEER_AUTHOR_CACHE_TTL,
+                PEER_AUTHOR_CACHE_CAPACITY,
+            ),
         })
     }
 

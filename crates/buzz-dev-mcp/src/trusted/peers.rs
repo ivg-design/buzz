@@ -31,6 +31,24 @@ pub async fn discover(
     relay: &TrustedRelay,
     cancellation: &CancellationToken,
 ) -> Result<Vec<VerifiedPeer>, String> {
+    let self_pubkey = relay.signer_pubkey();
+    discover_with_exclusion(relay, cancellation, Some(&self_pubkey)).await
+}
+
+/// Resolve the same signed enrolled-agent directory while retaining the
+/// current signer. Persistent thread participant lists may include that agent.
+pub(super) async fn discover_including_self(
+    relay: &TrustedRelay,
+    cancellation: &CancellationToken,
+) -> Result<Vec<VerifiedPeer>, String> {
+    discover_with_exclusion(relay, cancellation, None).await
+}
+
+async fn discover_with_exclusion(
+    relay: &TrustedRelay,
+    cancellation: &CancellationToken,
+    excluded_pubkey: Option<&str>,
+) -> Result<Vec<VerifiedPeer>, String> {
     if !relay.grants.is_managed_nemo() {
         return Err("verified peer discovery is unavailable outside the Nemo workspace".into());
     }
@@ -51,11 +69,12 @@ pub async fn discover(
     let policy_events = relay
         .query_signed_events(policy_filters(&direct_members), cancellation)
         .await?;
-    let candidates = policy_candidates(&policy_events, &direct_members, &relay.signer_pubkey());
+    let candidates = policy_candidates(&policy_events, &direct_members, excluded_pubkey);
     if candidates.is_empty() {
         return Ok(Vec::new());
     }
-    if candidates.len() > MAX_PEERS {
+    let candidate_limit = MAX_PEERS + usize::from(excluded_pubkey.is_none());
+    if candidates.len() > candidate_limit {
         return Err("verified Nemo peer roster exceeds the bounded tool limit".into());
     }
     let profile_events = relay
@@ -95,7 +114,7 @@ fn policy_filters(direct_members: &BTreeSet<String>) -> Vec<serde_json::Value> {
 fn policy_candidates(
     events: &[Event],
     direct_members: &BTreeSet<String>,
-    self_pubkey: &str,
+    excluded_pubkey: Option<&str>,
 ) -> Vec<String> {
     let mut candidates = BTreeSet::new();
     for event in events {
@@ -108,7 +127,7 @@ fn policy_candidates(
         let Some(pubkey) = single_tag_value(event, "d").and_then(canonical_pubkey) else {
             continue;
         };
-        if pubkey != self_pubkey {
+        if excluded_pubkey != Some(pubkey.as_str()) {
             candidates.insert(pubkey);
         }
     }

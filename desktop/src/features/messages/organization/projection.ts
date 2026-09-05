@@ -11,6 +11,7 @@ export type OrganizationAction =
     } & ThreadMetadata)
   | ({ type: "thread_metadata"; thread_root_id: string } & ThreadMetadata)
   | { type: "hide"; message_ids: string[]; hidden: boolean }
+  | { type: "participants"; thread_root_id: string; agent_pubkeys: string[] }
   | { type: "undo"; change_event_id: string };
 export type OrganizationRecord = {
   event: RelayEvent;
@@ -23,6 +24,7 @@ export type OrganizationState = {
   groups: Map<string, Ranked<string>>;
   hidden: Map<string, Ranked<boolean>>;
   metadata: Map<string, ThreadMetadata>;
+  participants: Map<string, string[]>;
 };
 const validId = (value: unknown): value is string =>
   typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
@@ -53,6 +55,15 @@ export function organizationAction(
       (a.summary === undefined ||
         (typeof a.summary === "string" && a.summary.length <= 8000));
     if (a.type === "undo" && validId(a.change_event_id)) return a;
+    if (
+      a.type === "participants" &&
+      validId(a.thread_root_id) &&
+      Array.isArray(a.agent_pubkeys) &&
+      a.agent_pubkeys.length <= 100 &&
+      a.agent_pubkeys.every(validId) &&
+      new Set(a.agent_pubkeys).size === a.agent_pubkeys.length
+    )
+      return a;
     if (a.type === "hide" && selection() && typeof a.hidden === "boolean")
       return a;
     if (
@@ -91,11 +102,14 @@ export function buildOrganizationState(
     groups: new Map(),
     hidden: new Map(),
     metadata: new Map(),
+    participants: new Map(),
   };
   records.forEach((record, rank) => {
     record.undone = undone.has(record.event.id);
     if (record.undone) return;
     const a = record.action;
+    if (a.type === "participants")
+      state.participants.set(a.thread_root_id, [...a.agent_pubkeys]);
     if (a.type === "group") {
       for (const id of a.message_ids)
         state.groups.set(id, { value: a.thread_root_id, rank });

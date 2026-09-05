@@ -220,6 +220,7 @@ export function useConversationOrganization(
       (channel?.channelType === "forum"
         ? forumSubtrees.isPending
         : subtrees.isPending),
+    isLoadingHistory: query.isPending || query.isFetching,
     isSaving: mutation.isPending,
     apply: mutation.mutateAsync,
     retry: () => {

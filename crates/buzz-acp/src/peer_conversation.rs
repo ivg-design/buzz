@@ -73,12 +73,23 @@ pub(crate) fn requires_task_thread(event: &Event, recipient: &str) -> bool {
 /// Scheduled instructions and peer questions always use their visible thread,
 /// including in DMs and when ordinary replies are configured inline.
 pub(crate) fn conversation_scope(channel_id: uuid::Uuid, event: &Event) -> SessionScope {
+    conversation_scope_for_root(
+        channel_id,
+        &parse_thread_tags(event)
+            .root_event_id
+            .unwrap_or_else(|| event.id.to_hex()),
+    )
+}
+
+/// Use the organization projection's effective destination for grouped
+/// messages while retaining the same visible-thread session behavior.
+pub(crate) fn conversation_scope_for_root(
+    channel_id: uuid::Uuid,
+    effective_root: &str,
+) -> SessionScope {
     SessionScope::Thread {
         channel_id,
-        root_event_id: parse_thread_tags(event)
-            .root_event_id
-            .unwrap_or_else(|| event.id.to_hex())
-            .to_ascii_lowercase(),
+        root_event_id: effective_root.to_ascii_lowercase(),
     }
 }
 

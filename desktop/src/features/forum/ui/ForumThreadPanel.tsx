@@ -26,6 +26,7 @@ import { DeleteActionMenu } from "./DeleteActionMenu";
 import { ForumComposer } from "./ForumComposer";
 
 type ForumThreadPanelProps = {
+  headerActions?: React.ReactNode;
   thread: ForumThreadResponse | undefined;
   organizationMetadata?: ThreadMetadata;
   organizationSourceView?: boolean;
@@ -146,6 +147,7 @@ function ReplyRow({
 }
 
 export function ForumThreadPanel({
+  headerActions,
   organizationMetadata,
   organizationSourceView,
   thread,
@@ -192,7 +194,7 @@ export function ForumThreadPanel({
   if (isLoading || !thread) {
     return (
       <div className={cn("flex h-full flex-col", channelChrome.contentPadding)}>
-        <div className="border-b border-border/60 px-4 py-3">
+        <div className="flex items-center justify-between gap-2 border-b border-border/60 px-4 py-3">
           <Button
             className="gap-1.5 text-muted-foreground"
             onClick={onBack}
@@ -230,7 +232,7 @@ export function ForumThreadPanel({
 
   return (
     <div className={cn("flex h-full flex-col", channelChrome.contentPadding)}>
-      <div className="border-b border-border/60 px-4 py-3">
+      <div className="flex items-center justify-between gap-2 border-b border-border/60 px-4 py-3">
         <Button
           className="gap-1.5 text-muted-foreground"
           onClick={onBack}
@@ -240,6 +242,7 @@ export function ForumThreadPanel({
           <ArrowLeft className="h-4 w-4" />
           Back to posts
         </Button>
+        {headerActions}
       </div>
 
       <div

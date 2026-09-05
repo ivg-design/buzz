@@ -94,6 +94,8 @@ users do not maintain per-peer grants or refresh a hash after every source commi
 | Ask an enrolled peer | `buzz_peer_ask` | Ask one peer in the current task thread and wait up to 60 seconds. A timeout returns a request ID for `buzz_peer_wait`. |
 | Continue waiting for a peer | `buzz_peer_wait` | Wait up to 60 seconds for the exact signed reply to an existing peer question. A pending result is not a failure. |
 | Answer a peer | `buzz_peer_reply` | Reply to the exact addressed peer question. The answer stays visible and correlated in the same task thread. |
+| Read thread organization | `buzz_organization_read` | Read signed organization history and the current effective participant list for a shared thread. |
+| Update thread organization | `buzz_organization_apply` | Set the complete desired agent participant list for a thread, or apply another supported organization change. An empty participant list removes all agents. |
 | Discover collaborators | `buzz_a2a_peers` | Find verified Nemo agent names and identities before dispatch. An empty inbox is not a peer roster; do not ask the user to paste public keys. |
 | Delegate a job | `buzz_a2a_dispatch` | Supply the verified peer, bounded task, acceptance, and required job coordinates. The tool verifies or creates the visible shared task thread before execution and returns its channel/root with the request ID. Use `paths: []` for an information-only consultation. GitHub issue, PR, and run references accept a positive number or canonical same-repository URL. Use a fresh operation ID and a stable retry key. |
 | Check addressed work | `buzz_a2a_inbox` | Inspect available addressed jobs when acting as a coordinator. Do not duplicate an already-owned task. |
@@ -110,6 +112,15 @@ no human relay is required. Reuse a retry key only for the same request body, an
 execute a replayed job twice. A changed task needs a new request.
 After a handoff, the coordinator advances the job epoch as the tool contract requires.
 
+Thread participants persist as an automatic-follow preference independently of one-time
+message recipients. Before adding or removing an agent, read the thread's effective list with
+`buzz_organization_read`, resolve the intended agents through `buzz_a2a_peers`, preserve all
+participants that should remain, and pass the complete desired public-key list to
+`buzz_organization_apply`. Passing an empty list removes all agent participants. The list
+controls which agents automatically receive future human posts in the thread. It does not
+restrict direct peer questions or signed recipients, and it does not change channel or
+repository access.
+
 Do not call a wait tool without a live operation or session identifier. Avoid busy polling
 and repeated status messages. Cancellation is settled when the worker has stopped and
 reported its terminal disposition. Interrupted execution can be `indeterminate` when its
@@ -123,7 +134,9 @@ After interruption, inspect the actual affected state before retrying a mutation
 A timer delivers the human's exact prompt at each configured interval through the normal
 queue. It does not create a separate scheduled-completion protocol, automatic replay, or
 standing authority beyond that delivered prompt. Handle each delivery as ordinary incoming
-work and keep progress and results in its current shared conversation.
+instructions and keep any progress or results in its current shared conversation. If the
+prompt says to wait or do nothing when there are no new instructions, remain idle; do not
+invent a task or keep a provider turn running merely because a timer exists.
 
 One-shot delegated workers stay on their assigned outcome and may use native subagents,
 host tools, and the peer ask/reply tools available in every Job session; they do not become

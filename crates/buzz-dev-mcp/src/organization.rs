@@ -1,10 +1,11 @@
 //! Typed, user-directed conversation organization. Registered inside `trusted`
 //! with `#[path = "../organization.rs"] mod organization`.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use buzz_core::organization::{self, OrganizationChange};
-use nostr::Timestamp;
+use buzz_core::organization::{self, OrganizationChange, OrganizationProjection};
+use nostr::{Event, Timestamp};
 use rmcp::model::CallToolResult;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -28,6 +29,9 @@ pub struct OrganizationReadParams {
     pub search_page: Option<u32>,
     /// Optional original thread root, for message history only.
     pub thread_root_id: Option<String>,
+    /// Include the effective persistent agent participants for thread_root_id.
+    #[serde(default)]
+    pub include_participants: bool,
     /// Cursor returned by an earlier page. Supply both cursor fields together.
     pub before_created_at: Option<u64>,
     /// Cursor returned by an earlier page.
@@ -79,6 +83,12 @@ pub enum OrganizationActionInput {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         summary: Option<String>,
     },
+    /// Replace the complete persistent agent participant list for a thread.
+    Participants {
+        thread_root_id: String,
+        /// Verified enrolled agent public keys. An empty list removes all agents.
+        agent_pubkeys: Vec<String>,
+    },
     /// Hide clutter or restore previously hidden messages and replies.
     Hide {
         message_ids: Vec<String>,
@@ -115,6 +125,19 @@ pub async fn organization_apply(
         .map_err(|error| format!("invalid organization action: {error}"))?;
         let change = OrganizationChange { version: 1, action };
         change.validate()?;
+        let requested_participants = match &change.action {
+            buzz_core::organization::OrganizationAction::Participants {
+                thread_root_id,
+                agent_pubkeys,
+            } => {
+                if !agent_pubkeys.is_empty() {
+                    let peers = super::peers::discover_including_self(relay, &cancellation).await?;
+                    validate_participant_roster(agent_pubkeys, &peers)?;
+                }
+                Some(thread_root_id.clone())
+            }
+            _ => None,
+        };
         let latest = relay.query_signed_events(
             vec![serde_json::json!({
                 "#h": [channel], "kinds": [buzz_core::kind::KIND_CONVERSATION_ORGANIZATION], "limit": 1,
@@ -138,11 +161,23 @@ pub async fn organization_apply(
         let published = relay
             .publish_organization_event(event, &cancellation)
             .await?;
+        let participants = if let Some(thread_root_id) = requested_participants {
+            let changes = load_organization_history(relay, channel, &cancellation).await?;
+            Some(effective_participants(
+                channel,
+                &thread_root_id,
+                &changes,
+                &targets,
+            )?)
+        } else {
+            None
+        };
         Ok::<_, String>(serde_json::json!({
             "event_id": published.event_id,
             "accepted": published.accepted,
             "channel_id": channel,
             "change": change,
+            "participants": participants,
         }))
     }
     .await;
@@ -158,6 +193,9 @@ async fn read(
     cancellation: &CancellationToken,
 ) -> Result<serde_json::Value, String> {
     let channel = channel(relay, params.channel_id.as_deref())?;
+    if params.include_participants && params.thread_root_id.is_none() {
+        return Err("include_participants requires thread_root_id".into());
+    }
     let filter = history_filter(channel, &params)?;
     relay.fresh_context(cancellation).await?;
     let mut filters = vec![filter];
@@ -222,11 +260,26 @@ async fn read(
     } else {
         None
     };
+    let participants = if params.include_participants {
+        let root = thread_root
+            .as_ref()
+            .ok_or("thread root is unavailable in this channel")?;
+        let changes = load_organization_history(relay, channel, cancellation).await?;
+        Some(effective_participants(
+            channel,
+            &root.id.to_hex(),
+            &changes,
+            std::slice::from_ref(root),
+        )?)
+    } else {
+        None
+    };
     Ok(serde_json::json!({
         "channel_id": channel,
         // Full signed source fields preserve author/time/id/imeta/reply links.
         "events": events,
         "thread_root": thread_root,
+        "participants": participants,
         "has_more": has_more,
         "next_cursor": next_cursor,
         "next_search_page": if has_more && params.search.is_some() && params.search_page.unwrap_or(1) < 1000 {
@@ -234,6 +287,90 @@ async fn read(
         } else { None },
         "search_limit_reached": has_more && params.search.is_some() && params.search_page == Some(1000),
     }))
+}
+
+const ORGANIZATION_PAGE_SIZE: usize = 200;
+const MAX_ORGANIZATION_PAGES: usize = 500;
+
+/// Load complete signed change history so an effective policy cannot silently
+/// ignore an older Participants record or its later Undo.
+async fn load_organization_history(
+    relay: &TrustedRelay,
+    channel: uuid::Uuid,
+    cancellation: &CancellationToken,
+) -> Result<Vec<Event>, String> {
+    let mut all = BTreeMap::new();
+    let mut cursor: Option<(u64, String)> = None;
+    for _ in 0..MAX_ORGANIZATION_PAGES {
+        let mut filter = serde_json::json!({
+            "#h": [channel],
+            "kinds": [buzz_core::kind::KIND_CONVERSATION_ORGANIZATION],
+            "limit": ORGANIZATION_PAGE_SIZE,
+        });
+        if let Some((created_at, event_id)) = cursor.as_ref() {
+            filter["until"] = serde_json::json!(created_at);
+            filter["before_id"] = serde_json::json!(event_id);
+        }
+        let batch = relay
+            .query_signed_events(vec![filter], cancellation)
+            .await?;
+        for event in &batch {
+            if organization::event_channel(event)? != channel {
+                return Err("relay history contained an unexpected channel".into());
+            }
+            organization::parse_change(event)?;
+            all.insert(event.id, event.clone());
+        }
+        if batch.len() < ORGANIZATION_PAGE_SIZE {
+            return Ok(all.into_values().collect());
+        }
+        let oldest = batch
+            .iter()
+            .min_by(|a, b| {
+                a.created_at
+                    .cmp(&b.created_at)
+                    .then_with(|| b.id.cmp(&a.id))
+            })
+            .ok_or("organization history page was unexpectedly empty")?;
+        let next = (oldest.created_at.as_secs(), oldest.id.to_hex());
+        if cursor.as_ref() == Some(&next) {
+            return Err("organization history did not advance; retry the read".into());
+        }
+        cursor = Some(next);
+    }
+    Err("organization history exceeded the supported page limit".into())
+}
+
+fn effective_participants(
+    channel: uuid::Uuid,
+    thread_root_id: &str,
+    changes: &[Event],
+    messages: &[Event],
+) -> Result<serde_json::Value, String> {
+    let projection = OrganizationProjection::from_events(channel, changes, messages)?;
+    let effective_thread_root_id = projection.effective_root(thread_root_id);
+    let participants = projection.participants(&effective_thread_root_id);
+    Ok(serde_json::json!({
+        "thread_root_id": effective_thread_root_id,
+        "configured": participants.is_some(),
+        "agent_pubkeys": participants.unwrap_or_default(),
+    }))
+}
+
+fn validate_participant_roster(
+    requested: &[String],
+    peers: &[super::peers::VerifiedPeer],
+) -> Result<(), String> {
+    let verified: BTreeSet<_> = peers.iter().map(|peer| peer.pubkey.as_str()).collect();
+    if let Some(unknown) = requested
+        .iter()
+        .find(|pubkey| !verified.contains(pubkey.as_str()))
+    {
+        return Err(format!(
+            "participant agent is not in the verified Nemo roster: {unknown}"
+        ));
+    }
+    Ok(())
 }
 
 fn history_filter(

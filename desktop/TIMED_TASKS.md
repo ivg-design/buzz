@@ -22,6 +22,12 @@ One pending delivery per schedule prevents duplicate sends. Delivered prompts
 enter the recipient's ordinary queue, and the next interval does not depend
 on any special completion response.
 
+The instruction can ask the agent to remain idle. For example: “Check whether
+I have left new instructions. If there are none, do nothing and wait.” The
+timer supplies that text without adding a goal, inventing a task, or requiring
+the agent to keep working. Between deliveries, the timer does not keep an
+agent turn running.
+
 The total count is the number of instructions acknowledged by the relay, not
 successful agent executions. A failed delivery attempt does not consume a run;
 duplicate acknowledgements cannot consume another run. The schedule shows

@@ -300,7 +300,7 @@ impl TrustedSessionMcp {
 
     #[tool(
         name = "buzz_organization_read",
-        description = "Read or search a bounded page of signed conversation history or reversible organization changes in the current or another accessible channel."
+        description = "Read or search a bounded page of signed conversation history or reversible organization changes, and optionally return the effective persistent agent participants for one thread."
     )]
     async fn buzz_organization_read(
         &self,
@@ -315,7 +315,7 @@ impl TrustedSessionMcp {
 
     #[tool(
         name = "buzz_organization_apply",
-        description = "Apply one user-requested reversible grouping, title, summary, hide, restore, or undo change while preserving the original signed messages."
+        description = "Apply one user-requested reversible grouping, metadata, participant-list, visibility, or undo change while preserving the original signed messages. A participants action supplies the complete desired enrolled-agent list."
     )]
     async fn buzz_organization_apply(
         &self,

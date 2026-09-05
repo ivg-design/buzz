@@ -16,6 +16,10 @@ use crate::kind::{
     KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_V2,
 };
 
+#[path = "organization_projection.rs"]
+mod projection;
+pub use projection::OrganizationProjection;
+
 /// Maximum explicit message references in one atomic change.
 pub const MAX_ORGANIZATION_MESSAGES: usize = 100;
 
@@ -100,6 +104,14 @@ pub enum OrganizationAction {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         summary: Option<String>,
     },
+    /// Replace the complete agent participant policy for an original thread.
+    Participants {
+        /// Original top-level thread message.
+        thread_root_id: String,
+        /// Desired enrolled agents; an empty list explicitly removes all.
+        /// Current enrollment and channel rights are checked by relay ingress.
+        agent_pubkeys: Vec<String>,
+    },
     /// Hide or restore messages and their descendants in the organized view.
     Hide {
         /// Explicit messages whose original reply descendants inherit the value.
@@ -146,6 +158,23 @@ impl OrganizationChange {
                 validate_metadata(title.as_deref(), summary.as_deref())?;
             }
             OrganizationAction::Hide { message_ids, .. } => validate_ids(message_ids)?,
+            OrganizationAction::Participants {
+                thread_root_id,
+                agent_pubkeys,
+            } => {
+                validate_id(thread_root_id)?;
+                if agent_pubkeys.len() > MAX_ORGANIZATION_MESSAGES {
+                    return Err("select at most 100 agent participants".into());
+                }
+                let mut unique = BTreeSet::new();
+                for pubkey in agent_pubkeys {
+                    validate_id(pubkey)
+                        .map_err(|_| "agent pubkeys must be 64 lowercase hexadecimal characters")?;
+                    if !unique.insert(pubkey) {
+                        return Err("agent_pubkeys must not contain duplicates".into());
+                    }
+                }
+            }
             OrganizationAction::Undo { change_event_id } => validate_id(change_event_id)?,
         }
         Ok(())
@@ -163,7 +192,8 @@ impl OrganizationChange {
                 .map(String::as_str)
                 .chain(std::iter::once(thread_root_id.as_str()))
                 .collect(),
-            OrganizationAction::ThreadMetadata { thread_root_id, .. } => vec![thread_root_id],
+            OrganizationAction::ThreadMetadata { thread_root_id, .. }
+            | OrganizationAction::Participants { thread_root_id, .. } => vec![thread_root_id],
             OrganizationAction::Hide { message_ids, .. } => {
                 message_ids.iter().map(String::as_str).collect()
             }
@@ -256,7 +286,8 @@ pub fn validate_references(
                 }
                 let root = match &change.action {
                     OrganizationAction::Group { thread_root_id, .. }
-                    | OrganizationAction::ThreadMetadata { thread_root_id, .. } => {
+                    | OrganizationAction::ThreadMetadata { thread_root_id, .. }
+                    | OrganizationAction::Participants { thread_root_id, .. } => {
                         Some(thread_root_id.as_str())
                     }
                     _ => None,

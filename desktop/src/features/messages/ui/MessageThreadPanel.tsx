@@ -55,6 +55,7 @@ import { selectDeferredListRenderState } from "@/features/messages/lib/timelineS
 import { selectThreadRowHighlight } from "@/features/messages/lib/threadReplyHighlight";
 
 type MessageThreadPanelProps = ThreadPanelLayoutProps & {
+  headerActions?: React.ReactNode;
   channel: Channel | null;
   organizationMetadata?: ThreadMetadata;
   onRestoreOrganizationMessage?: (messageId: string) => Promise<void>;
@@ -147,6 +148,7 @@ const EMPTY_THREAD_REPLIES: MainTimelineEntry[] = [];
 const THREAD_PANEL_SUMMARY_INDENT_OFFSET_REM = 0;
 
 export function MessageThreadPanel({
+  headerActions,
   channel,
   organizationMetadata,
   onRestoreOrganizationMessage,
@@ -934,6 +936,7 @@ export function MessageThreadPanel({
         header={
           isHuddleTranscript ? undefined : (
             <MessageThreadPanelHeader
+              actions={headerActions}
               headerLeading={headerLeading}
               headerTitle={headerTitle}
               headerTitleAriaLabel={headerTitleAriaLabel}

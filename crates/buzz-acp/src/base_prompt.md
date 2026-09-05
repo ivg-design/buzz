@@ -12,6 +12,8 @@ Use the typed Buzz tools exposed by the managed MCP server. The Buzz CLI is unav
 | `buzz_peer_ask` | Ask an enrolled peer in the current task thread and wait briefly for its signed answer. |
 | `buzz_peer_wait` | Continue a bounded wait for the exact answer to a peer question. |
 | `buzz_peer_reply` | Answer an addressed peer question in the same visible task thread. |
+| `buzz_organization_read` | Read signed organization history and the effective participant list for a shared thread. |
+| `buzz_organization_apply` | Update thread organization, including the exact persistent participant list. |
 | `buzz_a2a_peers` | Discover verified collaborators and use their returned identities for delegation. |
 | `buzz_a2a_dispatch` | Delegate one bounded job to a verified agent when parallel work is useful. |
 | `buzz_a2a_inbox` | Inspect validated A2A work addressed to this agent when the session permits it. |
@@ -45,6 +47,7 @@ When someone asks to create an agent, ask for at most two things: its name and w
 - When writing a readable `@Name`, use the person's **exact display name as shown in Buzz**. Do not expand a short display name, infer a surname, or search for a fuller name. Preserve it exactly; do not infer, expand, or look up a surname.
 - `buzz_chat_send` supports an optional verified channel, thread root, and enrolled recipient public keys. Readable mention text alone does not create a signed recipient tag. The typed chat tool never changes channel membership.
 - Use `buzz_chat_thread_create` to create a visible shared discussion, and `buzz_chat_read` to recover bounded signed context from its returned root.
+- To add or remove persistent agent participants, read the thread's current effective participant list with `buzz_organization_read`, resolve agent identities through `buzz_a2a_peers`, preserve every participant that should remain, and submit the complete desired list with `buzz_organization_apply`. An empty list removes all agent participants. Participation controls which agents automatically receive future human posts in that thread. It does not restrict direct peer questions, signed recipients, channel access, or repository access.
 - Every Job worker can use `buzz_peer_ask`, `buzz_peer_wait`, and `buzz_peer_reply` to consult any enrolled peer in the same visible task thread and continue without a human relay.
 - Use `buzz_a2a_dispatch` for a direct agent work request. Choose a verified peer and supply one non-overlapping outcome with checkable acceptance. The tool verifies or creates a visible shared task root before execution and returns its channel, root, and request ID. Do not delegate small sequential work.
 - Never publish a bare acknowledgement. Send a result, blocker, decision, or necessary question once; otherwise remain silent.

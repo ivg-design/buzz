@@ -298,6 +298,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn job_scope_binds_chat_to_request_root_without_losing_job_identity() {
+        let scope = job_scope();
+        let SessionScope::Job {
+            operation_id,
+            request_event_id,
+            ..
+        } = &scope
+        else {
+            unreachable!()
+        };
+        let binding = scope_binding(&scope, std::path::Path::new("/workspace"));
+
+        assert_eq!(
+            binding.thread_root_id.as_deref(),
+            Some(request_event_id.as_str())
+        );
+        assert_eq!(
+            binding.job_operation_id.as_deref(),
+            Some(operation_id.as_str())
+        );
+        assert_eq!(
+            binding.job_request_event_id.as_deref(),
+            Some(request_event_id.as_str())
+        );
+    }
+
     async fn post(session: &TrustedMcpSession, auth: &str) -> reqwest::Result<reqwest::Response> {
         reqwest::Client::new()
             .post(session.url())

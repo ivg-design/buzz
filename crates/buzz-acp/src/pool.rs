@@ -3419,7 +3419,7 @@ pub async fn run_prompt_task(
                         agent,
                         source,
                         PromptOutcome::AgentExited,
-                        requeue_ambiguous_provider_batch(&ctx, batch),
+                        requeue_pre_prompt_batch(&ctx, batch),
                     );
                     return;
                 }
@@ -3473,7 +3473,7 @@ pub async fn run_prompt_task(
                         agent,
                         source,
                         PromptOutcome::Timeout(TimeoutKind::Idle),
-                        requeue_ambiguous_provider_batch(&ctx, batch),
+                        requeue_pre_prompt_batch(&ctx, batch),
                     );
                     return;
                 }
@@ -3617,26 +3617,24 @@ pub async fn run_prompt_task(
             standing_context_sent,
         };
         let chat_thread_root = crate::queue::trusted_chat_thread_root(b, &format_args);
-        if !b.scope.is_job() {
-            if let Some(session) = agent.state.trusted_mcp.get(&b.scope) {
-                if let Err(error) = session.set_chat_thread_root_id(chat_thread_root.as_deref()) {
-                    tracing::error!(
-                        target: "pool::session",
-                        scope = %b.scope.telemetry_label(),
+        if let Some(session) = agent.state.trusted_mcp.get(&b.scope) {
+            if let Err(error) = session.set_chat_thread_root_id(chat_thread_root.as_deref()) {
+                tracing::error!(
+                    target: "pool::session",
+                    scope = %b.scope.telemetry_label(),
+                    "failed to bind trusted chat destination: {error}"
+                );
+                send_prompt_result(
+                    &result_tx,
+                    &turn_id,
+                    agent,
+                    source,
+                    PromptOutcome::Error(AcpError::Protocol(format!(
                         "failed to bind trusted chat destination: {error}"
-                    );
-                    send_prompt_result(
-                        &result_tx,
-                        &turn_id,
-                        agent,
-                        source,
-                        PromptOutcome::Error(AcpError::Protocol(format!(
-                            "failed to bind trusted chat destination: {error}"
-                        ))),
-                        requeue_batch_if_queue(&ctx, batch.clone()),
-                    );
-                    return;
-                }
+                    ))),
+                    requeue_batch_if_queue(&ctx, batch.clone()),
+                );
+                return;
             }
         }
         crate::queue::format_prompt(b, &format_args)
@@ -4998,6 +4996,11 @@ where
         .kinds([
             nostr::Kind::Custom(buzz_core::kind::KIND_STREAM_MESSAGE as u16),
             nostr::Kind::Custom(buzz_core::kind::KIND_STREAM_MESSAGE_V2 as u16),
+            nostr::Kind::Custom(buzz_core::kind::KIND_JOB_ACCEPTED as u16),
+            nostr::Kind::Custom(buzz_core::kind::KIND_JOB_PROGRESS as u16),
+            nostr::Kind::Custom(buzz_core::kind::KIND_JOB_RESULT as u16),
+            nostr::Kind::Custom(buzz_core::kind::KIND_JOB_CANCEL as u16),
+            nostr::Kind::Custom(buzz_core::kind::KIND_JOB_ERROR as u16),
         ])
         .custom_tags(e_tag, [root_event_id])
         .custom_tags(h_tag, [ch_str.as_str()])
@@ -5431,6 +5434,15 @@ fn requeue_ambiguous_provider_batch(
     } else {
         requeue_batch_if_queue(ctx, batch)
     }
+}
+
+/// Preserve a triggering batch that has not crossed its provider prompt
+/// boundary. Session recovery suppresses ambiguous post-prompt replay, but an
+/// initial-message failure happened before the actual event was delivered and
+/// is therefore safe to retry through the ordinary bounded queue policy.
+#[inline]
+fn requeue_pre_prompt_batch(ctx: &PromptContext, batch: Option<FlushBatch>) -> Option<FlushBatch> {
+    requeue_batch_if_queue(ctx, batch)
 }
 
 /// Map a cancelling [`ControlSignal`] to the [`CancelReason`] that should frame
@@ -7492,14 +7504,20 @@ while IFS= read -r _line; do :; done"#
         assert!(root.get("limit").is_none());
 
         let replies = serde_json::to_value(&filters[1]).expect("serialize replies filter");
-        assert_eq!(replies.get("kinds"), Some(&json!([9, 40002])));
+        assert_eq!(
+            replies.get("kinds"),
+            Some(&json!([9, 40002, 43002, 43003, 43004, 43005, 43006]))
+        );
         assert_eq!(replies.get("#e"), Some(&json!([root_id])));
         assert_eq!(replies.get("#h"), Some(&json!([channel_id.to_string()])));
         assert_eq!(replies.get("limit"), Some(&json!(reply_limit)));
         assert!(replies.get("authors").is_none());
 
         let agent = serde_json::to_value(&filters[2]).expect("serialize agent filter");
-        assert_eq!(agent.get("kinds"), Some(&json!([9, 40002])));
+        assert_eq!(
+            agent.get("kinds"),
+            Some(&json!([9, 40002, 43002, 43003, 43004, 43005, 43006]))
+        );
         assert_eq!(agent.get("#e"), Some(&json!([root_id])));
         assert_eq!(agent.get("#h"), Some(&json!([channel_id.to_string()])));
         assert_eq!(agent.get("authors"), Some(&json!([agent_pubkey.to_hex()])));
@@ -7510,7 +7528,10 @@ while IFS= read -r _line; do :; done"#
         assert_eq!(filters.len(), 1, "count should query only matching replies");
 
         let count = serde_json::to_value(&filters[0]).expect("serialize count filter");
-        assert_eq!(count.get("kinds"), Some(&json!([9, 40002])));
+        assert_eq!(
+            count.get("kinds"),
+            Some(&json!([9, 40002, 43002, 43003, 43004, 43005, 43006]))
+        );
         assert_eq!(count.get("#e"), Some(&json!([root_id])));
         assert_eq!(count.get("#h"), Some(&json!([channel_id.to_string()])));
         assert_eq!(count.get("limit"), Some(&json!(0)));
@@ -8526,6 +8547,25 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
     }
 
     #[test]
+    fn context_target_uses_job_request_as_task_thread_root() {
+        let channel_id = Uuid::new_v4();
+        let request_event_id = "a".repeat(64);
+        let batch = batch_with_scope(
+            SessionScope::Job {
+                channel_id,
+                operation_id: Uuid::new_v4().to_string(),
+                request_event_id: request_event_id.clone(),
+            },
+            signed_event_with_tags(vec![]),
+        );
+
+        assert_eq!(
+            resolve_context_target(&batch, false),
+            ContextTarget::Thread(request_event_id)
+        );
+    }
+
+    #[test]
     fn context_target_new_top_level_thread_has_no_history() {
         // A top-level mention opens a thread rooted at its own id; on the first
         // turn there is no prior thread history to fetch, but the scope still
@@ -8900,7 +8940,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
     }
 
     #[test]
-    fn durable_recovery_drops_ambiguous_provider_retry() {
+    fn durable_recovery_preserves_pre_prompt_and_drops_ambiguous_post_prompt_retry() {
         let mut ctx = make_prompt_context_no_owner();
         ctx.dedup_mode = DedupMode::Queue;
         let recovery_dir = tempfile::tempdir().unwrap();
@@ -8913,7 +8953,14 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         let channel_id = Uuid::new_v4();
         let batch = one_event_batch(channel_id);
 
-        assert!(requeue_ambiguous_provider_batch(&ctx, Some(batch.clone())).is_none());
+        assert!(
+            requeue_pre_prompt_batch(&ctx, Some(batch.clone())).is_some(),
+            "the triggering event was not sent during initial-message setup"
+        );
+        assert!(
+            requeue_ambiguous_provider_batch(&ctx, Some(batch.clone())).is_none(),
+            "a batch that crossed the real provider prompt boundary is indeterminate"
+        );
         let failure = classify_control_cancel_failure(
             &ctx,
             AcpError::CancelDrainTimeout(CONTROL_CANCEL_GRACE),

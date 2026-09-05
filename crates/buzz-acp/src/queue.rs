@@ -1517,6 +1517,13 @@ pub(crate) fn trusted_chat_thread_root(
     batch: &FlushBatch,
     args: &FormatPromptArgs<'_>,
 ) -> Option<String> {
+    // A durable job request is both the execution root and the task's visible
+    // discussion root. Agent-only reply heuristics intentionally permit deep
+    // nesting for ordinary chat, but a worker's job-run update must stay on
+    // the canonical request thread so humans and agents see one conversation.
+    if batch.scope.is_job() {
+        return batch.scope.root_event_id().map(str::to_owned);
+    }
     let last_event = batch.events.last()?;
     let thread_tags = parse_thread_tags(&last_event.event);
     let is_dm = args
@@ -1766,7 +1773,9 @@ fn format_context_hints(
         } else {
             "No additional thread history is available in this turn."
         };
-        let session_scope = if scope.is_thread() {
+        let session_scope = if scope.is_job() {
+            "agent job"
+        } else if scope.is_thread() {
             "thread"
         } else {
             "channel"
@@ -1785,7 +1794,10 @@ fn format_context_hints(
             }
         }
         s.push_str(&format!("\n{ctx_hint}"));
-        if thread_tags.root_event_id.is_none() && reply_placement == ReplyPlacement::Timeline {
+        if scope.is_job() {
+            append_thread_instruction(&mut s, root);
+        } else if thread_tags.root_event_id.is_none() && reply_placement == ReplyPlacement::Timeline
+        {
             append_timeline_instruction(&mut s);
         } else if let Some(event_id) = reply_anchor {
             if thread_tags.root_event_id.is_some() {
@@ -2412,6 +2424,90 @@ mod tests {
             queue.push(make_queued(channel_id, &format!("chat-{index}")));
         }
         assert_eq!(queue.queued_event_count(&job_scope), 1);
+    }
+
+    #[test]
+    fn durable_job_chat_and_prompt_are_bound_to_request_thread() {
+        let channel_id = Uuid::new_v4();
+        let job_scope = job(channel_id, "a");
+        let request_event_id = job_scope.root_event_id().unwrap().to_string();
+        let batch = FlushBatch {
+            channel_id,
+            scope: job_scope,
+            events: vec![BatchEvent {
+                event: make_event("worker turn"),
+                prompt_tag: "agent-job".into(),
+                received_at: Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+
+        assert_eq!(
+            trusted_chat_thread_root(&batch, &FormatPromptArgs::default()),
+            Some(request_event_id.clone())
+        );
+        let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
+        assert!(prompt.contains("Session scope: agent job"));
+        assert!(prompt.contains(&format!(
+            "Trusted reply destination: thread root {request_event_id}"
+        )));
+    }
+
+    #[test]
+    fn human_task_thread_reply_keeps_root_without_changing_nonjob_agent_policy() {
+        let channel_id = Uuid::new_v4();
+        let root = "b".repeat(64);
+        let event = make_event_with_tags(
+            "follow up",
+            vec![
+                vec!["e".into(), root.clone(), String::new(), "root".into()],
+                vec!["e".into(), "c".repeat(64), String::new(), "reply".into()],
+            ],
+        );
+        let author = event.pubkey.to_hex();
+        let batch = FlushBatch {
+            channel_id,
+            scope: thread(channel_id, &root),
+            events: vec![BatchEvent {
+                event,
+                prompt_tag: "@mention".into(),
+                received_at: Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+
+        let human = HashMap::from([(author.clone(), PromptProfile::default())]);
+        assert_eq!(
+            trusted_chat_thread_root(
+                &batch,
+                &FormatPromptArgs {
+                    profile_lookup: Some(&human),
+                    ..Default::default()
+                }
+            ),
+            Some(root)
+        );
+
+        let agent = HashMap::from([(
+            author,
+            PromptProfile {
+                is_agent: true,
+                ..Default::default()
+            },
+        )]);
+        assert_eq!(
+            trusted_chat_thread_root(
+                &batch,
+                &FormatPromptArgs {
+                    profile_lookup: Some(&agent),
+                    ..Default::default()
+                }
+            ),
+            None,
+            "ordinary agent-only threads retain their existing placement policy"
+        );
     }
 
     /// Build a QueuedEvent for an explicit scope.

@@ -99,13 +99,19 @@ impl SessionScope {
         }
     }
 
-    /// The canonical thread-root event id for a [`Thread`](Self::Thread) scope,
-    /// or `None` for a conversation scope.
+    /// The canonical conversation root for a thread or durable job.
+    ///
+    /// A job's signed request event is also its human-facing discussion root.
+    /// Keeping that root on the execution scope lets the trusted chat surface
+    /// place worker messages beside the request without collapsing the Job
+    /// scope into an ordinary Thread scope.
     pub fn root_event_id(&self) -> Option<&str> {
         match self {
             Self::Conversation { .. } => None,
             Self::Thread { root_event_id, .. } => Some(root_event_id),
-            Self::Job { .. } => None,
+            Self::Job {
+                request_event_id, ..
+            } => Some(request_event_id),
         }
     }
 
@@ -408,6 +414,25 @@ mod tests {
         assert_eq!(thread.root_event_id(), Some(root.as_str()));
         assert!(thread.is_thread());
         assert_eq!(thread.telemetry_label(), "thread:abcdef01");
+
+        let job = SessionScope::Job {
+            channel_id: ch,
+            operation_id: "operation-123".into(),
+            request_event_id: root.clone(),
+        };
+        assert_eq!(job.channel_id(), ch);
+        assert_eq!(job.root_event_id(), Some(root.as_str()));
+        assert!(!job.is_thread(), "job execution stays isolated from chat");
+        assert!(job.is_job());
+
+        let discussion = SessionScope::Thread {
+            channel_id: ch,
+            root_event_id: root,
+        };
+        assert_ne!(
+            job, discussion,
+            "a shared task root must not collapse execution and discussion sessions"
+        );
     }
 
     #[test]

@@ -6,7 +6,7 @@ use super::agent_env::idle_pool_sleep_env;
 
 use crate::{
     managed_agents::{
-        append_log_marker, known_acp_runtime, login_shell_environment, login_shell_path,
+        append_log_marker, host_cli_environment, known_acp_runtime, login_shell_path,
         managed_agent_log_path, missing_command_message, normalize_agent_args, open_log_file,
         resolve_command, spawn_key_refusal, KnownAcpRuntime, ManagedAgentPairRuntime,
         ManagedAgentRecord, ManagedAgentRuntimeKey, ManagedAgentSummary,
@@ -96,16 +96,22 @@ fn resolved_standard_agent_command(
 /// the caller applies explicit agent and Desktop policy values afterwards.
 fn apply_host_shell_environment(
     command: &mut std::process::Command,
-    host_environment: Option<std::collections::BTreeMap<String, String>>,
+    host_environment: &std::collections::BTreeMap<String, String>,
 ) {
-    let Some(host_environment) = host_environment else {
-        return;
-    };
     for (key, value) in host_environment {
-        if !super::env_vars::is_reserved_env_key(&key) {
+        if !super::env_vars::is_reserved_env_key(key) {
             command.env(key, value);
         }
     }
+}
+
+pub(crate) fn effort_floor_environment(
+    host_environment: &std::collections::BTreeMap<String, String>,
+    baked_environment: std::collections::BTreeMap<String, String>,
+) -> std::collections::BTreeMap<String, String> {
+    let mut floor = host_environment.clone();
+    floor.extend(baked_environment);
+    floor
 }
 
 /// Classify an agent's persona against the live catalog for the Agents-menu
@@ -703,7 +709,8 @@ fn spawn_agent_child_inner(
     // config, MCP discovery, credential-agent sockets, and tool settings. Buzz
     // control/signing keys are never copied from the shell; the dedicated
     // Desktop policy and record layers below remain authoritative.
-    apply_host_shell_environment(&mut command, login_shell_environment());
+    let host_environment = host_cli_environment();
+    apply_host_shell_environment(&mut command, &host_environment);
     if let Some(home) = super::default_agent_workdir() {
         command.current_dir(home);
     }
@@ -819,9 +826,15 @@ fn spawn_agent_child_inner(
         &mut command,
         resolve_session_title(record.display_name.as_deref(), &record.name),
     );
-    // Strip all known effort keys and emit exactly one projected key. Command
-    // inherits the parent env — the returned EffortApplied token is consumed
-    // by spawn_with_effort_proof below; deleting this call is a compile error.
+    // Strip all known effort keys and emit one projected value (under both the
+    // native and adapter transport keys when the runtime requires it). The
+    // returned EffortApplied token is consumed by spawn_with_effort_proof below;
+    // deleting this call is a compile error.
+    // Host-native effort is the lowest launch tier. Baked build policy may
+    // override it, while every saved definition/global/persona/agent tier in
+    // the projection remains higher precedence.
+    let effort_floor =
+        effort_floor_environment(&host_environment, super::agent_env::baked_build_env());
     let effort = apply_effort_to_spawn_command(
         &mut command,
         record,
@@ -829,7 +842,7 @@ fn spawn_agent_child_inner(
         &personas,
         record.persona_id.as_deref(),
         &global.env_vars,
-        &super::agent_env::baked_build_env(),
+        &effort_floor,
     );
     if let Some(meta) = runtime_meta {
         for (key, value) in runtime_metadata_env_vars(

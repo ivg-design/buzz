@@ -95,6 +95,21 @@ pub(crate) fn login_shell_environment() -> Option<BTreeMap<String, String>> {
     }
 }
 
+/// Effective environment of an ordinary host CLI. The desktop process is the
+/// platform-native floor; on Unix, an exported interactive login-shell value
+/// overrides it. If the bounded shell probe fails, the inherited process
+/// environment remains usable. Values are returned to the launch path only and
+/// are never logged.
+pub(crate) fn host_cli_environment() -> BTreeMap<String, String> {
+    let mut environment = std::env::vars_os()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+        .collect::<BTreeMap<_, _>>();
+    if let Some(shell_environment) = login_shell_environment() {
+        environment.extend(shell_environment);
+    }
+    environment
+}
+
 /// Invalidate the host environment alongside the existing login-shell PATH
 /// cache after installs, retries, and Doctor refreshes.
 pub(super) fn refresh_host_environment() {

@@ -19,7 +19,7 @@ mod runtime_metadata;
 mod windows_install;
 mod catalog;
 pub(crate) use catalog::KNOWN_ACP_RUNTIMES;
-pub(crate) use host_environment::login_shell_environment;
+pub(crate) use host_environment::host_cli_environment;
 pub use login_shell::{find_nvm_default_bin, login_shell_path};
 pub(crate) use login_shell::{find_via_login_shell, refresh_login_shell_path};
 #[cfg(test)]

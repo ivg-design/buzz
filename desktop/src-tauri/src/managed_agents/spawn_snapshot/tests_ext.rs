@@ -109,15 +109,44 @@ fn effective_effort_reads_the_projected_key_for_the_runtime() {
 
 #[test]
 fn effective_effort_reads_acp_sentinel_for_keyless_runtime() {
-    // Claude/Codex/keyless-ACP descriptors carry the effective value under the
-    // ACP-startup sentinel, which is the destination key for a runtime with no
-    // native thinking-effort env var (here: the claude adapter command).
+    // Codex/keyless-ACP descriptors carry the effective value under the ACP
+    // startup sentinel, which is their destination key.
     let descriptor = EffectiveHarnessDescriptor {
-        command: "claude-code-acp".into(),
+        command: "codex-acp".into(),
         args: vec![],
         env: BTreeMap::from([("BUZZ_ACP_EFFORT_LEVEL".to_string(), "low".to_string())]),
     };
     assert_eq!(effective_effort(&descriptor).as_deref(), Some("low"));
+}
+
+#[test]
+fn claude_snapshot_reads_native_effort_and_strips_both_launch_keys() {
+    let descriptor = EffectiveHarnessDescriptor {
+        command: "claude-agent-acp".into(),
+        args: vec![],
+        env: BTreeMap::from([
+            ("CLAUDE_CODE_EFFORT_LEVEL".to_string(), "low".to_string()),
+            ("BUZZ_ACP_EFFORT_LEVEL".to_string(), "low".to_string()),
+        ]),
+    };
+    assert_eq!(effective_effort(&descriptor).as_deref(), Some("low"));
+
+    let rec = record();
+    let snapshot = SpawnConfigSnapshot::from_inputs(SpawnConfigInputs {
+        record: &rec,
+        descriptor: &descriptor,
+        relay_url: "wss://relay.example",
+        team_instructions: None,
+        system_prompt: None,
+        model: None,
+        provider: None,
+        enforced_owner_only: false,
+        session_policy: AcpSessionPolicy::Channel,
+        workspace_project: None,
+    });
+    assert_eq!(snapshot.effort_level.as_deref(), Some("low"));
+    assert!(!snapshot.env.contains_key("CLAUDE_CODE_EFFORT_LEVEL"));
+    assert!(!snapshot.env.contains_key("BUZZ_ACP_EFFORT_LEVEL"));
 }
 
 #[test]

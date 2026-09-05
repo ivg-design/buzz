@@ -675,7 +675,7 @@ fn host_shell_environment_preserves_normal_cli_configuration_and_filters_buzz_co
         ),
     ]);
 
-    super::apply_host_shell_environment(&mut command, Some(host_environment));
+    super::apply_host_shell_environment(&mut command, &host_environment);
 
     let environment: std::collections::BTreeMap<_, _> = command
         .get_envs()
@@ -748,6 +748,52 @@ fn host_shell_environment_preserves_normal_cli_configuration_and_filters_buzz_co
             .status()
             .expect("sentinel child must launch");
         assert!(status.success(), "sentinel child observed wrong effort env");
+    }
+
+    // With no saved effort at any tier, the host's native Claude setting is
+    // the floor and is mirrored to the adapter transport. The unrelated stale
+    // host sentinel still cannot become an independent authority.
+    #[cfg(unix)]
+    let mut inherited_command = std::process::Command::new("/bin/sh");
+    #[cfg(not(unix))]
+    let mut inherited_command = std::process::Command::new("cmd");
+    inherited_command.env_clear();
+    super::apply_host_shell_environment(&mut inherited_command, &host_environment);
+    let inherited_record = fixture(RespondTo::OwnerOnly, vec![], Some("tag".into()));
+    let effort_floor =
+        super::effort_floor_environment(&host_environment, std::collections::BTreeMap::new());
+    let _effort = super::apply_effort_to_spawn_command(
+        &mut inherited_command,
+        &inherited_record,
+        known_acp_runtime("claude-agent-acp"),
+        &[],
+        None,
+        &std::collections::BTreeMap::new(),
+        &effort_floor,
+    );
+    let inherited_environment: std::collections::BTreeMap<_, _> = inherited_command
+        .get_envs()
+        .filter_map(|(key, value)| Some((key.to_str()?, value?.to_str()?)))
+        .collect();
+    assert_eq!(
+        inherited_environment.get("CLAUDE_CODE_EFFORT_LEVEL"),
+        Some(&"low")
+    );
+    assert_eq!(
+        inherited_environment.get("BUZZ_ACP_EFFORT_LEVEL"),
+        Some(&"low")
+    );
+    #[cfg(unix)]
+    {
+        let status = inherited_command
+            .arg("-c")
+            .arg(r#"test "$CLAUDE_CODE_EFFORT_LEVEL" = low && test "$BUZZ_ACP_EFFORT_LEVEL" = low"#)
+            .status()
+            .expect("inherited-effort child must launch");
+        assert!(
+            status.success(),
+            "inherited-effort child observed wrong effort env"
+        );
     }
 }
 

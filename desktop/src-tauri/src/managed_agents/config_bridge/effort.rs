@@ -149,6 +149,11 @@ pub(crate) fn apply_launch_effort(
     harness_def: Option<&HarnessDefinition>,
     baked_env: &BTreeMap<String, String>,
 ) {
+    // The host CLI is the true environment floor for a Desktop launch. Include
+    // only its provider-native effort in this projection; the full host map is
+    // never serialized into the descriptor. Baked policy retains precedence.
+    let mut effort_floor = crate::managed_agents::host_cli_environment();
+    effort_floor.extend(baked_env.clone());
     effort_launch_projection(
         record,
         runtime,
@@ -156,7 +161,7 @@ pub(crate) fn apply_launch_effort(
         record.persona_id.as_deref(),
         global_env,
         harness_def,
-        baked_env,
+        &effort_floor,
     )
     .apply(env);
 }

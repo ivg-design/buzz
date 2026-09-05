@@ -15,6 +15,7 @@ import {
 } from "@/shared/ui/dialog";
 import { listTimedTasks, saveTimedTask, setTimedTaskStatus } from "./api";
 import { draftForTimedTask, timedTaskInput } from "./form";
+import { timedTaskConversationLabel } from "./channelLabels";
 import { useTimedTaskDestinations } from "./useTimedTaskDestinations";
 import { TimedTaskForm } from "./TimedTaskForm";
 import { TimedTaskList } from "./TimedTaskList";
@@ -73,7 +74,7 @@ export function TimedTaskDialog({
   const channelNames = Object.fromEntries(
     availableChannels.map((channel) => [
       channel.id,
-      channel.channelType === "dm" ? dmChannelLabels[channel.id] ?? channel.name : `#${channel.name}`,
+      timedTaskConversationLabel(channel, dmChannelLabels[channel.id]),
     ]),
   );
   const channelOptions = [

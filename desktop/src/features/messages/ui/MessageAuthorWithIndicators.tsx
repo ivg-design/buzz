@@ -5,6 +5,7 @@ import { UserNameIndicators } from "@/features/user-status/ui/UserNameIndicators
 
 type MessageAuthorWithIndicatorsProps = {
   authorName: string;
+  channelId?: string | null;
   children: React.ReactNode;
   ownerPubkey?: string | null;
   pubkey: string;
@@ -13,6 +14,7 @@ type MessageAuthorWithIndicatorsProps = {
 
 export function MessageAuthorWithIndicators({
   authorName,
+  channelId,
   children,
   ownerPubkey,
   pubkey,
@@ -21,6 +23,7 @@ export function MessageAuthorWithIndicators({
   return (
     <span className="inline-flex min-w-0 items-baseline gap-1">
       <MessageAuthorIdentity
+        channelId={channelId}
         displayName={authorName}
         ownerPubkey={ownerPubkey}
         pubkey={pubkey}

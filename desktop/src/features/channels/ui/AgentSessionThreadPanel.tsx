@@ -6,7 +6,6 @@ import {
   Sparkles,
   TerminalSquare,
 } from "lucide-react";
-import { toast } from "sonner";
 
 import { useAgentWorking } from "@/features/agents/agentWorkingSignal";
 import {
@@ -23,9 +22,7 @@ import {
 } from "@/features/agents/ui/useObserverEvents";
 import { useAnchoredScroll } from "@/features/messages/ui/useAnchoredScroll";
 import { useStableArrayShallow } from "@/shared/hooks/useStableReference";
-import { cancelManagedAgentTurn } from "@/shared/api/agentControl";
-import { awaitCancelTurnOutcome } from "@/features/agents/lib/cancelTurnOutcome";
-import { subscribeControlResults } from "@/features/agents/observerRelayStore";
+import { useStopAgentTurn } from "@/features/agents/useStopAgentTurn";
 import type { Channel } from "@/shared/api/types";
 import { useEscapeKey } from "@/shared/hooks/useEscapeKey";
 import { useIsThreadPanelOverlay } from "@/shared/hooks/use-mobile";
@@ -242,8 +239,8 @@ export function AgentSessionThreadPanel({
   const headerScopeLabel = `${viewLabel} · ${scopeLabel}`;
   const animateActivity = useTranscriptAnimationEnabled();
   const showTimestamps = useTranscriptTimestampsEnabled();
-  const stopRequestPendingRef = React.useRef(false);
-  const [stopRequestPending, setStopRequestPending] = React.useState(false);
+  const { pendingChannelId, stopTurn } = useStopAgentTurn(agent);
+  const stopRequestPending = pendingChannelId !== null;
   const stopCurrentTurnTitle = stopRequestPending
     ? "Waiting for the agent to confirm the stop request."
     : canStopCurrentTurn
@@ -254,53 +251,7 @@ export function AgentSessionThreadPanel({
           ? "Only locally managed agents can be interrupted from this community."
           : "Available while the agent is working.";
   async function handleInterruptTurn() {
-    if (!sessionChannelId || stopRequestPendingRef.current) {
-      return;
-    }
-
-    stopRequestPendingRef.current = true;
-    setStopRequestPending(true);
-    try {
-      const requestId = crypto.randomUUID();
-      const outcome = await awaitCancelTurnOutcome({
-        requestId,
-        channelId: sessionChannelId,
-        subscribe: (listener) =>
-          subscribeControlResults(agent.pubkey, listener),
-        sendCancel: () =>
-          cancelManagedAgentTurn(agent.pubkey, sessionChannelId, requestId),
-        scheduleTimeout: (onTimeout) => {
-          const timeout = window.setTimeout(onTimeout, 8_000);
-          return () => window.clearTimeout(timeout);
-        },
-      });
-      if (outcome === "ambiguous_target") {
-        toast.error(
-          "This channel has multiple agent sessions. Stopping a specific thread isn't available here yet.",
-        );
-        return;
-      }
-      if (outcome === "no_active_turn") {
-        toast.info("No active turn to stop.");
-        return;
-      }
-      if (outcome === "unconfirmed") {
-        toast.info("Stop requested, but the agent hasn't confirmed it.");
-        return;
-      }
-      toast.success(
-        `Stop signal sent to ${agent.name}. It may take a moment to respond.`,
-      );
-    } catch (error) {
-      toast.error(
-        error instanceof Error
-          ? error.message
-          : `Failed to stop ${agent.name}'s current turn.`,
-      );
-    } finally {
-      stopRequestPendingRef.current = false;
-      setStopRequestPending(false);
-    }
+    if (canStopCurrentTurn) await stopTurn(sessionChannelId);
   }
 
   const agentHeaderActions = (

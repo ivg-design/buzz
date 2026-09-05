@@ -2030,7 +2030,7 @@ fn handle_cancel_turn_control(
         return;
     };
 
-    let status = if pool.channel_control_is_ambiguous(channel_id) {
+    let status = if pool.channel_cancel_is_ambiguous(channel_id) {
         "ambiguous_target"
     } else if signal_in_flight_task(pool, channel_id, ControlSignal::Cancel) {
         "sent"
@@ -5133,7 +5133,8 @@ fn mode_gate_signal(
 
 /// Send a control signal to the in-flight task for `channel_id`.
 ///
-/// Channel-targeted: refuses channels with multiple session scopes. Used only
+/// Channel-targeted: cancellation requires at most one active task; other
+/// controls require at most one known session scope (including idle). Used only
 /// by desktop observer frames (`cancel_turn` / `switch_model`), which carry a
 /// bare `channelId` and no thread context. Every thread-aware
 /// path — mid-turn steering/interruption and the owner `!cancel` / `!rotate`
@@ -5148,7 +5149,12 @@ fn signal_in_flight_task(
     channel_id: uuid::Uuid,
     mode: ControlSignal,
 ) -> bool {
-    if pool.channel_control_is_ambiguous(channel_id) {
+    let ambiguous = if matches!(mode, ControlSignal::Cancel) {
+        pool.channel_cancel_is_ambiguous(channel_id)
+    } else {
+        pool.channel_control_is_ambiguous(channel_id)
+    };
+    if ambiguous {
         return false;
     }
     let entry = pool
@@ -7160,6 +7166,63 @@ mod owner_control_command_tests {
             assert_eq!(rx.await.unwrap(), signal);
             assert_eq!(observer.snapshot()[0].payload["status"], "sent");
         }
+    }
+
+    #[tokio::test]
+    async fn observer_cancel_allows_one_active_task_with_idle_sibling_sessions() {
+        let mut pool = AgentPool::from_slots(vec![]);
+        let ch = Uuid::new_v4();
+        let active = thread_scope(ch, &"a".repeat(64));
+        pool.record_scope_owner(active.clone(), 0);
+        pool.record_scope_owner(thread_scope(ch, &"b".repeat(64)), 1);
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        insert_task_meta(&mut pool, 0, active, tx);
+        let observer = observer::ObserverHandle::in_process();
+        let payload = serde_json::json!({
+            "channelId": ch.to_string(), "modelId": "new-model", "requestId": "stop-active",
+        });
+
+        // Model switching still includes idle session history in its target set.
+        handle_switch_model_control(&payload, &mut pool, Some(&observer));
+        assert_eq!(observer.snapshot()[0].payload["status"], "ambiguous_target");
+        assert_eq!(
+            rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        );
+        handle_cancel_turn_control(&payload, &mut pool, Some(&observer));
+        assert_eq!(rx.await.unwrap(), ControlSignal::Cancel);
+        let result = &observer.snapshot()[1];
+        assert_eq!(result.payload["status"], "sent");
+        assert_eq!(result.payload["requestId"], "stop-active");
+        assert_eq!(result.channel_id, Some(ch.to_string()));
+
+        // Retained idle scopes alone must report inactivity, not ambiguity.
+        pool.task_map_mut().clear();
+        handle_cancel_turn_control(&payload, &mut pool, Some(&observer));
+        assert_eq!(observer.snapshot()[2].payload["status"], "no_active_turn");
+    }
+
+    #[tokio::test]
+    async fn observer_cancel_rejects_two_active_tasks_even_with_the_same_scope() {
+        let mut pool = AgentPool::from_slots(vec![]);
+        let ch = Uuid::new_v4();
+        let active = thread_scope(ch, &"a".repeat(64));
+        let (tx_a, mut rx_a) = tokio::sync::oneshot::channel();
+        let (tx_b, mut rx_b) = tokio::sync::oneshot::channel();
+        insert_task_meta(&mut pool, 0, active.clone(), tx_a);
+        insert_task_meta(&mut pool, 1, active, tx_b);
+        let observer = observer::ObserverHandle::in_process();
+        let payload = serde_json::json!({"channelId": ch.to_string(), "requestId": "stop-two"});
+        handle_cancel_turn_control(&payload, &mut pool, Some(&observer));
+        assert_eq!(observer.snapshot()[0].payload["status"], "ambiguous_target");
+        assert_eq!(
+            rx_a.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        );
+        assert_eq!(
+            rx_b.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        );
     }
 
     // Fix #2: mid-turn steer/interrupt must target the exact thread scope, not

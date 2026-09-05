@@ -114,18 +114,21 @@ export function MessageAuthorIdentity({
   ownerPubkey,
   role,
   displayName,
+  channelId,
   children,
 }: {
   pubkey?: string | null;
   ownerPubkey?: string | null;
   role?: string;
   displayName: string;
+  channelId?: string | null;
   children: React.ReactNode;
 }) {
   return (
     <>
       {pubkey ? (
         <UserProfilePopover
+          channelId={channelId}
           pubkey={pubkey}
           role={role}
           botIdenticonValue={displayName}

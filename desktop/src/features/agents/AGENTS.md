@@ -307,14 +307,23 @@ with a TypeScript lookup table or an id comparison in a component.
 ## Channel-only runtime controls
 
 Desktop observer controls identify a channel, not a thread session. The harness
-rejects `cancel_turn` and `switch_model` with `ambiguous_target` when that channel
-has multiple known session scopes, including retained idle scopes. Do not treat
-that result as success or a deferred model switch. Stop feedback waits for the
+rejects `cancel_turn` with `ambiguous_target` when that channel has multiple
+active tasks. Idle session history does not block stopping its sole active task.
+`switch_model` still rejects multiple known session scopes, including retained
+idle scopes. Do not treat either rejection as success or a deferred model switch. Stop feedback waits for the
 harness result matching the control type, channel, and request ID; relay delivery
 alone does not prove that a turn was signalled. A missing result is unconfirmed,
 not success. The activity pane must use its resolved `sessionChannelId` for
 both the outgoing control and result correlation, even without a loaded
 `Channel` object. Stop is unavailable in an unscoped all-channel pane.
+
+The agent hover card shares the Activity stop handler and shows Stop for live
+managed agents with active work. Message author/avatar/address-chip entry points
+supply the conversation channel; if it has active work, that is the target.
+Otherwise the card uses the sole working channel or offers explicit working
+channel choices. It never guesses between active tasks within one channel or
+opens a different pane to cancel. Pending feedback remains until the correlated
+result or bounded timeout, even if the working signal clears first.
 
 Per-thread observer controls remain a separate protocol/UI change. Do not tell
 users to type `!cancel` beside an inline mention: the owner command requires

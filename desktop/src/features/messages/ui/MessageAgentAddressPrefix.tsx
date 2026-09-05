@@ -11,6 +11,7 @@ import { InlineChip } from "@/shared/ui/InlineChip";
 /** Resolve all literal competitors before hiding tag-backed address chips. */
 export function useMessageAgentAddressPrefix({
   profiles,
+  channelId,
   body,
   tags,
   mentionNames,
@@ -18,6 +19,7 @@ export function useMessageAgentAddressPrefix({
   isKnownAgentPubkey,
 }: {
   profiles?: UserProfileLookup;
+  channelId?: string | null;
   body: string;
   tags?: string[][];
   mentionNames?: string[];
@@ -35,16 +37,22 @@ export function useMessageAgentAddressPrefix({
     [body, tags, isKnownAgentPubkey, mentionPubkeysByName, mentionNames],
   );
   return pubkeys.length > 0 ? (
-    <MessageAgentAddressPrefix profiles={profiles} pubkeys={pubkeys} />
+    <MessageAgentAddressPrefix
+      channelId={channelId}
+      profiles={profiles}
+      pubkeys={pubkeys}
+    />
   ) : undefined;
 }
 
 /** Visible send-state prefix for recipients kept in the composer address tray. */
 export function MessageAgentAddressPrefix({
   profiles,
+  channelId,
   pubkeys,
 }: {
   profiles?: UserProfileLookup;
+  channelId?: string | null;
   pubkeys: readonly string[];
 }) {
   return (
@@ -59,6 +67,7 @@ export function MessageAgentAddressPrefix({
           <React.Fragment key={pubkey}>
             {/* biome-ignore lint/a11y/useValidAriaRole: UserProfilePopover uses role for agent classification, not as an ARIA attribute. */}
             <UserProfilePopover
+              channelId={channelId}
               botIdenticonValue={label}
               pubkey={pubkey}
               role="bot"

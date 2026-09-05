@@ -276,6 +276,7 @@ export const MessageRow = React.memo(
       return Object.keys(values).length > 0 ? values : undefined;
     }, [isKnownAgentPubkey, mentionPubkeysByName]);
     const agentAddressPrefix = useMessageAgentAddressPrefix({
+      channelId,
       profiles,
       body: message.body,
       tags: message.tags,
@@ -522,6 +523,7 @@ export const MessageRow = React.memo(
       continuationTimestampGutter
     ) : message.pubkey ? (
       <UserProfilePopover
+        channelId={channelId}
         pubkey={message.pubkey}
         role={profilePopoverRole}
         botIdenticonValue={message.author}
@@ -642,6 +644,7 @@ export const MessageRow = React.memo(
       <MessageHeaderRow>
         {message.pubkey ? (
           <MessageAuthorWithIndicators
+            channelId={channelId}
             authorName={message.author}
             ownerPubkey={message.ownerPubkey}
             pubkey={message.pubkey}

@@ -1302,6 +1302,17 @@ impl AgentPool {
         scopes.any(|scope| scope != first)
     }
 
+    /// Cancellation targets active tasks only; idle session history is not work.
+    /// Count tasks rather than scopes so duplicate tasks never select arbitrarily.
+    pub fn channel_cancel_is_ambiguous(&self, channel_id: Uuid) -> bool {
+        self.task_map
+            .values()
+            .filter(|meta| meta.channel_id == Some(channel_id))
+            .take(2)
+            .count()
+            > 1
+    }
+
     /// Idle-path model switch: set `desired_model` on the idle agent for
     /// `channel_id` and invalidate its exact session scope so the next turn
     /// re-creates that session under the new model.

@@ -1,5 +1,6 @@
 import * as React from "react";
 import { Activity, Headphones, MessageSquare } from "lucide-react";
+import { AgentPopoverStopActions } from "./AgentPopoverStopActions";
 
 import { AgentManagementMarker } from "@/features/agents/ui/OtherSetupAgentMarker";
 
@@ -48,6 +49,7 @@ import { resolveModelLabel } from "@/features/agents/lib/formatAgentModelLabel";
 type UserProfilePopoverProps = {
   children: React.ReactNode;
   pubkey: string;
+  channelId?: string | null;
   triggerElement?: "div" | "span";
   /** Accessible name for interactive trigger content that is visually hidden. */
   triggerAriaLabel?: string;
@@ -134,6 +136,7 @@ export function UserProfilePopover({
   enableHoverPopover = true,
   role,
   botIdenticonValue,
+  channelId,
 }: UserProfilePopoverProps) {
   const [open, setOpen] = React.useState(false);
   const hoverTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(
@@ -222,6 +225,7 @@ export function UserProfilePopover({
       {open ? (
         <UserProfilePopoverBody
           botIdenticonValue={botIdenticonValue}
+          channelId={channelId}
           canOpenProfilePanel={canOpenProfilePanel}
           onBeforeAction={clearHoverTimer}
           onContentMouseEnter={handleContentMouseEnter}
@@ -244,6 +248,7 @@ export function UserProfilePopover({
  */
 function UserProfilePopoverBody({
   botIdenticonValue,
+  channelId,
   canOpenProfilePanel,
   onBeforeAction,
   onContentMouseEnter,
@@ -260,6 +265,7 @@ function UserProfilePopoverBody({
   onMouseLeave: () => void;
   onTriggerClick: (event: React.MouseEvent) => void;
   pubkey: string;
+  channelId?: string | null;
   role?: string;
   setOpen: (open: boolean) => void;
 }) {
@@ -492,6 +498,16 @@ function UserProfilePopoverBody({
               />
             ))}
           </div>
+        ) : null}
+
+        {isBotProfile && managedAgent ? (
+          <AgentPopoverStopActions
+            key={managedAgent.pubkey}
+            agent={managedAgent}
+            channelId={channelId}
+            channelNames={channelIdToName}
+            onBeforeAction={onBeforeAction}
+          />
         ) : null}
 
         {canViewActivity ? (

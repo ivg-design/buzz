@@ -1891,16 +1891,19 @@ async fn resolve_provider_session_at(
 
     // Resolve the saved autonomy preference to an adapter-native ACP mode.
     // Claude calls unrestricted execution `bypassPermissions`; Codex calls
-    // the equivalent mode `agent-full-access`. Apply it to every managed
-    // session, including one-shot workers. Their typed MCP authorization,
-    // signer isolation, and immutable job ownership remain separate bounds.
-    let applied_permission_mode = match resolve_permission_mode(&ctx.permission_mode, &resp.raw)? {
-        Some(wire) => Some((
-            wire,
-            apply_permission_mode(&mut agent.acp, &resp.session_id, wire).await?,
-        )),
-        None => None,
-    };
+    // the equivalent mode `agent-full-access`. Immutable JobPolicyV1 sessions
+    // already enforce native-tools-off, one explicit trusted MCP, and denied
+    // permission requests. Mutating their provider mode afterward would
+    // conflict with that acknowledged policy (and Claude deliberately rejects
+    // bypassPermissions because dangerous permission skipping is disabled).
+    let applied_permission_mode = apply_configured_permission_mode(
+        &mut agent.acp,
+        &resp.session_id,
+        &ctx.permission_mode,
+        &resp.raw,
+        job_policy.as_ref(),
+    )
+    .await?;
 
     // Emit session config for desktop consumption (config bridge tier 1b).
     // Emitted AFTER desired_model resolution so the desktop caches the
@@ -2075,6 +2078,25 @@ fn resolve_permission_mode(
                 }
             ))
         })
+}
+
+async fn apply_configured_permission_mode(
+    acp: &mut AcpClient,
+    session_id: &str,
+    permission_mode: &PermissionMode,
+    session_new: &serde_json::Value,
+    job_policy: Option<&JobSessionPolicy>,
+) -> Result<Option<(&'static str, PermissionModeApplication)>, AcpError> {
+    if job_policy.is_some() {
+        return Ok(None);
+    }
+    match resolve_permission_mode(permission_mode, session_new)? {
+        Some(wire) => Ok(Some((
+            wire,
+            apply_permission_mode(acp, session_id, wire).await?,
+        ))),
+        None => Ok(None),
+    }
 }
 
 fn should_send_initial_message(source: &PromptSource, is_new_session: bool) -> bool {
@@ -6331,9 +6353,20 @@ while IFS= read -r _line; do :; done"#
         let observer = observer::ObserverHandle::in_process();
         acp.set_observer(Some(observer.clone()), 0);
 
-        let applied = apply_permission_mode(&mut acp, "sess-1", "agent-full-access")
-            .await
-            .expect("matching effective mode must be accepted");
+        let session_new = json!({
+            "modes": {"availableModes": [{"id": "agent-full-access"}]}
+        });
+        let (wire, applied) = apply_configured_permission_mode(
+            &mut acp,
+            "sess-1",
+            &PermissionMode::BypassPermissions,
+            &session_new,
+            None,
+        )
+        .await
+        .expect("matching effective mode must be accepted")
+        .expect("ordinary session must apply its configured mode");
+        assert_eq!(wire, "agent-full-access");
         assert!(applied.independently_verified);
         let request = observer
             .snapshot()
@@ -6344,6 +6377,41 @@ while IFS= read -r _line; do :; done"#
             .expect("mode request was sent");
         assert_eq!(request.payload["params"]["configId"], "mode");
         assert_eq!(request.payload["params"]["value"], "agent-full-access");
+        acp.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn immutable_job_policy_skips_configured_permission_mode_rpc() {
+        let reply = r#""error":{"code":-32603,"message":"Internal error"}"#;
+        let mut acp = spawn_permission_mode_acp(reply).await;
+        let observer = observer::ObserverHandle::in_process();
+        acp.set_observer(Some(observer.clone()), 0);
+        let session_new = json!({
+            "modes": {
+                "availableModes": [{"id": "default"}, {"id": "bypassPermissions"}],
+                "currentModeId": "default"
+            }
+        });
+        let job_policy = JobSessionPolicy::new("a".repeat(64)).unwrap();
+
+        let applied = apply_configured_permission_mode(
+            &mut acp,
+            "job-session",
+            &PermissionMode::BypassPermissions,
+            &session_new,
+            Some(&job_policy),
+        )
+        .await
+        .expect("the acknowledged immutable policy owns job permissions");
+
+        assert!(applied.is_none());
+        assert!(
+            !observer
+                .snapshot()
+                .iter()
+                .any(|event| event.kind == "acp_write"),
+            "a JobPolicyV1 session must not receive a post-creation mode mutation"
+        );
         acp.shutdown().await;
     }
 

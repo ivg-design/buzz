@@ -1082,7 +1082,7 @@ dependencies = [
 
 [[package]]
 name = "buzz-desktop"
-version = "0.5.23-nemo.5"
+version = "0.5.23-nemo.6"
 dependencies = [
  "anyhow",
  "arboard",

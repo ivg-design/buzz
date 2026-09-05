@@ -52,6 +52,40 @@ By default, the harness discovers only channels the agent is a **member** of (`G
 
 **Private channels** require explicit membership. The relay doesn't yet have a REST/event API for managing channel members — this is a known gap. For now, use `create_channel` via the Buzz CLI to create new channels (the creator is automatically a member).
 
+### Managed Codex and Claude host sessions
+
+Managed conversations and delegated A2A jobs use the provider's ordinary session
+configuration and selected permission mode. In full-access mode they retain native
+file, shell and subagent tools, configured MCP servers, and the host's normal account
+configuration. The trusted Buzz MCP is added for coordination; it does not replace
+the provider's tools. Buzz-owned signing and job-control values stay in the harness
+instead of being injected into provider environment variables.
+
+Claude's per-agent effort setting is stored in `CLAUDE_CODE_EFFORT_LEVEL` and is
+available when creating or editing an agent, before an adapter session starts.
+Supported CLI values are `low`, `medium`, `high`, `xhigh` and `max`; availability
+depends on the selected model. An explicit agent value overrides the inherited
+host value. Save the setting and restart a running agent to apply it to subsequent
+conversations and delegated jobs. Other per-agent environment variables remain
+available in the environment editor.
+
+The receiver can prepare a separate worktree to avoid concurrent writers sharing a
+checkout. Its branch, revision and path coordinates describe the work assignment,
+not a sandbox around the agent. Native tools can read other refs, work elsewhere on
+the host and use existing authenticated tools when requested. Remote permissions and
+repository protections still apply.
+
+A2A receipts track admission, execution and results. They cannot observe every effect
+of a native shell command or a configured MCP. After an interrupted prompt, an empty
+Buzz Git journal is not evidence that nothing changed: report the unresolved outcome
+and reconcile actual state rather than automatically replaying mutations. A failure
+known to occur before the prompt is sent can still be retried.
+
+Nemo's dedicated workspace automatically supplies the shared instructions in
+`docs/NEMO_WORKSPACE_INSTRUCTIONS.md`. The explicit pinned preload configuration
+below remains available for other project configurations; it is not a per-agent
+Nemo onboarding requirement or a host-tool access gate.
+
 ### Project repository skills
 
 Project channels can preload repository-owned instructions for managed agents. The

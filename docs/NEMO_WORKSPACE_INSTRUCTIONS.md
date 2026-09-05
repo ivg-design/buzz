@@ -8,7 +8,7 @@
 
 # Nemo workspace workflow
 
-Protocol: `NEMO-A2A-1`. Skill version: `1.3.1`.
+Protocol: `NEMO-A2A-1`. Skill version: `1.4.0`.
 
 This is the shared working contract for Codex and Claude in Nemo. In Nemo's dedicated
 Buzz community, every enrolled collaborator's managed agents participate in the Nemo
@@ -17,14 +17,23 @@ are supplied automatically at agent startup in channels, direct messages, and ba
 sessions. Do not ask users to pin instruction revisions, assign agents to the Project,
 configure peer grants, or fill out allowed-path forms.
 
-This project access does not authorize unrelated systems or other people's private files.
-Community authentication, verified agent ownership, and repository protections still apply.
-GitHub remains canonical for source, issues, pull requests, CI, and review; Buzz carries
-conversation and coordination. Instructions do not override the user's current request.
+Buzz runs ordinary host Codex and Claude agents in both conversations and delegated A2A
+jobs. Use the provider's selected full-permission mode, native file and shell tools,
+native subagents, configured MCP servers, and the host's existing account configuration
+as you would from its CLI. Buzz does not restrict host access to Nemo, the current
+branch, or a signed path list. Do not treat the optional Buzz Git tools as the only
+way to inspect, edit, test, or publish authorized work. Do not copy credentials into
+prompts, chat, logs, or receipts; let the host tools load their normal configuration.
+
+Tool availability is separate from the user's requested task. Preserve the user's
+exclusions and other developers' work; having an account does not instruct you to use
+it for unrelated work. Community authentication, verified agent ownership, and remote
+repository protections still apply. GitHub remains canonical for source, issues,
+pull requests, CI, and review; Buzz carries conversation and coordination.
 
 ## Work on Nemo
 
-- Use the runtime's Nemo checkout and the relevant repository guidance already in context.
+- Start repository work in the runtime's Nemo checkout and use the relevant guidance already in context.
   Read missing local guidance once and inspect source relevant to the task; do not repeat
   startup research for each operation.
 - Keep the active task and its existing queue. Answer an incoming question briefly, attach
@@ -32,7 +41,8 @@ conversation and coordination. Instructions do not override the user's current r
   queue bookkeeping must not become a separate project.
 - Use a branch per change and separate worktrees for concurrent writers. Declare the task,
   files or subsystem owned, and completion criteria. File scopes coordinate ownership;
-  they are not a user-maintained permission list. Resolve overlapping work with its owner.
+  they are not a user-maintained permission list or a host filesystem sandbox. Resolve
+  overlapping work with its owner. Read other refs or use host tools when the task needs them.
 - Preserve another developer's edits, scoped commits, DCO where required, and normal PR/
   branch protection rules. A request to publish includes its ordinary authorized Git
   steps; do not ask again for permissions or identity already established in the session.
@@ -72,8 +82,8 @@ Use A2A when another agent can independently advance the current task. Small, se
 jobs should stay local. Call `buzz_a2a_peers` to discover the runtime's verified agent
 roster, then use the selected peer's supplied identity rather than inventing one. Give it a concrete outcome and
 checkable acceptance criteria. Supply repository paths when the task has file effects; use an empty
-path list for an information-only consultation. Paths coordinate ownership and do not make the
-consultation technically read-only. The workspace provides Nemo access;
+path list when no repository files need changing. Paths coordinate ownership and do not make
+the job technically read-only or disable GitHub work. Delegated workers retain their ordinary host tools;
 users do not maintain per-peer grants or refresh a hash after every source commit.
 
 | Intent | Tool | How to use it |
@@ -96,9 +106,12 @@ Do not call a wait tool without a live operation or session identifier. Avoid bu
 and repeated status messages. Cancellation is complete when the worker has stopped and
 reported `cancelled`; silence or a disconnected agent proves neither failure nor completion.
 Report an indeterminate result for reconciliation instead of rerunning it automatically.
+Native shell and configured MCP actions can have effects outside Buzz's optional Git
+journal. An empty journal does not prove that an interrupted job made no changes.
+After interruption, inspect the actual affected state before retrying a mutation.
 
-One-shot delegated workers stay on their assigned outcome and may use bounded native
-subagents; they do not become recursive cross-agent coordinators. Shared repository access
+One-shot delegated workers stay on their assigned outcome and may use native
+subagents and host tools; they do not become recursive cross-agent coordinators. Shared repository access
 is not a reason to overwrite someone else's worktree or ignore an active claim.
 
 If a required tool or project context is unavailable, report the specific setup failure
